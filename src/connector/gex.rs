@@ -1,5 +1,6 @@
 use data::chart::gex::{
-    Config, GexExpiryFilter, GexFreshness, GexSignModel, GexSnapshot, calculate_gex_at,
+    Config, GexExpiryFilter, GexFreshness, GexGammaSource, GexScenarioResolution, GexSignModel,
+    GexSnapshot, calculate_gex_at,
 };
 use exchange::{
     UnixMs,
@@ -15,6 +16,51 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum GexHistoryError {
+    #[error("local GEX history cache is unavailable")]
+    CacheUnavailable,
+}
+
+#[allow(dead_code)]
+pub trait GexHistoryProvider {
+    async fn load_range(
+        &self,
+        series: &DerivedGexSeriesKey,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<Vec<GexSnapshot>, GexHistoryError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalGexHistoryProvider;
+
+impl LocalGexHistoryProvider {
+    fn load_range_detailed(
+        self,
+        series: &DerivedGexSeriesKey,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<crate::connector::persistent_cache::GexHistoryCacheRead, GexHistoryError> {
+        crate::connector::persistent_cache::market_cache()
+            .map(|cache| cache.read_gex_history_detailed(&series_cache_key(*series), from, to))
+            .ok_or(GexHistoryError::CacheUnavailable)
+    }
+}
+
+impl GexHistoryProvider for LocalGexHistoryProvider {
+    async fn load_range(
+        &self,
+        series: &DerivedGexSeriesKey,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<Vec<GexSnapshot>, GexHistoryError> {
+        crate::connector::persistent_cache::market_cache()
+            .map(|cache| cache.read_gex_history(&series_cache_key(*series), from, to))
+            .ok_or(GexHistoryError::CacheUnavailable)
+    }
+}
 
 pub const INSTRUMENT_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MARKET_SNAPSHOT_TTL_MS: u64 = 15 * 1_000;
@@ -92,16 +138,20 @@ struct DerivedGexKey {
     expiry: GexExpiryFilter,
     min_oi_bits: u64,
     min_gex_bits: u64,
+    gamma_source: GexGammaSource,
+    scenario_resolution: GexScenarioResolution,
     revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct DerivedGexSeriesKey {
-    chain: OptionsChainKey,
-    model: GexSignModel,
-    expiry: GexExpiryFilter,
-    min_oi_bits: u64,
-    min_gex_bits: u64,
+    pub chain: OptionsChainKey,
+    pub model: GexSignModel,
+    pub expiry: GexExpiryFilter,
+    pub min_oi_bits: u64,
+    pub min_gex_bits: u64,
+    pub gamma_source: GexGammaSource,
+    pub scenario_resolution: GexScenarioResolution,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +182,7 @@ pub struct GexDataCoordinator {
     next_revision: u64,
     cache_path: PathBuf,
     persist_heatmap: bool,
+    history_provider: LocalGexHistoryProvider,
 }
 
 impl Default for GexDataCoordinator {
@@ -157,6 +208,7 @@ impl GexDataCoordinator {
             next_revision: 1,
             cache_path,
             persist_heatmap,
+            history_provider: LocalGexHistoryProvider,
         };
         coordinator.load_persistent();
         coordinator
@@ -309,6 +361,8 @@ impl GexDataCoordinator {
             expiry: config.expiry_filter,
             min_oi_bits: config.min_open_interest.to_bits(),
             min_gex_bits: config.min_absolute_gex.to_bits(),
+            gamma_source: config.gamma_source,
+            scenario_resolution: config.scenario_resolution,
             revision: raw.revision,
         };
         if let Some(cached) = self.derived_snapshots.get(&key) {
@@ -327,6 +381,8 @@ impl GexDataCoordinator {
             expiry: config.expiry_filter,
             min_oi_bits: config.min_open_interest.to_bits(),
             min_gex_bits: config.min_absolute_gex.to_bits(),
+            gamma_source: config.gamma_source,
+            scenario_resolution: config.scenario_resolution,
         };
         let revision = raw.revision;
         self.ensure_history_loaded(series_key, now);
@@ -335,7 +391,7 @@ impl GexDataCoordinator {
     }
 
     pub fn history(
-        &self,
+        &mut self,
         underlying: OptionsUnderlying,
         config: &Config,
         retention_minutes: u16,
@@ -347,7 +403,10 @@ impl GexDataCoordinator {
             expiry: config.expiry_filter,
             min_oi_bits: config.min_open_interest.to_bits(),
             min_gex_bits: config.min_absolute_gex.to_bits(),
+            gamma_source: config.gamma_source,
+            scenario_resolution: config.scenario_resolution,
         };
+        self.ensure_history_loaded(key, now);
         let retention_ms = u64::from(retention_minutes.clamp(30, 24 * 60)) * 60_000;
         let cutoff = now.saturating_sub(retention_ms);
         self.derived_history
@@ -397,15 +456,32 @@ impl GexDataCoordinator {
     }
 
     fn ensure_history_loaded(&mut self, key: DerivedGexSeriesKey, now: UnixMs) {
-        if !self.loaded_history.insert(key) || !self.persist_heatmap {
+        if self.loaded_history.contains(&key) || !self.persist_heatmap {
             return;
         }
         let Some(cache) = crate::connector::persistent_cache::market_cache() else {
             return;
         };
+        self.loaded_history.insert(key);
         let from = now.saturating_sub(24 * 60 * 60 * 1_000);
-        let stored = cache.read_gex_history(&series_cache_key(key), from, now);
-        let mut stored = stored
+        let canonical = series_cache_key(key);
+        let mut report = self
+            .history_provider
+            .load_range_detailed(&key, from, now)
+            .unwrap_or_default();
+        let legacy = legacy_series_cache_key(key);
+        let legacy_report = cache.read_gex_history_detailed(&legacy, from, now);
+        if !legacy_report.snapshots.is_empty() {
+            log::debug!(
+                "GEX HistoryLegacyKey | canonical={} legacy={} snapshots={}",
+                canonical,
+                legacy,
+                legacy_report.snapshots.len()
+            );
+            report.snapshots.extend(legacy_report.snapshots);
+        }
+        let mut stored = report
+            .snapshots
             .into_iter()
             .map(|value| HistoricalGexSnapshot {
                 revision: 0,
@@ -414,7 +490,24 @@ impl GexDataCoordinator {
             .collect::<Vec<_>>();
         stored.sort_by_key(|entry| entry.value.observed_at);
         stored.dedup_by_key(|entry| entry.value.observed_at);
+        let first = stored.first().map(|entry| entry.value.observed_at.as_u64());
+        let last = stored.last().map(|entry| entry.value.observed_at.as_u64());
+        let loaded = stored.len();
         self.derived_history.entry(key).or_default().extend(stored);
+        log::debug!(
+            "GEX HistoryLoaded | key={} requested_buckets={} found_buckets={} decoded={} valid={} discarded={} deduplicated={} corrupt_buckets={} loaded={} first={:?} last={:?}",
+            canonical,
+            report.buckets_requested,
+            report.buckets_found,
+            report.decoded,
+            report.valid,
+            report.discarded,
+            report.deduplicated,
+            report.corrupt_buckets,
+            loaded,
+            first,
+            last,
+        );
     }
 
     pub fn freshness(&mut self, underlying: OptionsUnderlying, now: UnixMs) -> GexFreshness {
@@ -527,7 +620,21 @@ impl GexDataCoordinator {
     }
 }
 
-fn series_cache_key(key: DerivedGexSeriesKey) -> String {
+pub fn series_cache_key(key: DerivedGexSeriesKey) -> String {
+    format!(
+        "gex|provider={:?}|underlying={:?}|model={:?}|expiry={:?}|min_oi={:016x}|min_gex={:016x}|gamma_source={:?}|scenario={:?}",
+        key.chain.provider,
+        key.chain.underlying,
+        key.model,
+        key.expiry,
+        key.min_oi_bits,
+        key.min_gex_bits,
+        key.gamma_source,
+        key.scenario_resolution,
+    )
+}
+
+fn legacy_series_cache_key(key: DerivedGexSeriesKey) -> String {
     format!(
         "gex|provider={:?}|underlying={:?}|model={:?}|expiry={:?}|min_oi={:016x}|min_gex={:016x}",
         key.chain.provider,
@@ -624,6 +731,8 @@ mod tests {
                     underlying_price: 100_000.0,
                     interest_rate: 0.0,
                     observed_at,
+                    native_gamma: None,
+                    native_gamma_observed_at: None,
                 },
                 instrument,
             }]
@@ -846,7 +955,9 @@ mod tests {
         let key = DerivedGexSeriesKey {
             chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
             model: GexSignModel::CallPutOiProxy,
+            gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
+            scenario_resolution: GexScenarioResolution::Auto,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };
@@ -873,7 +984,9 @@ mod tests {
         let base = DerivedGexSeriesKey {
             chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
             model: GexSignModel::CallPutOiProxy,
+            gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
+            scenario_resolution: GexScenarioResolution::Auto,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };
@@ -897,7 +1010,9 @@ mod tests {
         let key = DerivedGexSeriesKey {
             chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
             model: GexSignModel::CallPutOiProxy,
+            gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
+            scenario_resolution: GexScenarioResolution::Auto,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };

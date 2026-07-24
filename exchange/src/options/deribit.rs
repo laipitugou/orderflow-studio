@@ -4,13 +4,25 @@ use super::{
 };
 use crate::{UnixMs, adapter};
 use reqwest::Client;
-use serde::Deserialize;
-use std::{collections::HashMap, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use thiserror::Error;
 
 const PRODUCTION_BASE_URL: &str = "https://www.deribit.com/api/v2";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const NATIVE_GAMMA_REFRESH_MS: u64 = 60_000;
+const MAX_NATIVE_GAMMA_INSTRUMENTS: usize = 128;
+
+#[derive(Debug, Default)]
+struct NativeGammaState {
+    last_refresh: Option<UnixMs>,
+    values: HashMap<String, (f64, UnixMs)>,
+}
 
 #[derive(Debug, Error)]
 pub enum DeribitError {
@@ -34,6 +46,7 @@ pub enum DeribitError {
 pub struct DeribitOptionsClient {
     client: Client,
     base_url: String,
+    native_gamma: Arc<Mutex<HashMap<OptionsUnderlying, NativeGammaState>>>,
 }
 
 impl DeribitOptionsClient {
@@ -54,6 +67,7 @@ impl DeribitOptionsClient {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            native_gamma: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -102,7 +116,8 @@ impl DeribitOptionsClient {
             .inspect_err(|error| {
                 log::warn!("GEX FetchFailed kind=snapshot underlying={underlying} error={error}");
             })?;
-        let snapshot = merge_snapshot(underlying, instruments, summaries, UnixMs::now())?;
+        let mut snapshot = merge_snapshot(underlying, instruments, summaries, UnixMs::now())?;
+        self.enrich_native_gamma(&mut snapshot).await;
         log::info!(
             "GEX SnapshotRefreshed underlying={underlying} contracts={} observed_at={}",
             snapshot.contracts.len(),
@@ -110,6 +125,109 @@ impl DeribitOptionsClient {
         );
         log::info!("GEX FetchCompleted kind=snapshot underlying={underlying}");
         Ok(snapshot)
+    }
+
+    async fn enrich_native_gamma(&self, snapshot: &mut RawOptionChainSnapshot) {
+        let now = UnixMs::now();
+        let cached = {
+            let Ok(mut states) = self.native_gamma.lock() else {
+                return;
+            };
+            let state = states.entry(snapshot.underlying).or_default();
+            if state
+                .last_refresh
+                .is_some_and(|last| now.saturating_diff(last) < NATIVE_GAMMA_REFRESH_MS)
+            {
+                Some(state.values.clone())
+            } else {
+                state.last_refresh = Some(now);
+                None
+            }
+        };
+        let values = if let Some(cached) = cached {
+            cached
+        } else {
+            let candidates = select_native_gamma_candidates(snapshot, MAX_NATIVE_GAMMA_INSTRUMENTS);
+            match self.fetch_native_gamma_batch(&candidates, now).await {
+                Ok(values) => {
+                    if let Ok(mut states) = self.native_gamma.lock() {
+                        states.entry(snapshot.underlying).or_default().values = values.clone();
+                    }
+                    values
+                }
+                Err(error) => {
+                    log::debug!(
+                        "GEX NativeGammaFallback | underlying={} error={error}",
+                        snapshot.underlying
+                    );
+                    HashMap::new()
+                }
+            }
+        };
+        let contracts = Arc::make_mut(&mut snapshot.contracts);
+        for contract in contracts {
+            if let Some((gamma, observed_at)) = values.get(&contract.instrument.instrument_name)
+                && gamma.is_finite()
+                && *gamma >= 0.0
+            {
+                contract.market.native_gamma = Some(*gamma);
+                contract.market.native_gamma_observed_at = Some(*observed_at);
+            }
+        }
+    }
+
+    async fn fetch_native_gamma_batch(
+        &self,
+        instruments: &[String],
+        now: UnixMs,
+    ) -> Result<HashMap<String, (f64, UnixMs)>, DeribitError> {
+        if instruments.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let requests = instruments
+            .iter()
+            .enumerate()
+            .map(|(id, instrument_name)| NativeTickerRequest {
+                jsonrpc: "2.0",
+                id: id as u64,
+                method: "public/ticker",
+                params: NativeTickerParams { instrument_name },
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .post(&self.base_url)
+            .json(&requests)
+            .send()
+            .await
+            .map_err(DeribitError::Request)?;
+        let status = response.status();
+        let body = response.text().await.map_err(DeribitError::Request)?;
+        if !status.is_success() {
+            return Err(DeribitError::Http {
+                status: status.as_u16(),
+                message: body.chars().take(256).collect(),
+            });
+        }
+        let replies: Vec<NativeTickerReply> =
+            serde_json::from_str(&body).map_err(DeribitError::Decode)?;
+        let mut values = HashMap::new();
+        for reply in replies {
+            let Some(instrument) = instruments.get(reply.id as usize) else {
+                continue;
+            };
+            let Some(result) = reply.result else {
+                continue;
+            };
+            let Some(gamma) = result.greeks.and_then(|greeks| greeks.gamma) else {
+                continue;
+            };
+            let observed_at = result.timestamp.map(UnixMs::new).unwrap_or(now);
+            if gamma.is_finite() && gamma >= 0.0 {
+                values.insert(instrument.clone(), (gamma, observed_at));
+            }
+        }
+        Ok(values)
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(
@@ -209,6 +327,66 @@ struct BookSummaryDto {
     creation_timestamp: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeTickerRequest<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: NativeTickerParams<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeTickerParams<'a> {
+    instrument_name: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeTickerReply {
+    id: u64,
+    result: Option<NativeTickerResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeTickerResult {
+    timestamp: Option<u64>,
+    greeks: Option<NativeGreeks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeGreeks {
+    gamma: Option<f64>,
+}
+
+fn select_native_gamma_candidates(
+    snapshot: &RawOptionChainSnapshot,
+    maximum: usize,
+) -> Vec<String> {
+    let lower = snapshot.source_spot * 0.85;
+    let upper = snapshot.source_spot * 1.15;
+    let mut candidates = snapshot
+        .contracts
+        .iter()
+        .filter(|contract| {
+            contract.instrument.strike >= lower && contract.instrument.strike <= upper
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.market
+            .open_interest_underlying
+            .total_cmp(&a.market.open_interest_underlying)
+            .then_with(|| {
+                a.instrument
+                    .instrument_name
+                    .cmp(&b.instrument.instrument_name)
+            })
+    });
+    candidates
+        .into_iter()
+        .take(maximum.clamp(32, 256))
+        .map(|contract| contract.instrument.instrument_name.clone())
+        .collect()
+}
+
 fn merge_snapshot(
     underlying: OptionsUnderlying,
     instruments: &[OptionInstrument],
@@ -256,6 +434,8 @@ fn merge_snapshot(
                 underlying_price: spot,
                 interest_rate: rate,
                 observed_at: UnixMs::new(summary.creation_timestamp.unwrap_or(now.as_u64())),
+                native_gamma: None,
+                native_gamma_observed_at: None,
             },
         });
     }
@@ -331,6 +511,49 @@ mod tests {
         .expect("snapshot");
         assert_eq!(snapshot.contracts.len(), 1);
         assert_eq!(snapshot.contracts[0].market.open_interest_underlying, 12.5);
+    }
+
+    #[test]
+    fn native_gamma_candidates_are_bounded_near_spot_and_oi_ordered() {
+        let instruments = parse_rpc::<Vec<InstrumentDto>>(INSTRUMENTS)
+            .expect("fixture")
+            .into_iter()
+            .filter_map(|dto| dto.into_model(OptionsUnderlying::Btc))
+            .collect::<Vec<_>>();
+        let summaries = parse_rpc::<Vec<BookSummaryDto>>(SUMMARIES).expect("fixture");
+        let base = merge_snapshot(
+            OptionsUnderlying::Btc,
+            &instruments,
+            summaries,
+            UnixMs::new(1_800_000_000_000),
+        )
+        .expect("snapshot");
+        let template = base.contracts[0].clone();
+        let mut contracts = (0..300)
+            .map(|index| {
+                let mut contract = template.clone();
+                contract.instrument.instrument_name = format!("BTC-CANDIDATE-{index:03}");
+                contract.instrument.strike = 90_000.0 + f64::from(index);
+                contract.market.open_interest_underlying = f64::from(index);
+                contract
+            })
+            .collect::<Vec<_>>();
+        let mut outside = template;
+        outside.instrument.instrument_name = "BTC-OUTSIDE".to_owned();
+        outside.instrument.strike = 200_000.0;
+        outside.market.open_interest_underlying = f64::MAX;
+        contracts.push(outside);
+        let snapshot = RawOptionChainSnapshot {
+            contracts: contracts.into(),
+            ..base
+        };
+        let selected = select_native_gamma_candidates(&snapshot, 128);
+        assert_eq!(selected.len(), 128);
+        assert_eq!(
+            selected.first().map(String::as_str),
+            Some("BTC-CANDIDATE-299")
+        );
+        assert!(!selected.iter().any(|name| name == "BTC-OUTSIDE"));
     }
 
     #[tokio::test]

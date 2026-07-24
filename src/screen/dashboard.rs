@@ -368,11 +368,17 @@ impl Dashboard {
                         let config = data::chart::gex::Config {
                             sign_model: levels.enabled_model,
                             expiry_filter: levels.expiry_filter,
+                            gamma_source: levels.gamma_source,
+                            scenario_resolution: levels.scenario_resolution,
+                            min_open_interest: levels.minimum_open_interest,
+                            min_absolute_gex: levels.minimum_absolute_gex,
                             ..data::chart::gex::Config::default()
                         };
-                        let snapshot = coordinator.derived(underlying, &config, now);
                         let history =
                             coordinator.history(underlying, &config, levels.history_minutes, now);
+                        let snapshot = coordinator
+                            .derived(underlying, &config, now)
+                            .or_else(|| history.last().cloned());
                         let freshness = coordinator.freshness(underlying, now);
                         let error = coordinator.last_error(underlying).map(Arc::from);
                         chart.set_gex_overlay_data(snapshot, history, freshness, error);

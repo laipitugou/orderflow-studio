@@ -1072,7 +1072,11 @@ impl Flowsurface {
                 };
                 let connectivity_task = self.apply_connectivity_transition(transition);
 
-                let consumers = self.active_dashboard().gex_consumers();
+                let consumers = self
+                    .layout_manager
+                    .iter_dashboards()
+                    .flat_map(Dashboard::gex_consumers)
+                    .collect::<Vec<_>>();
                 self.gex_coordinator.set_consumers(consumers);
                 self.sync_gex_dashboard(exchange::UnixMs::now());
 
@@ -2456,12 +2460,9 @@ impl Flowsurface {
     }
 
     fn sync_gex_dashboard(&mut self, now: exchange::UnixMs) {
-        let Some(active) = self.layout_manager.active_layout_id().map(|id| id.unique) else {
-            return;
-        };
         let coordinator = &mut self.gex_coordinator;
-        if let Some(layout) = self.layout_manager.get_mut(active) {
-            layout.dashboard.sync_gex(coordinator, now);
+        for dashboard in self.layout_manager.iter_dashboards_mut() {
+            dashboard.sync_gex(coordinator, now);
         }
     }
 

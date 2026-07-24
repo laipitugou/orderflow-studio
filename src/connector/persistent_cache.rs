@@ -6,10 +6,16 @@
 //! they are allowed back into the chart.
 
 use data::chart::{
-    gex::GexSnapshot,
+    gex::{
+        GammaVegaMetrics, GexExpiryFilter, GexExpiryStrike, GexGammaProvenance, GexGammaSource,
+        GexScenarioPoint, GexSignModel, GexSnapshot, GexStrike, IntrinsicStressMetrics,
+    },
     kline::{BubbleCandidate, BubbleVolumeSummary},
 };
-use exchange::{Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume};
+use exchange::{
+    Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
+    options::{OptionsProvider, OptionsUnderlying},
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +44,18 @@ const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_
 const GEX_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("gex_history_v1");
 
 static CACHE: OnceLock<Option<MarketDataCache>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+pub struct GexHistoryCacheRead {
+    pub snapshots: Vec<GexSnapshot>,
+    pub buckets_requested: usize,
+    pub buckets_found: usize,
+    pub decoded: usize,
+    pub valid: usize,
+    pub discarded: usize,
+    pub deduplicated: usize,
+    pub corrupt_buckets: usize,
+}
 
 /// Cached records plus the half-open intervals which still require the network.
 #[derive(Debug)]
@@ -106,6 +124,109 @@ struct StoredBucket<T> {
     dataset_key: String,
     bucket_start: u64,
     records: Vec<T>,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct LegacyGexStrikeV1 {
+    strike: f64,
+    call_gex_1pct: f64,
+    put_gex_1pct: f64,
+    net_gex_1pct: f64,
+    absolute_gamma_1pct: f64,
+    call_open_interest: f64,
+    put_open_interest: f64,
+    expiration_count: usize,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct LegacyGexExpiryStrikeV1 {
+    expiration: UnixMs,
+    strike: f64,
+    call_gex_1pct: f64,
+    put_gex_1pct: f64,
+    net_gex_1pct: f64,
+    absolute_gamma_1pct: f64,
+    call_open_interest: f64,
+    put_open_interest: f64,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct LegacyGexSnapshotV1 {
+    provider: OptionsProvider,
+    underlying: OptionsUnderlying,
+    model: GexSignModel,
+    expiry_filter: GexExpiryFilter,
+    source_spot: f64,
+    observed_at: UnixMs,
+    calculated_at: UnixMs,
+    net_gex_1pct: Option<f64>,
+    absolute_gex_1pct: f64,
+    call_wall: Option<f64>,
+    put_wall: Option<f64>,
+    gamma_flip: Option<f64>,
+    intrinsic_stress: IntrinsicStressMetrics,
+    gamma_vega: GammaVegaMetrics,
+    strikes: std::sync::Arc<[LegacyGexStrikeV1]>,
+    expiry_strikes: std::sync::Arc<[LegacyGexExpiryStrikeV1]>,
+    scenario_curve: std::sync::Arc<[GexScenarioPoint]>,
+    scale_p95: f64,
+}
+
+impl From<LegacyGexSnapshotV1> for GexSnapshot {
+    fn from(value: LegacyGexSnapshotV1) -> Self {
+        Self {
+            provider: value.provider,
+            underlying: value.underlying,
+            model: value.model,
+            expiry_filter: value.expiry_filter,
+            gamma_source: GexGammaSource::BlackScholesDerived,
+            gamma_provenance: GexGammaProvenance::Derived,
+            source_spot: value.source_spot,
+            observed_at: value.observed_at,
+            calculated_at: value.calculated_at,
+            net_gex_1pct: value.net_gex_1pct,
+            absolute_gex_1pct: value.absolute_gex_1pct,
+            call_wall: value.call_wall,
+            put_wall: value.put_wall,
+            gamma_flip: value.gamma_flip,
+            intrinsic_stress: value.intrinsic_stress,
+            gamma_vega: value.gamma_vega,
+            strikes: value
+                .strikes
+                .iter()
+                .map(|strike| GexStrike {
+                    strike: strike.strike,
+                    call_gex_1pct: strike.call_gex_1pct,
+                    put_gex_1pct: strike.put_gex_1pct,
+                    net_gex_1pct: strike.net_gex_1pct,
+                    absolute_gamma_1pct: strike.absolute_gamma_1pct,
+                    call_open_interest: strike.call_open_interest,
+                    put_open_interest: strike.put_open_interest,
+                    expiration_count: strike.expiration_count,
+                    gamma_provenance: GexGammaProvenance::Derived,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            expiry_strikes: value
+                .expiry_strikes
+                .iter()
+                .map(|strike| GexExpiryStrike {
+                    expiration: strike.expiration,
+                    strike: strike.strike,
+                    call_gex_1pct: strike.call_gex_1pct,
+                    put_gex_1pct: strike.put_gex_1pct,
+                    net_gex_1pct: strike.net_gex_1pct,
+                    absolute_gamma_1pct: strike.absolute_gamma_1pct,
+                    call_open_interest: strike.call_open_interest,
+                    put_open_interest: strike.put_open_interest,
+                    gamma_provenance: GexGammaProvenance::Derived,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            scenario_curve: value.scenario_curve,
+            scale_p95: value.scale_p95,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, serde::Deserialize)]
@@ -454,38 +575,97 @@ impl MarketDataCache {
         from: UnixMs,
         to: UnixMs,
     ) -> Vec<GexSnapshot> {
+        self.read_gex_history_detailed(dataset_key, from, to)
+            .snapshots
+    }
+
+    pub fn read_gex_history_detailed(
+        &self,
+        dataset_key: &str,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> GexHistoryCacheRead {
+        let mut report = GexHistoryCacheRead {
+            buckets_requested: ((to.saturating_diff(from) / HOURLY_BUCKET_MS) + 1) as usize,
+            ..GexHistoryCacheRead::default()
+        };
         let Ok(read) = self.db.begin_read() else {
-            return Vec::new();
+            return report;
         };
         let Ok(table) = read.open_table(GEX_HISTORY_TABLE) else {
-            return Vec::new();
+            return report;
         };
         let prefix = format!("{dataset_key}|");
-        let mut records = Vec::new();
         let Ok(iter) = table.iter() else {
-            return records;
+            return report;
         };
         for entry in iter.flatten() {
             let key = entry.0.value();
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let Ok(bucket) = decode_checked::<StoredBucket<GexSnapshot>>(entry.1.value()) else {
-                log::warn!("CACHE GexCorrupt | key={key}");
+            let Some(key_bucket_start) = key
+                .rsplit('|')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
                 continue;
             };
-            if bucket.schema != CACHE_SCHEMA || bucket.dataset_key != dataset_key {
+            if key_bucket_start > to.as_u64()
+                || key_bucket_start.saturating_add(HOURLY_BUCKET_MS) < from.as_u64()
+            {
                 continue;
             }
-            records.extend(bucket.records.into_iter().filter(|snapshot| {
-                snapshot.observed_at >= from
+            report.buckets_found += 1;
+            let bucket = match decode_checked::<StoredBucket<GexSnapshot>>(entry.1.value()) {
+                Ok(bucket) => bucket,
+                Err(_) => {
+                    match decode_checked::<StoredBucket<LegacyGexSnapshotV1>>(entry.1.value()) {
+                        Ok(legacy) => StoredBucket {
+                            schema: legacy.schema,
+                            dataset_key: legacy.dataset_key,
+                            bucket_start: legacy.bucket_start,
+                            records: legacy.records.into_iter().map(GexSnapshot::from).collect(),
+                        },
+                        Err(_) => {
+                            report.corrupt_buckets += 1;
+                            log::debug!(
+                                "CACHE GexBucketIgnored | key={key} reason=decode_or_checksum"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            if bucket.schema != CACHE_SCHEMA
+                || bucket.dataset_key != dataset_key
+                || bucket.bucket_start != key_bucket_start
+            {
+                report.discarded += bucket.records.len();
+                continue;
+            }
+            report.decoded += bucket.records.len();
+            for snapshot in bucket.records {
+                if snapshot.observed_at >= from
                     && snapshot.observed_at <= to
                     && snapshot.is_semantically_valid()
-            }));
+                {
+                    report.snapshots.push(snapshot);
+                    report.valid += 1;
+                } else {
+                    report.discarded += 1;
+                }
+            }
         }
-        records.sort_by_key(|snapshot| snapshot.observed_at);
-        records.dedup_by_key(|snapshot| snapshot.observed_at);
-        records
+        report
+            .snapshots
+            .sort_by_key(|snapshot| snapshot.observed_at);
+        let before = report.snapshots.len();
+        report
+            .snapshots
+            .dedup_by_key(|snapshot| snapshot.observed_at);
+        report.deduplicated = before.saturating_sub(report.snapshots.len());
+        report
     }
 
     pub fn store_gex_snapshot(&self, dataset_key: &str, snapshot: &GexSnapshot) {
@@ -498,7 +678,24 @@ impl MarketDataCache {
             .read_value(GEX_HISTORY_TABLE, &key)
             .ok()
             .flatten()
-            .and_then(|blob| decode_checked::<StoredBucket<GexSnapshot>>(&blob).ok())
+            .and_then(|blob| {
+                decode_checked::<StoredBucket<GexSnapshot>>(&blob)
+                    .ok()
+                    .or_else(|| {
+                        decode_checked::<StoredBucket<LegacyGexSnapshotV1>>(&blob)
+                            .ok()
+                            .map(|legacy| StoredBucket {
+                                schema: legacy.schema,
+                                dataset_key: legacy.dataset_key,
+                                bucket_start: legacy.bucket_start,
+                                records: legacy
+                                    .records
+                                    .into_iter()
+                                    .map(GexSnapshot::from)
+                                    .collect(),
+                            })
+                    })
+            })
             .filter(|bucket| bucket.schema == CACHE_SCHEMA && bucket.dataset_key == dataset_key)
             .map_or_else(Vec::new, |bucket| bucket.records);
         records.push(snapshot.clone());
@@ -1435,6 +1632,170 @@ mod tests {
                 .read_gex_history("series", UnixMs::new(0), UnixMs::new(u64::MAX))
                 .is_empty()
         );
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn cached_gex_snapshot(observed_at: u64) -> GexSnapshot {
+        GexSnapshot {
+            provider: OptionsProvider::Deribit,
+            underlying: OptionsUnderlying::Btc,
+            model: GexSignModel::CallPutOiProxy,
+            expiry_filter: GexExpiryFilter::SevenDays,
+            gamma_source: GexGammaSource::BlackScholesDerived,
+            gamma_provenance: GexGammaProvenance::Derived,
+            source_spot: 100_000.0,
+            observed_at: UnixMs::new(observed_at),
+            calculated_at: UnixMs::new(observed_at),
+            net_gex_1pct: Some(1.0),
+            absolute_gex_1pct: 1.0,
+            call_wall: None,
+            put_wall: None,
+            gamma_flip: None,
+            intrinsic_stress: IntrinsicStressMetrics::default(),
+            gamma_vega: GammaVegaMetrics::default(),
+            strikes: std::sync::Arc::from([]),
+            expiry_strikes: std::sync::Arc::from([]),
+            scenario_curve: std::sync::Arc::from([GexScenarioPoint {
+                price: 100_000.0,
+                net_gex_1pct: 1.0,
+                absolute_gex_1pct: 1.0,
+            }]),
+            scale_p95: 1.0,
+        }
+    }
+
+    #[test]
+    fn gex_history_roundtrips_across_hourly_buckets_and_commits() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-gex-roundtrip-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let first = cached_gex_snapshot(1_800_000_000_000);
+        let second = cached_gex_snapshot(first.observed_at.as_u64() + HOURLY_BUCKET_MS + 15_000);
+        cache.store_gex_snapshot("canonical-series", &first);
+        cache.store_gex_snapshot("canonical-series", &second);
+        cache.store_gex_snapshot("canonical-series", &second);
+        let report = cache.read_gex_history_detailed(
+            "canonical-series",
+            first.observed_at.saturating_sub(1),
+            second.observed_at.saturating_add(1),
+        );
+        assert_eq!(report.buckets_found, 2);
+        assert_eq!(report.snapshots.len(), 2);
+        assert_eq!(report.snapshots[0].observed_at, first.observed_at);
+        drop(cache);
+        let reopened = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        assert_eq!(
+            reopened
+                .read_gex_history("canonical-series", first.observed_at, second.observed_at)
+                .len(),
+            2
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_middle_gex_bucket_does_not_hide_valid_neighbors() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-gex-neighbors-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let first = cached_gex_snapshot(1_800_000_000_000);
+        let third = cached_gex_snapshot(first.observed_at.as_u64() + 2 * HOURLY_BUCKET_MS);
+        cache.store_gex_snapshot("series", &first);
+        cache.store_gex_snapshot("series", &third);
+        let corrupt_start =
+            first.observed_at.as_u64() / HOURLY_BUCKET_MS * HOURLY_BUCKET_MS + HOURLY_BUCKET_MS;
+        let write = cache.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(GEX_HISTORY_TABLE).unwrap();
+            table
+                .insert(
+                    format!("series|{corrupt_start:020}").as_str(),
+                    b"corrupt".as_slice(),
+                )
+                .unwrap();
+        }
+        write.commit().unwrap();
+        let report =
+            cache.read_gex_history_detailed("series", first.observed_at, third.observed_at);
+        assert_eq!(report.snapshots.len(), 2);
+        assert_eq!(report.corrupt_buckets, 1);
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn first_heatmap_cache_schema_loads_through_legacy_decoder() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-gex-legacy-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let current = cached_gex_snapshot(1_800_000_000_000);
+        let legacy = LegacyGexSnapshotV1 {
+            provider: current.provider,
+            underlying: current.underlying,
+            model: current.model,
+            expiry_filter: current.expiry_filter,
+            source_spot: current.source_spot,
+            observed_at: current.observed_at,
+            calculated_at: current.calculated_at,
+            net_gex_1pct: current.net_gex_1pct,
+            absolute_gex_1pct: current.absolute_gex_1pct,
+            call_wall: current.call_wall,
+            put_wall: current.put_wall,
+            gamma_flip: current.gamma_flip,
+            intrinsic_stress: current.intrinsic_stress,
+            gamma_vega: current.gamma_vega,
+            strikes: std::sync::Arc::from([]),
+            expiry_strikes: std::sync::Arc::from([]),
+            scenario_curve: current.scenario_curve,
+            scale_p95: current.scale_p95,
+        };
+        let bucket_start = legacy.observed_at.as_u64() / HOURLY_BUCKET_MS * HOURLY_BUCKET_MS;
+        let encoded = encode_checked(&StoredBucket {
+            schema: CACHE_SCHEMA,
+            dataset_key: "legacy-series".to_owned(),
+            bucket_start,
+            records: vec![legacy],
+        })
+        .unwrap();
+        let write = cache.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(GEX_HISTORY_TABLE).unwrap();
+            table
+                .insert(
+                    format!("legacy-series|{bucket_start:020}").as_str(),
+                    encoded.as_slice(),
+                )
+                .unwrap();
+        }
+        write.commit().unwrap();
+        let loaded =
+            cache.read_gex_history("legacy-series", current.observed_at, current.observed_at);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].gamma_source, GexGammaSource::BlackScholesDerived);
+        assert_eq!(loaded[0].gamma_provenance, GexGammaProvenance::Derived);
         drop(cache);
         std::fs::remove_file(path).unwrap();
     }

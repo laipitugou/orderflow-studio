@@ -122,6 +122,10 @@ impl LayoutManager {
         self.layouts.iter_mut().map(|entry| &mut entry.dashboard)
     }
 
+    pub fn iter_dashboards(&self) -> impl Iterator<Item = &Dashboard> {
+        self.layouts.iter().map(|entry| &entry.dashboard)
+    }
+
     pub fn mut_dashboard(&mut self, id: Uuid) -> Option<&mut Dashboard> {
         self.get_mut(id).map(|e| &mut e.dashboard)
     }

@@ -69,6 +69,10 @@ pub struct OptionMarketPoint {
     pub underlying_price: f64,
     pub interest_rate: f64,
     pub observed_at: UnixMs,
+    #[serde(default)]
+    pub native_gamma: Option<f64>,
+    #[serde(default)]
+    pub native_gamma_observed_at: Option<UnixMs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

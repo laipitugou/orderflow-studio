@@ -16,7 +16,8 @@ const MIN_DENOMINATOR: f64 = 1.0e-12;
 const DEFAULT_FLIP_RANGE_PERCENT: f64 = 30.0;
 const FLIP_SCAN_STEPS: usize = 240;
 const FLIP_BISECTION_STEPS: usize = 60;
-pub const DEFAULT_SCENARIO_POINTS: usize = 192;
+pub const DEFAULT_SCENARIO_POINTS: usize = 512;
+pub const NATIVE_GAMMA_MAX_AGE_MS: u64 = 90_000;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexOverlayMode {
@@ -36,10 +37,105 @@ impl GexOverlayMode {
     ];
 
     pub fn supported_by(self, model: GexSignModel) -> bool {
-        matches!(self, Self::Levels | Self::AbsoluteHeatmap)
-            || model == GexSignModel::CallPutOiProxy
+        !matches!(self, Self::NetHeatmap) || model == GexSignModel::CallPutOiProxy
     }
 }
+
+macro_rules! display_enum {
+    ($name:ident, $($variant:ident => $label:literal),+ $(,)?) => {
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(match self { $(Self::$variant => $label),+ })
+            }
+        }
+    };
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexScenarioResolution {
+    #[default]
+    Auto,
+    Samples128,
+    Samples256,
+    Samples512,
+}
+impl GexScenarioResolution {
+    pub const ALL: [Self; 4] = [
+        Self::Auto,
+        Self::Samples128,
+        Self::Samples256,
+        Self::Samples512,
+    ];
+    pub const fn samples(self) -> usize {
+        match self {
+            Self::Auto | Self::Samples512 => 512,
+            Self::Samples128 => 128,
+            Self::Samples256 => 256,
+        }
+    }
+}
+display_enum!(GexScenarioResolution, Auto => "Auto (512)", Samples128 => "128 samples", Samples256 => "256 samples", Samples512 => "512 samples");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexTimeResolution {
+    #[default]
+    FollowChart,
+    Seconds30,
+    Minute1,
+    Minute5,
+}
+impl GexTimeResolution {
+    pub const ALL: [Self; 4] = [
+        Self::FollowChart,
+        Self::Seconds30,
+        Self::Minute1,
+        Self::Minute5,
+    ];
+}
+display_enum!(GexTimeResolution, FollowChart => "Follow chart", Seconds30 => "30 seconds", Minute1 => "1 minute", Minute5 => "5 minutes");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexStrikeGeometry {
+    CompactLine,
+    #[default]
+    CompactKernel,
+    VoronoiLegacy,
+}
+impl GexStrikeGeometry {
+    pub const ALL: [Self; 3] = [Self::CompactLine, Self::CompactKernel, Self::VoronoiLegacy];
+}
+display_enum!(GexStrikeGeometry, CompactLine => "Compact line", CompactKernel => "Compact kernel", VoronoiLegacy => "Legacy filled bands");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexCurrentProfileStyle {
+    #[default]
+    Bars,
+    Curve,
+}
+impl GexCurrentProfileStyle {
+    pub const ALL: [Self; 2] = [Self::Bars, Self::Curve];
+}
+display_enum!(GexCurrentProfileStyle, Bars => "Bars", Curve => "Curve");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexGammaSource {
+    BlackScholesDerived,
+    #[default]
+    ProviderNativePreferred,
+}
+impl GexGammaSource {
+    pub const ALL: [Self; 2] = [Self::ProviderNativePreferred, Self::BlackScholesDerived];
+}
+display_enum!(GexGammaSource, BlackScholesDerived => "Black-Scholes derived", ProviderNativePreferred => "Provider native preferred");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexGammaProvenance {
+    Native,
+    #[default]
+    Derived,
+    Mixed,
+}
+display_enum!(GexGammaProvenance, Native => "Provider native", Derived => "Black-Scholes derived", Mixed => "Mixed native / derived");
 
 impl std::fmt::Display for GexOverlayMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,7 +259,7 @@ impl std::fmt::Display for GexBasisMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RawStrike => f.write_str("Raw strike"),
-            Self::ShiftToChartPrice => f.write_str("Shift to chart price"),
+            Self::ShiftToChartPrice => f.write_str("Legacy / experimental basis shift"),
         }
     }
 }
@@ -207,6 +303,17 @@ pub struct GexLevelsConfig {
     pub overlay_mode: GexOverlayMode,
     pub enabled_model: GexSignModel,
     pub expiry_filter: GexExpiryFilter,
+    pub gamma_source: GexGammaSource,
+    pub minimum_open_interest: f64,
+    pub minimum_absolute_gex: f64,
+    pub scenario_resolution: GexScenarioResolution,
+    pub time_resolution: GexTimeResolution,
+    pub strike_geometry: GexStrikeGeometry,
+    pub strike_core_width_px: f32,
+    pub strike_influence_width_px: f32,
+    pub minimum_visible_intensity: f32,
+    pub interpolate_short_gaps: bool,
+    pub maximum_gap_buckets: u8,
     pub show_gamma_flip: bool,
     pub show_call_wall: bool,
     pub show_put_wall: bool,
@@ -236,6 +343,7 @@ pub struct GexLevelsConfig {
     pub time_aggregation: GexTimeAggregation,
     pub show_current_profile: bool,
     pub current_profile_width_percent: f32,
+    pub current_profile_style: GexCurrentProfileStyle,
     pub show_persistent_gamma_zones: bool,
     pub persistent_lookback_minutes: u16,
     pub persistent_threshold: f32,
@@ -258,6 +366,17 @@ impl Default for GexLevelsConfig {
             overlay_mode: GexOverlayMode::ScenarioHeatmap,
             enabled_model: GexSignModel::CallPutOiProxy,
             expiry_filter: GexExpiryFilter::SevenDays,
+            gamma_source: GexGammaSource::ProviderNativePreferred,
+            minimum_open_interest: 0.0,
+            minimum_absolute_gex: 0.0,
+            scenario_resolution: GexScenarioResolution::Auto,
+            time_resolution: GexTimeResolution::FollowChart,
+            strike_geometry: GexStrikeGeometry::CompactKernel,
+            strike_core_width_px: 3.0,
+            strike_influence_width_px: 10.0,
+            minimum_visible_intensity: 0.08,
+            interpolate_short_gaps: false,
+            maximum_gap_buckets: 1,
             show_gamma_flip: true,
             show_call_wall: true,
             show_put_wall: true,
@@ -280,13 +399,14 @@ impl Default for GexLevelsConfig {
             positive_color: GexLevelColor::Success,
             negative_color: GexLevelColor::Danger,
             absolute_color: GexLevelColor::Primary,
-            heatmap_opacity: 0.32,
+            heatmap_opacity: 0.28,
             history_minutes: 240,
             normalization_mode: GexNormalizationMode::AutoVisible,
             time_aggregation: GexTimeAggregation::Latest,
             show_current_profile: true,
-            current_profile_width_percent: 8.0,
-            show_persistent_gamma_zones: false,
+            current_profile_width_percent: 6.0,
+            current_profile_style: GexCurrentProfileStyle::Curve,
+            show_persistent_gamma_zones: true,
             persistent_lookback_minutes: 15,
             persistent_threshold: 0.65,
             show_gamma_flip_marker: true,
@@ -312,6 +432,9 @@ impl GexLevelsConfig {
 pub struct Config {
     pub sign_model: GexSignModel,
     pub expiry_filter: GexExpiryFilter,
+    pub gamma_source: GexGammaSource,
+    pub scenario_resolution: GexScenarioResolution,
+    pub max_native_gamma_instruments: usize,
     pub min_open_interest: f64,
     pub min_absolute_gex: f64,
     pub max_visible_strikes: usize,
@@ -346,6 +469,9 @@ impl Default for Config {
         Self {
             sign_model: GexSignModel::CallPutOiProxy,
             expiry_filter: GexExpiryFilter::SevenDays,
+            gamma_source: GexGammaSource::ProviderNativePreferred,
+            scenario_resolution: GexScenarioResolution::Auto,
+            max_native_gamma_instruments: 128,
             min_open_interest: 0.0,
             min_absolute_gex: 0.0,
             max_visible_strikes: 40,
@@ -519,6 +645,8 @@ pub struct GexStrike {
     pub call_open_interest: f64,
     pub put_open_interest: f64,
     pub expiration_count: usize,
+    #[serde(default)]
+    pub gamma_provenance: GexGammaProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -531,6 +659,8 @@ pub struct GexExpiryStrike {
     pub absolute_gamma_1pct: f64,
     pub call_open_interest: f64,
     pub put_open_interest: f64,
+    #[serde(default)]
+    pub gamma_provenance: GexGammaProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -547,6 +677,10 @@ pub struct GexSnapshot {
     pub model: GexSignModel,
     #[serde(default)]
     pub expiry_filter: GexExpiryFilter,
+    #[serde(default)]
+    pub gamma_source: GexGammaSource,
+    #[serde(default)]
+    pub gamma_provenance: GexGammaProvenance,
     pub source_spot: f64,
     pub observed_at: UnixMs,
     pub calculated_at: UnixMs,
@@ -636,6 +770,8 @@ struct StrikeAccumulator {
     call_oi: f64,
     put_oi: f64,
     expirations: FxHashSet<UnixMs>,
+    native_gamma_count: usize,
+    derived_gamma_count: usize,
 }
 
 pub fn normal_pdf(value: f64) -> Option<f64> {
@@ -743,7 +879,12 @@ pub fn calculate_gex_at(
 
     for contract in selected.iter().copied() {
         let oi = contract.market.open_interest_underlying;
-        let Some(gex) = contract_gex(contract, chain.source_spot, calculated_at) else {
+        let Some((gex, provenance)) = current_contract_gex(
+            contract,
+            chain.source_spot,
+            calculated_at,
+            config.gamma_source,
+        ) else {
             continue;
         };
         if gex < config.min_absolute_gex {
@@ -756,6 +897,11 @@ pub fn calculate_gex_at(
                 ..StrikeAccumulator::default()
             });
         entry.absolute += gex;
+        match provenance {
+            GexGammaProvenance::Native => entry.native_gamma_count += 1,
+            GexGammaProvenance::Derived => entry.derived_gamma_count += 1,
+            GexGammaProvenance::Mixed => {}
+        }
         entry
             .expirations
             .insert(contract.instrument.expiration_timestamp);
@@ -779,6 +925,11 @@ pub fn calculate_gex_at(
                 ..StrikeAccumulator::default()
             });
         expiry_entry.absolute += gex;
+        match provenance {
+            GexGammaProvenance::Native => expiry_entry.native_gamma_count += 1,
+            GexGammaProvenance::Derived => expiry_entry.derived_gamma_count += 1,
+            GexGammaProvenance::Mixed => {}
+        }
         match contract.instrument.right {
             OptionRight::Call => {
                 expiry_entry.call_gex += gex;
@@ -804,6 +955,10 @@ pub fn calculate_gex_at(
                 call_open_interest: entry.call_oi,
                 put_open_interest: entry.put_oi,
                 expiration_count: entry.expirations.len(),
+                gamma_provenance: gamma_provenance(
+                    entry.native_gamma_count,
+                    entry.derived_gamma_count,
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -819,6 +974,7 @@ pub fn calculate_gex_at(
             absolute_gamma_1pct: entry.absolute,
             call_open_interest: entry.call_oi,
             put_open_interest: entry.put_oi,
+            gamma_provenance: gamma_provenance(entry.native_gamma_count, entry.derived_gamma_count),
         })
         .collect::<Vec<_>>();
     expiry_strikes.sort_by(|a, b| {
@@ -851,17 +1007,25 @@ pub fn calculate_gex_at(
         })
         .filter(|strike| strike.put_gex_1pct < 0.0)
         .map(|strike| strike.strike);
-    let (scenario_curve, gamma_flip) = if config.sign_model == GexSignModel::CallPutOiProxy {
-        build_scenario_curve(
-            &selected,
-            chain.source_spot,
-            calculated_at,
-            config.price_range_percent,
-            DEFAULT_SCENARIO_POINTS,
-        )
-    } else {
-        (Vec::new(), None)
-    };
+    let (scenario_curve, proxy_flip) = build_scenario_curve(
+        &selected,
+        chain.source_spot,
+        calculated_at,
+        config.price_range_percent,
+        config.scenario_resolution.samples(),
+    );
+    let gamma_flip = (config.sign_model == GexSignModel::CallPutOiProxy)
+        .then_some(proxy_flip)
+        .flatten();
+    let native_count = strikes
+        .iter()
+        .filter(|strike| strike.gamma_provenance == GexGammaProvenance::Native)
+        .count();
+    let derived_count = strikes
+        .iter()
+        .filter(|strike| strike.gamma_provenance == GexGammaProvenance::Derived)
+        .count();
+    let mixed_count = strikes.len().saturating_sub(native_count + derived_count);
     let scale_p95 = gex_percentile_95(strikes.iter().map(|strike| {
         if config.sign_model == GexSignModel::AbsoluteGamma {
             strike.absolute_gamma_1pct
@@ -883,6 +1047,12 @@ pub fn calculate_gex_at(
         underlying: chain.underlying,
         model: config.sign_model,
         expiry_filter: config.expiry_filter,
+        gamma_source: config.gamma_source,
+        gamma_provenance: if mixed_count > 0 || (native_count > 0 && derived_count > 0) {
+            GexGammaProvenance::Mixed
+        } else {
+            gamma_provenance(native_count, derived_count)
+        },
         source_spot: chain.source_spot,
         observed_at: chain.observed_at,
         calculated_at,
@@ -1094,11 +1264,51 @@ fn contract_gex(
         contract.market.interest_rate,
         volatility,
     )?;
-    // Deribit option book summaries express open_interest in the underlying
-    // currency already. Multiplying by contract_size again would double-scale
-    // BTC/ETH exposure and is intentionally avoided.
-    let gex = gamma * contract.market.open_interest_underlying * spot * spot * 0.01;
+    // Keep contract metadata explicit in the exposure formula. This also makes
+    // the calculation valid for providers whose OI unit is not one underlying.
+    let gex = gamma
+        * contract.market.open_interest_underlying
+        * contract.instrument.contract_size
+        * spot
+        * spot
+        * 0.01;
     (gex.is_finite() && gex >= 0.0).then_some(gex)
+}
+
+fn current_contract_gex(
+    contract: &RawOptionContractSnapshot,
+    spot: f64,
+    calculated_at: UnixMs,
+    source: GexGammaSource,
+) -> Option<(f64, GexGammaProvenance)> {
+    if source == GexGammaSource::ProviderNativePreferred
+        && let (Some(gamma), Some(observed_at)) = (
+            contract.market.native_gamma,
+            contract.market.native_gamma_observed_at,
+        )
+        && gamma.is_finite()
+        && gamma >= 0.0
+        && calculated_at.saturating_diff(observed_at) <= NATIVE_GAMMA_MAX_AGE_MS
+    {
+        let gex = gamma
+            * contract.market.open_interest_underlying
+            * contract.instrument.contract_size
+            * spot
+            * spot
+            * 0.01;
+        if gex.is_finite() && gex >= 0.0 {
+            return Some((gex, GexGammaProvenance::Native));
+        }
+    }
+    contract_gex(contract, spot, calculated_at).map(|gex| (gex, GexGammaProvenance::Derived))
+}
+
+fn gamma_provenance(native: usize, derived: usize) -> GexGammaProvenance {
+    match (native > 0, derived > 0) {
+        (true, false) => GexGammaProvenance::Native,
+        (false, true) | (false, false) => GexGammaProvenance::Derived,
+        (true, true) => GexGammaProvenance::Mixed,
+    }
 }
 
 fn proxy_total_at_price(
@@ -1225,10 +1435,99 @@ pub fn gex_percentile_95(values: impl IntoIterator<Item = f64>) -> Option<f64> {
 }
 
 pub fn gex_normalized_intensity(value: f64, scale: f64) -> Option<f32> {
+    gex_normalized_intensity_with_max(value, scale, 1.0)
+}
+
+pub fn gex_normalized_intensity_with_max(
+    value: f64,
+    scale: f64,
+    transformed_max: f64,
+) -> Option<f32> {
     if !value.is_finite() || !scale.is_finite() || scale <= 0.0 || value == 0.0 {
         return None;
     }
-    Some((value.abs() / scale).asinh().min(1.0) as f32)
+    if !transformed_max.is_finite() || transformed_max <= 0.0 {
+        return None;
+    }
+    Some(((value.abs() / scale).asinh() / transformed_max).clamp(0.0, 1.0) as f32)
+}
+
+pub fn gex_time_bucket_ms(resolution: GexTimeResolution, chart_interval_ms: u64) -> u64 {
+    match resolution {
+        GexTimeResolution::FollowChart => chart_interval_ms.max(1),
+        GexTimeResolution::Seconds30 => 30_000,
+        GexTimeResolution::Minute1 => 60_000,
+        GexTimeResolution::Minute5 => 300_000,
+    }
+}
+
+pub fn gex_bucket_start(timestamp: UnixMs, bucket_ms: u64) -> UnixMs {
+    let bucket_ms = bucket_ms.max(1);
+    UnixMs::new(timestamp.as_u64() / bucket_ms * bucket_ms)
+}
+
+pub fn regular_price_bins(low: f64, high: f64, count: usize) -> Vec<(f64, f64, f64)> {
+    if !low.is_finite() || !high.is_finite() || high <= low || count == 0 {
+        return Vec::new();
+    }
+    let step = (high - low) / count as f64;
+    (0..count)
+        .map(|index| {
+            let lower = low + index as f64 * step;
+            let upper = if index + 1 == count {
+                high
+            } else {
+                lower + step
+            };
+            (lower, upper, (lower + upper) * 0.5)
+        })
+        .collect()
+}
+
+pub fn interpolate_scenario_point(
+    curve: &[GexScenarioPoint],
+    price: f64,
+) -> Option<GexScenarioPoint> {
+    if curve.is_empty()
+        || !price.is_finite()
+        || price < curve.first()?.price
+        || price > curve.last()?.price
+    {
+        return None;
+    }
+    match curve.binary_search_by(|point| point.price.total_cmp(&price)) {
+        Ok(index) => curve.get(index).cloned(),
+        Err(index) if index > 0 && index < curve.len() => {
+            let left = &curve[index - 1];
+            let right = &curve[index];
+            let span = right.price - left.price;
+            if !span.is_finite() || span <= 0.0 {
+                return None;
+            }
+            let weight = ((price - left.price) / span).clamp(0.0, 1.0);
+            Some(GexScenarioPoint {
+                price,
+                net_gex_1pct: left.net_gex_1pct + (right.net_gex_1pct - left.net_gex_1pct) * weight,
+                absolute_gex_1pct: left.absolute_gex_1pct
+                    + (right.absolute_gex_1pct - left.absolute_gex_1pct) * weight,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn compact_kernel_alpha(distance_px: f32, core_width_px: f32, influence_width_px: f32) -> f32 {
+    let distance = distance_px.abs();
+    let core_half = core_width_px.clamp(2.0, 8.0) * 0.5;
+    let influence_half = influence_width_px.clamp(6.0, 24.0) * 0.5;
+    if distance <= core_half {
+        return 1.0;
+    }
+    if distance >= influence_half {
+        return 0.0;
+    }
+    let sigma = ((influence_half - core_half) / 2.5).max(0.1);
+    (-0.5 * ((distance - core_half) / sigma).powi(2)).exp()
 }
 
 pub fn gex_band_bounds(prices: &[f64]) -> Vec<(f64, f64)> {
@@ -1353,6 +1652,8 @@ mod tests {
                 underlying_price: 100.0,
                 interest_rate: 0.01,
                 observed_at: NOW,
+                native_gamma: None,
+                native_gamma_observed_at: None,
             },
         }
     }
@@ -1563,12 +1864,12 @@ mod tests {
     }
 
     #[test]
-    fn deribit_oi_is_not_multiplied_by_contract_size() {
+    fn exposure_respects_provider_contract_size() {
         let one = chain(vec![contract(100.0, OptionRight::Call, 7, 10.0, 1.0)]);
         let ten = chain(vec![contract(100.0, OptionRight::Call, 7, 10.0, 10.0)]);
         let a = calculate_gex_at(&one, &Config::default(), NOW);
         let b = calculate_gex_at(&ten, &Config::default(), NOW);
-        assert_eq!(a.absolute_gex_1pct, b.absolute_gex_1pct);
+        assert!((b.absolute_gex_1pct / a.absolute_gex_1pct - 10.0).abs() < 1.0e-9);
     }
 
     #[test]
@@ -1678,6 +1979,19 @@ mod tests {
         };
         customized.migrate_legacy_defaults();
         assert_eq!(customized.cluster_color, GexLevelColor::Secondary);
+
+        let first_heatmap: GexLevelsConfig =
+            serde_json::from_str(r#"{"overlay_mode":"ScenarioHeatmap"}"#)
+                .expect("first heatmap config");
+        assert_eq!(first_heatmap.overlay_mode, GexOverlayMode::ScenarioHeatmap);
+        assert_eq!(
+            first_heatmap.strike_geometry,
+            GexStrikeGeometry::CompactKernel
+        );
+        assert_eq!(
+            first_heatmap.time_resolution,
+            GexTimeResolution::FollowChart
+        );
     }
 
     #[test]
@@ -1757,6 +2071,8 @@ mod tests {
     fn new_config_roundtrips_with_scenario_default() {
         let config = GexLevelsConfig::default();
         assert_eq!(config.overlay_mode, GexOverlayMode::ScenarioHeatmap);
+        assert_eq!(config.current_profile_width_percent, 6.0);
+        assert!(config.current_profile_width_percent.clamp(4.0, 10.0) <= 10.0);
         let encoded = serde_json::to_string(&config).expect("serialize");
         let decoded: GexLevelsConfig = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
@@ -1801,6 +2117,131 @@ mod tests {
                 45_000
             ),
             UnixMs::new(2_000)
+        );
+    }
+
+    #[test]
+    fn scenario_resolutions_and_range_are_dense_and_bounded() {
+        let source = chain(vec![contract(100.0, OptionRight::Call, 7, 10.0, 1.0)]);
+        for (resolution, expected) in [
+            (GexScenarioResolution::Samples256, 256),
+            (GexScenarioResolution::Samples512, 512),
+        ] {
+            let snapshot = calculate_gex_at(
+                &source,
+                &Config {
+                    scenario_resolution: resolution,
+                    ..Config::default()
+                },
+                NOW,
+            );
+            assert_eq!(snapshot.scenario_curve.len(), expected);
+            assert!(snapshot.scenario_curve.first().expect("first").price <= 70.0);
+            assert!(snapshot.scenario_curve.last().expect("last").price >= 130.0);
+            assert!(
+                snapshot
+                    .scenario_curve
+                    .iter()
+                    .all(|point| point.absolute_gex_1pct >= 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn regular_scenario_bins_and_interpolation_do_not_use_strike_midpoints() {
+        let bins = regular_price_bins(90.0, 110.0, 4);
+        assert_eq!(
+            bins,
+            vec![
+                (90.0, 95.0, 92.5),
+                (95.0, 100.0, 97.5),
+                (100.0, 105.0, 102.5),
+                (105.0, 110.0, 107.5)
+            ]
+        );
+        let curve = [
+            GexScenarioPoint {
+                price: 90.0,
+                net_gex_1pct: -10.0,
+                absolute_gex_1pct: 10.0,
+            },
+            GexScenarioPoint {
+                price: 110.0,
+                net_gex_1pct: 10.0,
+                absolute_gex_1pct: 30.0,
+            },
+        ];
+        let midpoint = interpolate_scenario_point(&curve, 100.0).expect("interpolated");
+        assert_eq!(midpoint.net_gex_1pct, 0.0);
+        assert_eq!(midpoint.absolute_gex_1pct, 20.0);
+    }
+
+    #[test]
+    fn compact_kernel_has_exact_core_and_finite_influence() {
+        assert_eq!(compact_kernel_alpha(0.0, 3.0, 10.0), 1.0);
+        assert_eq!(compact_kernel_alpha(1.5, 3.0, 10.0), 1.0);
+        assert!(compact_kernel_alpha(3.0, 3.0, 10.0) > 0.0);
+        assert_eq!(compact_kernel_alpha(5.0, 3.0, 10.0), 0.0);
+        assert_eq!(compact_kernel_alpha(50.0, 3.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn chart_time_resolutions_align_to_unix_milliseconds() {
+        assert_eq!(
+            gex_time_bucket_ms(GexTimeResolution::FollowChart, 60_000),
+            60_000
+        );
+        assert_eq!(
+            gex_time_bucket_ms(GexTimeResolution::FollowChart, 180_000),
+            180_000
+        );
+        assert_eq!(
+            gex_time_bucket_ms(GexTimeResolution::FollowChart, 300_000),
+            300_000
+        );
+        assert_eq!(
+            gex_bucket_start(UnixMs::new(179_999), 60_000),
+            UnixMs::new(120_000)
+        );
+    }
+
+    #[test]
+    fn minimum_visible_intensity_can_remove_weak_cells() {
+        let weak = gex_normalized_intensity_with_max(0.01, 10.0, 1.0).expect("weak");
+        assert!(weak < GexLevelsConfig::default().minimum_visible_intensity);
+    }
+
+    #[test]
+    fn native_gamma_is_preferred_only_when_valid_and_fresh() {
+        let mut native = contract(100.0, OptionRight::Call, 7, 10.0, 1.0);
+        native.market.native_gamma = Some(0.25);
+        native.market.native_gamma_observed_at = Some(NOW.saturating_sub(1_000));
+        let fresh = calculate_gex_at(&chain(vec![native.clone()]), &Config::default(), NOW);
+        assert_eq!(fresh.gamma_provenance, GexGammaProvenance::Native);
+
+        native.market.native_gamma_observed_at =
+            Some(NOW.saturating_sub(NATIVE_GAMMA_MAX_AGE_MS + 1));
+        let stale = calculate_gex_at(&chain(vec![native.clone()]), &Config::default(), NOW);
+        assert_eq!(stale.gamma_provenance, GexGammaProvenance::Derived);
+
+        native.market.native_gamma = Some(f64::NAN);
+        let invalid = calculate_gex_at(&chain(vec![native]), &Config::default(), NOW);
+        assert_eq!(invalid.gamma_provenance, GexGammaProvenance::Derived);
+    }
+
+    #[test]
+    fn partial_native_coverage_is_reported_as_mixed() {
+        let mut native = contract(90.0, OptionRight::Call, 7, 10.0, 1.0);
+        native.market.native_gamma = Some(0.25);
+        native.market.native_gamma_observed_at = Some(NOW);
+        let derived = contract(110.0, OptionRight::Put, 7, 10.0, 1.0);
+        let snapshot = calculate_gex_at(&chain(vec![native, derived]), &Config::default(), NOW);
+        assert_eq!(snapshot.gamma_provenance, GexGammaProvenance::Mixed);
+        assert!(
+            snapshot
+                .scenario_curve
+                .iter()
+                .all(|point| point.absolute_gex_1pct >= 0.0)
         );
     }
 }

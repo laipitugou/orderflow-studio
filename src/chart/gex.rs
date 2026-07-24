@@ -576,6 +576,7 @@ mod tests {
                 call_open_interest: 1.0,
                 put_open_interest: 1.0,
                 expiration_count: 1,
+                gamma_provenance: data::chart::gex::GexGammaProvenance::Derived,
             })
             .collect::<Vec<_>>();
         chart.set_snapshot(
@@ -584,6 +585,8 @@ mod tests {
                 underlying: OptionsUnderlying::Btc,
                 model: GexSignModel::CallPutOiProxy,
                 expiry_filter: data::chart::gex::GexExpiryFilter::SevenDays,
+                gamma_source: data::chart::gex::GexGammaSource::BlackScholesDerived,
+                gamma_provenance: data::chart::gex::GexGammaProvenance::Derived,
                 source_spot: 100.0,
                 observed_at: UnixMs::new(1),
                 calculated_at: UnixMs::new(1),

@@ -1426,6 +1426,7 @@ mod tests {
             call_open_interest: 1.0,
             put_open_interest: 1.0,
             expiration_count: 1,
+            gamma_provenance: data::chart::gex::GexGammaProvenance::Derived,
         }
     }
 
