@@ -5,7 +5,10 @@
 //! marker and checksum; decoded records are also validated semantically before
 //! they are allowed back into the chart.
 
-use data::chart::kline::{BubbleCandidate, BubbleVolumeSummary};
+use data::chart::{
+    gex::GexSnapshot,
+    kline::{BubbleCandidate, BubbleVolumeSummary},
+};
 use exchange::{Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
@@ -32,6 +35,7 @@ const TRADE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trades_v
 const OI_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("open_interest_v1");
 // V1 stored candle/price bins. V2 stores temporal/spatial smart clusters and must never decode V1.
 const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_summaries_v2");
+const GEX_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("gex_history_v1");
 
 static CACHE: OnceLock<Option<MarketDataCache>> = OnceLock::new();
 
@@ -444,6 +448,101 @@ impl MarketDataCache {
         self.store_records(CacheKind::BubbleSummary, &key, from, to_exclusive, records);
     }
 
+    pub fn read_gex_history(
+        &self,
+        dataset_key: &str,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Vec<GexSnapshot> {
+        let Ok(read) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = read.open_table(GEX_HISTORY_TABLE) else {
+            return Vec::new();
+        };
+        let prefix = format!("{dataset_key}|");
+        let mut records = Vec::new();
+        let Ok(iter) = table.iter() else {
+            return records;
+        };
+        for entry in iter.flatten() {
+            let key = entry.0.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let Ok(bucket) = decode_checked::<StoredBucket<GexSnapshot>>(entry.1.value()) else {
+                log::warn!("CACHE GexCorrupt | key={key}");
+                continue;
+            };
+            if bucket.schema != CACHE_SCHEMA || bucket.dataset_key != dataset_key {
+                continue;
+            }
+            records.extend(bucket.records.into_iter().filter(|snapshot| {
+                snapshot.observed_at >= from
+                    && snapshot.observed_at <= to
+                    && snapshot.is_semantically_valid()
+            }));
+        }
+        records.sort_by_key(|snapshot| snapshot.observed_at);
+        records.dedup_by_key(|snapshot| snapshot.observed_at);
+        records
+    }
+
+    pub fn store_gex_snapshot(&self, dataset_key: &str, snapshot: &GexSnapshot) {
+        if !snapshot.is_semantically_valid() {
+            return;
+        }
+        let bucket_start = snapshot.observed_at.as_u64() / HOURLY_BUCKET_MS * HOURLY_BUCKET_MS;
+        let key = format!("{dataset_key}|{bucket_start:020}");
+        let mut records = self
+            .read_value(GEX_HISTORY_TABLE, &key)
+            .ok()
+            .flatten()
+            .and_then(|blob| decode_checked::<StoredBucket<GexSnapshot>>(&blob).ok())
+            .filter(|bucket| bucket.schema == CACHE_SCHEMA && bucket.dataset_key == dataset_key)
+            .map_or_else(Vec::new, |bucket| bucket.records);
+        records.push(snapshot.clone());
+        records.retain(GexSnapshot::is_semantically_valid);
+        records.sort_by_key(|value| value.observed_at);
+        records.dedup_by_key(|value| value.observed_at);
+        let bucket = StoredBucket {
+            schema: CACHE_SCHEMA,
+            dataset_key: dataset_key.to_owned(),
+            bucket_start,
+            records,
+        };
+        let Ok(encoded) = encode_checked(&bucket) else {
+            return;
+        };
+        let Ok(write) = self.db.begin_write() else {
+            return;
+        };
+        {
+            let Ok(mut table) = write.open_table(GEX_HISTORY_TABLE) else {
+                return;
+            };
+            if table.insert(key.as_str(), encoded.as_slice()).is_err() {
+                return;
+            }
+            let cutoff = snapshot
+                .observed_at
+                .as_u64()
+                .saturating_sub(24 * 60 * 60 * 1_000);
+            let prefix = format!("{dataset_key}|");
+            let _ = table.retain(|stored_key, _| {
+                if !stored_key.starts_with(&prefix) {
+                    return true;
+                }
+                stored_key
+                    .rsplit('|')
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_none_or(|start| start + HOURLY_BUCKET_MS >= cutoff)
+            });
+        }
+        let _ = write.commit();
+    }
+
     /// Removes every persisted market-data record while keeping the database
     /// open and its schema metadata intact.
     pub fn clear_all(&self) -> Result<(), String> {
@@ -455,6 +554,7 @@ impl MarketDataCache {
             TRADE_TABLE,
             OI_TABLE,
             BUBBLE_TABLE,
+            GEX_HISTORY_TABLE,
         ] {
             let mut table = write
                 .open_table(definition)
@@ -877,6 +977,9 @@ fn open_initialized_database(path: &Path) -> Result<Database, String> {
             .map_err(|error| error.to_string())?;
         let _ = write
             .open_table(BUBBLE_TABLE)
+            .map_err(|error| error.to_string())?;
+        let _ = write
+            .open_table(GEX_HISTORY_TABLE)
             .map_err(|error| error.to_string())?;
     }
     write.commit().map_err(|error| error.to_string())?;
@@ -1303,6 +1406,35 @@ mod tests {
                 .is_none()
         );
 
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_gex_bucket_is_ignored_without_blocking_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-gex-corrupt-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = open_initialized_database(&path).unwrap();
+        let cache = MarketDataCache {
+            db,
+            path: path.clone(),
+        };
+        let write = cache.db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(GEX_HISTORY_TABLE).unwrap();
+            table
+                .insert("series|00000000000000000000", b"corrupt".as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert!(
+            cache
+                .read_gex_history("series", UnixMs::new(0), UnixMs::new(u64::MAX))
+                .is_empty()
+        );
         drop(cache);
         std::fs::remove_file(path).unwrap();
     }

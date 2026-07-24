@@ -11,6 +11,7 @@ use exchange::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -94,6 +95,21 @@ struct DerivedGexKey {
     revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct DerivedGexSeriesKey {
+    chain: OptionsChainKey,
+    model: GexSignModel,
+    expiry: GexExpiryFilter,
+    min_oi_bits: u64,
+    min_gex_bits: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalGexSnapshot {
+    revision: u64,
+    value: Arc<GexSnapshot>,
+}
+
 #[derive(Debug, Clone)]
 struct FailureState {
     attempts: u32,
@@ -106,6 +122,8 @@ pub struct GexDataCoordinator {
     instruments: FxHashMap<OptionsChainKey, CachedInstruments>,
     raw_snapshots: FxHashMap<OptionsChainKey, CachedRawSnapshot>,
     derived_snapshots: FxHashMap<DerivedGexKey, CachedGexSnapshot>,
+    derived_history: FxHashMap<DerivedGexSeriesKey, VecDeque<HistoricalGexSnapshot>>,
+    loaded_history: FxHashSet<DerivedGexSeriesKey>,
     in_flight: FxHashSet<GexFetchKind>,
     failures: FxHashMap<OptionsChainKey, FailureState>,
     subscribers: FxHashMap<OptionsChainKey, usize>,
@@ -113,6 +131,7 @@ pub struct GexDataCoordinator {
     last_freshness: FxHashMap<OptionsChainKey, GexFreshness>,
     next_revision: u64,
     cache_path: PathBuf,
+    persist_heatmap: bool,
 }
 
 impl Default for GexDataCoordinator {
@@ -123,10 +142,13 @@ impl Default for GexDataCoordinator {
 
 impl GexDataCoordinator {
     pub fn new(cache_path: PathBuf) -> Self {
+        let persist_heatmap = cache_path == data::data_path(Some(CACHE_FILENAME));
         let mut coordinator = Self {
             instruments: FxHashMap::default(),
             raw_snapshots: FxHashMap::default(),
             derived_snapshots: FxHashMap::default(),
+            derived_history: FxHashMap::default(),
+            loaded_history: FxHashSet::default(),
             in_flight: FxHashSet::default(),
             failures: FxHashMap::default(),
             subscribers: FxHashMap::default(),
@@ -134,6 +156,7 @@ impl GexDataCoordinator {
             last_freshness: FxHashMap::default(),
             next_revision: 1,
             cache_path,
+            persist_heatmap,
         };
         coordinator.load_persistent();
         coordinator
@@ -298,7 +321,100 @@ impl GexDataCoordinator {
                 value: value.clone(),
             },
         );
+        let series_key = DerivedGexSeriesKey {
+            chain,
+            model: config.sign_model,
+            expiry: config.expiry_filter,
+            min_oi_bits: config.min_open_interest.to_bits(),
+            min_gex_bits: config.min_absolute_gex.to_bits(),
+        };
+        let revision = raw.revision;
+        self.ensure_history_loaded(series_key, now);
+        self.append_history(series_key, revision, value.clone(), now);
         Some(value)
+    }
+
+    pub fn history(
+        &self,
+        underlying: OptionsUnderlying,
+        config: &Config,
+        retention_minutes: u16,
+        now: UnixMs,
+    ) -> Vec<Arc<GexSnapshot>> {
+        let key = DerivedGexSeriesKey {
+            chain: OptionsChainKey::deribit(underlying),
+            model: config.sign_model,
+            expiry: config.expiry_filter,
+            min_oi_bits: config.min_open_interest.to_bits(),
+            min_gex_bits: config.min_absolute_gex.to_bits(),
+        };
+        let retention_ms = u64::from(retention_minutes.clamp(30, 24 * 60)) * 60_000;
+        let cutoff = now.saturating_sub(retention_ms);
+        self.derived_history
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.value.observed_at >= cutoff)
+            .map(|entry| entry.value.clone())
+            .collect()
+    }
+
+    fn append_history(
+        &mut self,
+        key: DerivedGexSeriesKey,
+        revision: u64,
+        value: Arc<GexSnapshot>,
+        now: UnixMs,
+    ) {
+        const DISK_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+        const MAX_HISTORY_SNAPSHOTS: usize = 5_760;
+        let history = self.derived_history.entry(key).or_default();
+        if history
+            .iter()
+            .any(|entry| entry.revision == revision || entry.value.observed_at == value.observed_at)
+        {
+            return;
+        }
+        let position = history
+            .iter()
+            .position(|entry| entry.value.observed_at > value.observed_at)
+            .unwrap_or(history.len());
+        let persisted = value.clone();
+        history.insert(position, HistoricalGexSnapshot { revision, value });
+        let cutoff = now.saturating_sub(DISK_RETENTION_MS);
+        while history
+            .front()
+            .is_some_and(|entry| entry.value.observed_at < cutoff)
+            || history.len() > MAX_HISTORY_SNAPSHOTS
+        {
+            history.pop_front();
+        }
+        if self.persist_heatmap
+            && let Some(cache) = crate::connector::persistent_cache::market_cache()
+        {
+            cache.store_gex_snapshot(&series_cache_key(key), persisted.as_ref());
+        }
+    }
+
+    fn ensure_history_loaded(&mut self, key: DerivedGexSeriesKey, now: UnixMs) {
+        if !self.loaded_history.insert(key) || !self.persist_heatmap {
+            return;
+        }
+        let Some(cache) = crate::connector::persistent_cache::market_cache() else {
+            return;
+        };
+        let from = now.saturating_sub(24 * 60 * 60 * 1_000);
+        let stored = cache.read_gex_history(&series_cache_key(key), from, now);
+        let mut stored = stored
+            .into_iter()
+            .map(|value| HistoricalGexSnapshot {
+                revision: 0,
+                value: Arc::new(value),
+            })
+            .collect::<Vec<_>>();
+        stored.sort_by_key(|entry| entry.value.observed_at);
+        stored.dedup_by_key(|entry| entry.value.observed_at);
+        self.derived_history.entry(key).or_default().extend(stored);
     }
 
     pub fn freshness(&mut self, underlying: OptionsUnderlying, now: UnixMs) -> GexFreshness {
@@ -337,6 +453,8 @@ impl GexDataCoordinator {
     pub fn invalidate_persistent(&mut self) -> std::io::Result<()> {
         self.raw_snapshots.clear();
         self.derived_snapshots.clear();
+        self.derived_history.clear();
+        self.loaded_history.clear();
         if self.cache_path.exists() {
             std::fs::remove_file(&self.cache_path)?;
         }
@@ -407,6 +525,18 @@ impl GexDataCoordinator {
         let bytes = serde_json::to_vec(&stored).map_err(std::io::Error::other)?;
         atomic_write(&self.cache_path, &bytes)
     }
+}
+
+fn series_cache_key(key: DerivedGexSeriesKey) -> String {
+    format!(
+        "gex|provider={:?}|underlying={:?}|model={:?}|expiry={:?}|min_oi={:016x}|min_gex={:016x}",
+        key.chain.provider,
+        key.chain.underlying,
+        key.model,
+        key.expiry,
+        key.min_oi_bits,
+        key.min_gex_bits,
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -696,5 +826,87 @@ mod tests {
             [GexFetchKind::Instruments(_)]
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn heatmap_snapshot(observed_at: UnixMs, model: GexSignModel) -> Arc<GexSnapshot> {
+        Arc::new(calculate_gex_at(
+            &snapshot(observed_at),
+            &Config {
+                sign_model: model,
+                ..Config::default()
+            },
+            observed_at,
+        ))
+    }
+
+    #[test]
+    fn history_is_ordered_deduplicated_and_pruned() {
+        let now = UnixMs::new(1_800_100_000_000);
+        let mut value = coordinator();
+        let key = DerivedGexSeriesKey {
+            chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
+            model: GexSignModel::CallPutOiProxy,
+            expiry: GexExpiryFilter::SevenDays,
+            min_oi_bits: 0.0f64.to_bits(),
+            min_gex_bits: 0.0f64.to_bits(),
+        };
+        let newer = now.saturating_sub(1_000);
+        let older = now.saturating_sub(2_000);
+        value.append_history(key, 2, heatmap_snapshot(newer, key.model), now);
+        value.append_history(key, 1, heatmap_snapshot(older, key.model), now);
+        value.append_history(key, 3, heatmap_snapshot(newer, key.model), now);
+        assert_eq!(value.derived_history[&key].len(), 2);
+        assert_eq!(value.derived_history[&key][0].value.observed_at, older);
+        let expired = now.saturating_sub(24 * 60 * 60 * 1_000 + 1);
+        value.append_history(key, 4, heatmap_snapshot(expired, key.model), now);
+        assert!(
+            value.derived_history[&key]
+                .iter()
+                .all(|entry| entry.value.observed_at != expired)
+        );
+    }
+
+    #[test]
+    fn histories_are_separated_by_dataset_configuration() {
+        let now = UnixMs::new(1_800_100_000_000);
+        let mut value = coordinator();
+        let base = DerivedGexSeriesKey {
+            chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
+            model: GexSignModel::CallPutOiProxy,
+            expiry: GexExpiryFilter::SevenDays,
+            min_oi_bits: 0.0f64.to_bits(),
+            min_gex_bits: 0.0f64.to_bits(),
+        };
+        let absolute = DerivedGexSeriesKey {
+            model: GexSignModel::AbsoluteGamma,
+            ..base
+        };
+        value.append_history(base, 1, heatmap_snapshot(now, base.model), now);
+        value.append_history(absolute, 1, heatmap_snapshot(now, absolute.model), now);
+        assert_eq!(value.derived_history.len(), 2);
+        assert!(!Arc::ptr_eq(
+            &value.derived_history[&base][0].value,
+            &value.derived_history[&absolute][0].value
+        ));
+    }
+
+    #[test]
+    fn history_has_an_absolute_snapshot_cap() {
+        let now = UnixMs::new(1_800_100_000_000);
+        let mut value = coordinator();
+        let key = DerivedGexSeriesKey {
+            chain: OptionsChainKey::deribit(OptionsUnderlying::Btc),
+            model: GexSignModel::CallPutOiProxy,
+            expiry: GexExpiryFilter::SevenDays,
+            min_oi_bits: 0.0f64.to_bits(),
+            min_gex_bits: 0.0f64.to_bits(),
+        };
+        let template = heatmap_snapshot(now, key.model);
+        for revision in 0..5_761u64 {
+            let mut snapshot = (*template).clone();
+            snapshot.observed_at = now.saturating_sub(5_761 - revision);
+            value.append_history(key, revision + 1, Arc::new(snapshot), now);
+        }
+        assert_eq!(value.derived_history[&key].len(), 5_760);
     }
 }

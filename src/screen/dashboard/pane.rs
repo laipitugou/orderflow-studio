@@ -93,6 +93,7 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     PaneClicked(pane_grid::Pane),
     PaneResized(pane_grid::ResizeEvent),

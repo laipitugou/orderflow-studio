@@ -158,6 +158,7 @@ impl std::fmt::Display for LinkGroup {
 
 /// Defines the specific configuration for different types of pane settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum VisualConfig {
     Heatmap(heatmap::Config),
     TimeAndSales(timeandsales::Config),

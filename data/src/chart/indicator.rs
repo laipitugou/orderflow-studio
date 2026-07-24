@@ -99,7 +99,7 @@ impl Display for KlineIndicator {
             KlineIndicator::VolumeBubbles => write!(f, "Volume Bubbles"),
             KlineIndicator::SessionVolumeProfile => write!(f, "Session Volume Profile"),
             KlineIndicator::Vwap => write!(f, "VWAP"),
-            KlineIndicator::GexLevels => write!(f, "GEX Levels"),
+            KlineIndicator::GexLevels => write!(f, "GEX Overlay"),
         }
     }
 }

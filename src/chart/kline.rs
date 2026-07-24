@@ -235,8 +235,18 @@ pub struct KlineChart {
     last_tick: Instant,
     visual_config: Config,
     gex_snapshot: Option<Arc<data::chart::gex::GexSnapshot>>,
+    gex_history: Vec<Arc<data::chart::gex::GexSnapshot>>,
+    gex_freshness: data::chart::gex::GexFreshness,
+    gex_error: Option<Arc<str>>,
+    gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
+}
+
+#[derive(Debug, Default)]
+struct GexRenderCache {
+    key: Option<u64>,
+    display_scale: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,6 +361,10 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     gex_snapshot: None,
+                    gex_history: Vec::new(),
+                    gex_freshness: data::chart::gex::GexFreshness::Loading,
+                    gex_error: None,
+                    gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                 }
@@ -418,6 +432,10 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     gex_snapshot: None,
+                    gex_history: Vec::new(),
+                    gex_freshness: data::chart::gex::GexFreshness::Loading,
+                    gex_error: None,
+                    gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                 }
@@ -1385,6 +1403,30 @@ impl KlineChart {
             return;
         }
         self.gex_snapshot = snapshot;
+        self.chart.cache.clear_all();
+    }
+
+    pub fn set_gex_overlay_data(
+        &mut self,
+        snapshot: Option<Arc<data::chart::gex::GexSnapshot>>,
+        history: Vec<Arc<data::chart::gex::GexSnapshot>>,
+        freshness: data::chart::gex::GexFreshness,
+        error: Option<Arc<str>>,
+    ) {
+        let unchanged = self.gex_snapshot.as_ref().map(|value| value.observed_at)
+            == snapshot.as_ref().map(|value| value.observed_at)
+            && self.gex_history.len() == history.len()
+            && self.gex_history.last().map(|value| value.observed_at)
+                == history.last().map(|value| value.observed_at)
+            && self.gex_freshness == freshness
+            && self.gex_error == error;
+        if unchanged {
+            return;
+        }
+        self.gex_snapshot = snapshot;
+        self.gex_history = history;
+        self.gex_freshness = freshness;
+        self.gex_error = error;
         self.chart.cache.clear_all();
     }
 
@@ -2431,10 +2473,14 @@ impl canvas::Program<Message> for KlineChart {
                     if self.indicator_enabled(KlineIndicator::GexLevels)
                         && let Some(snapshot) = &self.gex_snapshot
                     {
-                        draw_gex_levels(
+                        draw_gex_overlay(
                             frame,
                             price_to_y,
+                            interval_to_x,
                             snapshot,
+                            &self.gex_history,
+                            self.gex_freshness,
+                            &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
                             chart.tick_size,
                             self.data_source
@@ -2546,6 +2592,18 @@ impl canvas::Program<Message> for KlineChart {
                         cursor_position,
                         bounds_size,
                     );
+                } else if self.visual_config.gex_levels().show_hover_tooltip
+                    && self.indicator_enabled(KlineIndicator::GexLevels)
+                    && draw_gex_hover_tooltip(
+                        frame,
+                        chart,
+                        &self.gex_history,
+                        &self.visual_config.gex_levels(),
+                        cursor_position,
+                        bounds_size,
+                        palette,
+                    )
+                {
                 } else {
                     draw_crosshair_tooltip(
                         &self.data_source,
@@ -2590,6 +2648,684 @@ impl canvas::Program<Message> for KlineChart {
                 }
             }
         }
+    }
+}
+
+fn draw_gex_hover_tooltip(
+    frame: &mut canvas::Frame,
+    chart: &ViewState,
+    history: &[Arc<data::chart::gex::GexSnapshot>],
+    config: &data::chart::gex::GexLevelsConfig,
+    cursor: Point,
+    bounds: Size,
+    palette: &Extended,
+) -> bool {
+    use data::chart::gex::{GexBasisMode, GexOverlayMode, dominant_expiry, gex_band_bounds};
+    if config.overlay_mode == GexOverlayMode::Levels || history.is_empty() {
+        return false;
+    }
+    let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+    let world = Point::new(
+        (cursor.x - center.x) / chart.scaling - chart.translation.x,
+        (cursor.y - center.y) / chart.scaling - chart.translation.y,
+    );
+    let time = UnixMs::new(chart.x_to_interval(world.x));
+    let Some(snapshot) = history
+        .iter()
+        .rev()
+        .find(|snapshot| snapshot.observed_at <= time)
+    else {
+        return false;
+    };
+    let hovered_price = chart.y_to_price(world.y).to_f64();
+    let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        f64::from(chart.base_price_y.to_f32_lossy()) - snapshot.source_spot
+    } else {
+        0.0
+    };
+    let cells = gex_snapshot_cells(snapshot, config.overlay_mode);
+    let prices = cells
+        .iter()
+        .map(|(price, _)| *price + basis)
+        .collect::<Vec<_>>();
+    let Some((index, _)) = gex_band_bounds(&prices)
+        .iter()
+        .enumerate()
+        .find(|(_, (lower, upper))| hovered_price >= *lower && hovered_price <= *upper)
+    else {
+        return false;
+    };
+    let (price, value) = cells[index];
+    let age_seconds = UnixMs::now().saturating_diff(snapshot.observed_at) / 1_000;
+    let distance = (price / snapshot.source_spot - 1.0) * 100.0;
+    let mut lines = vec![
+        format!(
+            "Snapshot {} ({}s old)",
+            snapshot.observed_at.as_u64(),
+            age_seconds
+        ),
+        format!(
+            "Source spot {:.2}  Distance {distance:+.2}%",
+            snapshot.source_spot
+        ),
+        format!(
+            "Model {}  Expiry {}",
+            snapshot.model, snapshot.expiry_filter
+        ),
+    ];
+    if config.overlay_mode == GexOverlayMode::ScenarioHeatmap {
+        lines.push(format!("Hypothetical price {price:.2}"));
+        lines.push(format!("Scenario net GEX {value:+.2}"));
+        lines.push(format!(
+            "Gamma Flip {}",
+            snapshot
+                .gamma_flip
+                .map_or_else(|| "n/a".into(), |flip| format!("{flip:.2}"))
+        ));
+        lines.push("OI Proxy scenario".into());
+    } else if let Some(strike) = snapshot
+        .strikes
+        .iter()
+        .find(|strike| strike.strike.to_bits() == price.to_bits())
+    {
+        lines.push(format!(
+            "Strike {:.2}  Net {:+.2}",
+            strike.strike, strike.net_gex_1pct
+        ));
+        lines.push(format!(
+            "Absolute {:.2}  Call {:+.2}  Put {:+.2}",
+            strike.absolute_gamma_1pct, strike.call_gex_1pct, strike.put_gex_1pct
+        ));
+        lines.push(format!(
+            "Call OI {:.2}  Put OI {:.2}",
+            strike.call_open_interest, strike.put_open_interest
+        ));
+        if let Some((expiry, share)) = dominant_expiry(&snapshot.expiry_strikes, strike.strike) {
+            lines.push(format!(
+                "Dominant expiry {} ({:.0}%)",
+                expiry.as_u64(),
+                share * 100.0
+            ));
+        }
+        if snapshot.model == data::chart::gex::GexSignModel::CallPutOiProxy {
+            lines.push("OI Proxy".into());
+        }
+    }
+    let width = 300.0;
+    let height = 12.0 + lines.len() as f32 * 16.0;
+    let x = (cursor.x + 14.0).min((bounds.width - width - 4.0).max(4.0));
+    let y = (cursor.y + 14.0).min((bounds.height - height - 4.0).max(4.0));
+    frame.fill(
+        &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+        palette.background.base.color.scale_alpha(0.94),
+    );
+    for (line, text) in lines.iter().enumerate() {
+        draw_cluster_text(
+            frame,
+            text,
+            Point::new(x + 8.0, y + 10.0 + line as f32 * 16.0),
+            11.0,
+            palette.background.base.text,
+            Alignment::Start,
+            Alignment::Start,
+        );
+    }
+    true
+}
+
+fn draw_gex_overlay(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32 + Copy,
+    time_to_x: impl Fn(u64) -> f32 + Copy,
+    snapshot: &data::chart::gex::GexSnapshot,
+    history: &[Arc<data::chart::gex::GexSnapshot>],
+    freshness: data::chart::gex::GexFreshness,
+    render_cache: &RefCell<GexRenderCache>,
+    config: &data::chart::gex::GexLevelsConfig,
+    tick_size: PriceStep,
+    latest_chart_price: f64,
+    visible_region: Rectangle,
+    chart_scaling: f32,
+    palette: &Extended,
+) {
+    use data::chart::gex::GexOverlayMode;
+    if config.overlay_mode == GexOverlayMode::Levels {
+        draw_gex_levels(
+            frame,
+            price_to_y,
+            snapshot,
+            config,
+            tick_size,
+            latest_chart_price,
+            visible_region,
+            chart_scaling,
+            palette,
+        );
+        return;
+    }
+    if !config.overlay_mode.supported_by(config.enabled_model) {
+        return;
+    }
+    let display_scale = draw_gex_heatmap(
+        frame,
+        price_to_y,
+        time_to_x,
+        history,
+        freshness,
+        render_cache,
+        config,
+        latest_chart_price,
+        visible_region,
+        chart_scaling,
+        palette,
+    );
+    if config.show_persistent_gamma_zones && freshness != data::chart::gex::GexFreshness::Expired {
+        draw_persistent_gamma_zones(
+            frame,
+            price_to_y,
+            history,
+            config,
+            latest_chart_price,
+            visible_region,
+            chart_scaling,
+            palette,
+        );
+    }
+    if config.show_current_profile {
+        draw_gex_current_profile(
+            frame,
+            price_to_y,
+            snapshot,
+            config,
+            display_scale,
+            latest_chart_price,
+            visible_region,
+            chart_scaling,
+            palette,
+        );
+    }
+    draw_gex_reference_markers(
+        frame,
+        price_to_y,
+        snapshot,
+        config,
+        latest_chart_price,
+        visible_region,
+        chart_scaling,
+        palette,
+    );
+}
+
+fn draw_persistent_gamma_zones(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    history: &[Arc<data::chart::gex::GexSnapshot>],
+    config: &data::chart::gex::GexLevelsConfig,
+    latest_chart_price: f64,
+    region: Rectangle,
+    scaling: f32,
+    palette: &Extended,
+) {
+    use data::chart::gex::{
+        GexBasisMode, gex_band_bounds, gex_percentile_95, persistent_gamma_zone_score,
+    };
+    let Some(current) = history.last() else {
+        return;
+    };
+    let cutoff = current
+        .observed_at
+        .saturating_sub(u64::from(config.persistent_lookback_minutes.clamp(1, 60)) * 60_000);
+    let lookback = history
+        .iter()
+        .filter(|snapshot| snapshot.observed_at >= cutoff)
+        .collect::<Vec<_>>();
+    if lookback.len() < 3 {
+        return;
+    }
+    let current_cells = gex_snapshot_cells(current, config.overlay_mode);
+    let Some(scale) = gex_percentile_95(current_cells.iter().map(|(_, value)| *value)) else {
+        return;
+    };
+    let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        latest_chart_price - current.source_spot
+    } else {
+        0.0
+    };
+    let prices = current_cells
+        .iter()
+        .map(|(price, _)| *price + basis)
+        .collect::<Vec<_>>();
+    for ((price, value), (lower, upper)) in current_cells.iter().zip(gex_band_bounds(&prices)) {
+        let mut present = 0usize;
+        let mut local_max = 0usize;
+        for snapshot in &lookback {
+            let cells = gex_snapshot_cells(snapshot, config.overlay_mode);
+            if let Some(position) = cells
+                .iter()
+                .position(|(candidate, _)| candidate.to_bits() == price.to_bits())
+            {
+                present += 1;
+                let magnitude = cells[position].1.abs();
+                let previous = position
+                    .checked_sub(1)
+                    .and_then(|i| cells.get(i))
+                    .map_or(0.0, |cell| cell.1.abs());
+                let next = cells.get(position + 1).map_or(0.0, |cell| cell.1.abs());
+                if magnitude >= previous && magnitude >= next {
+                    local_max += 1;
+                }
+            }
+        }
+        if present < 3 {
+            continue;
+        }
+        let current_magnitude = (value.abs() / scale).asinh().min(1.0);
+        let score = persistent_gamma_zone_score(
+            current_magnitude,
+            present as f64 / lookback.len() as f64,
+            local_max as f64 / present as f64,
+        );
+        if score < f64::from(config.persistent_threshold.clamp(0.5, 0.9)) {
+            continue;
+        }
+        let top = price_to_y(Price::from_f64(upper))
+            .min(price_to_y(Price::from_f64(lower)))
+            .max(region.y);
+        let bottom = price_to_y(Price::from_f64(upper))
+            .max(price_to_y(Price::from_f64(lower)))
+            .min(region.y + region.height);
+        if bottom <= top {
+            continue;
+        }
+        let role = if *value >= 0.0 {
+            config.positive_color
+        } else {
+            config.negative_color
+        };
+        let width = region.width * 0.12;
+        frame.stroke(
+            &Path::rectangle(
+                Point::new(region.x + region.width - width, top),
+                Size::new(width, bottom - top),
+            ),
+            Stroke::default()
+                .with_color(resolve_gex_color(role, palette).scale_alpha(0.8))
+                .with_width(gex_screen_width_to_world(1.0, scaling)),
+        );
+    }
+}
+
+fn resolve_gex_color(role: data::chart::gex::GexLevelColor, palette: &Extended) -> Color {
+    use data::chart::gex::GexLevelColor;
+    match role {
+        GexLevelColor::Primary => palette.primary.strong.color,
+        GexLevelColor::Success => palette.success.strong.color,
+        GexLevelColor::Danger => palette.danger.strong.color,
+        GexLevelColor::Warning => palette.warning.strong.color,
+        GexLevelColor::Secondary => palette.secondary.strong.color,
+    }
+}
+
+fn gex_snapshot_cells(
+    snapshot: &data::chart::gex::GexSnapshot,
+    mode: data::chart::gex::GexOverlayMode,
+) -> Vec<(f64, f64)> {
+    use data::chart::gex::GexOverlayMode;
+    match mode {
+        GexOverlayMode::ScenarioHeatmap => snapshot
+            .scenario_curve
+            .iter()
+            .map(|point| (point.price, point.net_gex_1pct))
+            .collect(),
+        GexOverlayMode::AbsoluteHeatmap => snapshot
+            .strikes
+            .iter()
+            .map(|strike| (strike.strike, strike.absolute_gamma_1pct))
+            .collect(),
+        GexOverlayMode::NetHeatmap => snapshot
+            .strikes
+            .iter()
+            .map(|strike| (strike.strike, strike.net_gex_1pct))
+            .collect(),
+        GexOverlayMode::Levels => Vec::new(),
+    }
+}
+
+fn draw_gex_heatmap(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32 + Copy,
+    time_to_x: impl Fn(u64) -> f32 + Copy,
+    history: &[Arc<data::chart::gex::GexSnapshot>],
+    freshness: data::chart::gex::GexFreshness,
+    render_cache: &RefCell<GexRenderCache>,
+    config: &data::chart::gex::GexLevelsConfig,
+    latest_chart_price: f64,
+    region: Rectangle,
+    scaling: f32,
+    palette: &Extended,
+) -> Option<f64> {
+    use data::chart::gex::{
+        GexBasisMode, GexFreshness, GexNormalizationMode, gex_band_bounds,
+        gex_normalized_intensity, gex_percentile_95,
+    };
+    if history.is_empty() {
+        return None;
+    }
+    let visible = history
+        .iter()
+        .enumerate()
+        .filter(|(_, snapshot)| {
+            let x = time_to_x(snapshot.observed_at.as_u64());
+            x >= region.x - 2.0 && x <= region.x + region.width + 2.0
+        })
+        .collect::<Vec<_>>();
+    let scale = match config.normalization_mode {
+        GexNormalizationMode::AutoVisible => {
+            gex_percentile_95(visible.iter().flat_map(|(_, snapshot)| {
+                gex_snapshot_cells(snapshot, config.overlay_mode)
+                    .into_iter()
+                    .map(|(_, value)| value)
+            }))
+        }
+        GexNormalizationMode::UtcDayLocked => {
+            let day_start = UnixMs::now().as_u64() / 86_400_000 * 86_400_000;
+            gex_percentile_95(
+                history
+                    .iter()
+                    .filter(|snapshot| snapshot.observed_at.as_u64() >= day_start)
+                    .flat_map(|snapshot| {
+                        gex_snapshot_cells(snapshot, config.overlay_mode)
+                            .into_iter()
+                            .map(|(_, value)| value)
+                    }),
+            )
+        }
+        GexNormalizationMode::GlobalHistory => {
+            gex_percentile_95(history.iter().flat_map(|snapshot| {
+                gex_snapshot_cells(snapshot, config.overlay_mode)
+                    .into_iter()
+                    .map(|(_, value)| value)
+            }))
+        }
+    };
+    let scale = scale?;
+    let cache_key = history
+        .last()
+        .map_or(0, |snapshot| snapshot.observed_at.as_u64())
+        ^ (history.len() as u64).rotate_left(11)
+        ^ u64::from(region.x.to_bits()).rotate_left(19)
+        ^ u64::from(region.y.to_bits()).rotate_left(27)
+        ^ u64::from(region.width.to_bits()).rotate_left(35)
+        ^ u64::from(region.height.to_bits()).rotate_left(43)
+        ^ (config.overlay_mode as u64).rotate_left(51)
+        ^ (config.normalization_mode as u64).rotate_left(55);
+    let scale = {
+        let mut cache = render_cache.borrow_mut();
+        if cache.key != Some(cache_key) {
+            cache.display_scale = Some(
+                cache
+                    .display_scale
+                    .map_or(scale, |previous| previous * 0.85 + scale * 0.15),
+            );
+            cache.key = Some(cache_key);
+        }
+        cache.display_scale.unwrap_or(scale)
+    };
+    let basis = |snapshot: &data::chart::gex::GexSnapshot| {
+        if config.basis_mode == GexBasisMode::ShiftToChartPrice && latest_chart_price.is_finite() {
+            latest_chart_price - snapshot.source_spot
+        } else {
+            0.0
+        }
+    };
+    type GexPixelBucket<'a> = (i32, Vec<(usize, &'a Arc<data::chart::gex::GexSnapshot>)>);
+    let mut buckets: Vec<GexPixelBucket<'_>> = Vec::new();
+    for entry in visible {
+        let pixel = (time_to_x(entry.1.observed_at.as_u64()) * scaling).floor() as i32;
+        if let Some((last_pixel, entries)) = buckets.last_mut()
+            && *last_pixel == pixel
+        {
+            entries.push(entry);
+        } else {
+            buckets.push((pixel, vec![entry]));
+        }
+    }
+    for bucket_index in 0..buckets.len() {
+        let entries = &buckets[bucket_index].1;
+        let Some((history_index, snapshot)) = entries.last().copied() else {
+            continue;
+        };
+        let x0 = time_to_x(entries[0].1.observed_at.as_u64()).max(region.x);
+        let next_time = buckets
+            .get(bucket_index + 1)
+            .and_then(|(_, next)| next.first())
+            .map(|(_, next)| next.observed_at.as_u64())
+            .or_else(|| {
+                history
+                    .get(history_index + 1)
+                    .map(|next| next.observed_at.as_u64())
+            });
+        let end_time = data::chart::gex::gex_column_end(
+            snapshot.observed_at,
+            next_time.map(UnixMs::new),
+            freshness,
+            UnixMs::now(),
+            crate::connector::gex::FRESH_THRESHOLD_MS,
+        )
+        .as_u64();
+        let x1 = time_to_x(end_time).min(region.x + region.width);
+        if x1 <= x0 {
+            continue;
+        }
+        let mut cells = gex_snapshot_cells(snapshot, config.overlay_mode);
+        if entries.len() > 1 {
+            for (price, value) in &mut cells {
+                let values = entries
+                    .iter()
+                    .filter_map(|(_, candidate)| {
+                        gex_snapshot_cells(candidate, config.overlay_mode)
+                            .into_iter()
+                            .find(|(candidate_price, _)| {
+                                candidate_price.to_bits() == price.to_bits()
+                            })
+                            .map(|(_, candidate_value)| candidate_value)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(aggregated) =
+                    data::chart::gex::aggregate_gex_values(config.time_aggregation, &values)
+                {
+                    *value = aggregated;
+                }
+            }
+        }
+        let prices = cells
+            .iter()
+            .map(|(price, _)| *price + basis(snapshot))
+            .collect::<Vec<_>>();
+        for ((_, value), (lower, upper)) in cells.iter().zip(gex_band_bounds(&prices)) {
+            let Some(intensity) = gex_normalized_intensity(*value, scale) else {
+                continue;
+            };
+            let y0 = price_to_y(Price::from_f64(upper));
+            let y1 = price_to_y(Price::from_f64(lower));
+            let top = y0.min(y1).max(region.y);
+            let bottom = y0.max(y1).min(region.y + region.height);
+            if bottom <= top {
+                continue;
+            }
+            let role = if config.overlay_mode == data::chart::gex::GexOverlayMode::AbsoluteHeatmap {
+                config.absolute_color
+            } else if *value >= 0.0 {
+                config.positive_color
+            } else {
+                config.negative_color
+            };
+            let stale_factor =
+                if freshness == GexFreshness::Stale || freshness == GexFreshness::Error {
+                    0.72
+                } else {
+                    1.0
+                };
+            frame.fill(
+                &Path::rectangle(Point::new(x0, top), Size::new(x1 - x0, bottom - top)),
+                resolve_gex_color(role, palette).scale_alpha(
+                    config.heatmap_opacity.clamp(0.05, 0.60) * intensity * stale_factor,
+                ),
+            );
+        }
+    }
+    Some(scale)
+}
+
+fn draw_gex_current_profile(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    snapshot: &data::chart::gex::GexSnapshot,
+    config: &data::chart::gex::GexLevelsConfig,
+    display_scale: Option<f64>,
+    latest_chart_price: f64,
+    region: Rectangle,
+    scaling: f32,
+    palette: &Extended,
+) {
+    use data::chart::gex::{
+        GexBasisMode, GexOverlayMode, gex_band_bounds, gex_normalized_intensity, gex_percentile_95,
+    };
+    let cells = gex_snapshot_cells(snapshot, config.overlay_mode);
+    let Some(scale) =
+        display_scale.or_else(|| gex_percentile_95(cells.iter().map(|(_, value)| *value)))
+    else {
+        return;
+    };
+    let width = region.width * config.current_profile_width_percent.clamp(4.0, 15.0) / 100.0;
+    let right = region.x + region.width - gex_screen_width_to_world(4.0, scaling);
+    let zero = if config.overlay_mode == GexOverlayMode::AbsoluteHeatmap {
+        right - width
+    } else {
+        right - width * 0.5
+    };
+    frame.stroke(
+        &Path::line(
+            Point::new(zero, region.y),
+            Point::new(zero, region.y + region.height),
+        ),
+        Stroke::default()
+            .with_color(palette.background.strong.color.scale_alpha(0.6))
+            .with_width(gex_screen_width_to_world(1.0, scaling)),
+    );
+    let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        latest_chart_price - snapshot.source_spot
+    } else {
+        0.0
+    };
+    let prices = cells
+        .iter()
+        .map(|(price, _)| *price + basis)
+        .collect::<Vec<_>>();
+    for ((_, value), (lower, upper)) in cells.iter().zip(gex_band_bounds(&prices)) {
+        let Some(intensity) = gex_normalized_intensity(*value, scale) else {
+            continue;
+        };
+        let top = price_to_y(Price::from_f64(upper))
+            .min(price_to_y(Price::from_f64(lower)))
+            .max(region.y);
+        let bottom = price_to_y(Price::from_f64(upper))
+            .max(price_to_y(Price::from_f64(lower)))
+            .min(region.y + region.height);
+        if bottom <= top {
+            continue;
+        }
+        let (x, bar_width, role) = if config.overlay_mode == GexOverlayMode::AbsoluteHeatmap {
+            (zero, width * intensity, config.absolute_color)
+        } else if *value >= 0.0 {
+            (zero, width * 0.5 * intensity, config.positive_color)
+        } else {
+            (
+                zero - width * 0.5 * intensity,
+                width * 0.5 * intensity,
+                config.negative_color,
+            )
+        };
+        frame.fill(
+            &Path::rectangle(Point::new(x, top), Size::new(bar_width, bottom - top)),
+            resolve_gex_color(role, palette)
+                .scale_alpha((config.heatmap_opacity + 0.18).clamp(0.1, 0.75)),
+        );
+    }
+}
+
+fn draw_gex_reference_markers(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    snapshot: &data::chart::gex::GexSnapshot,
+    config: &data::chart::gex::GexLevelsConfig,
+    latest_chart_price: f64,
+    region: Rectangle,
+    scaling: f32,
+    palette: &Extended,
+) {
+    use data::chart::gex::GexBasisMode;
+    let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        latest_chart_price - snapshot.source_spot
+    } else {
+        0.0
+    };
+    let markers = [
+        (
+            config.show_gamma_flip_marker,
+            "GF",
+            snapshot.gamma_flip,
+            config.gamma_flip_color,
+        ),
+        (
+            config.show_call_wall_marker,
+            "CW",
+            snapshot.call_wall,
+            config.call_wall_color,
+        ),
+        (
+            config.show_put_wall_marker,
+            "PW",
+            snapshot.put_wall,
+            config.put_wall_color,
+        ),
+    ];
+    for (show, label, price, role) in markers {
+        if !show {
+            continue;
+        }
+        let Some(price) = price else {
+            continue;
+        };
+        let y = price_to_y(Price::from_f64(price + basis));
+        if !gex_level_is_visible(y, region) {
+            continue;
+        }
+        draw_gex_level_label(
+            frame,
+            label,
+            Point::new(
+                region.x + region.width - gex_screen_width_to_world(28.0, scaling),
+                y,
+            ),
+            resolve_gex_color(role, palette),
+            scaling,
+            palette,
+        );
+    }
+    if config.show_gamma_flip_line
+        && let Some(price) = snapshot.gamma_flip
+    {
+        let y = price_to_y(Price::from_f64(price + basis));
+        frame.stroke(
+            &Path::line(
+                Point::new(region.x, y),
+                Point::new(region.x + region.width, y),
+            ),
+            Stroke::default()
+                .with_color(resolve_gex_color(config.gamma_flip_color, palette).scale_alpha(0.55))
+                .with_width(gex_screen_width_to_world(1.0, scaling)),
+        );
     }
 }
 

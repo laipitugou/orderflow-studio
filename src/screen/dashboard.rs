@@ -347,11 +347,21 @@ impl Dashboard {
                     } => {
                         if !indicators.contains(&data::chart::indicator::KlineIndicator::GexLevels)
                         {
-                            chart.set_gex_snapshot(None);
+                            chart.set_gex_overlay_data(
+                                None,
+                                Vec::new(),
+                                data::chart::gex::GexFreshness::Loading,
+                                None,
+                            );
                             return;
                         }
                         let Some(underlying) = market_underlying else {
-                            chart.set_gex_snapshot(None);
+                            chart.set_gex_overlay_data(
+                                None,
+                                Vec::new(),
+                                data::chart::gex::GexFreshness::Loading,
+                                None,
+                            );
                             return;
                         };
                         let levels = chart.visual_config().gex_levels();
@@ -360,7 +370,12 @@ impl Dashboard {
                             expiry_filter: levels.expiry_filter,
                             ..data::chart::gex::Config::default()
                         };
-                        chart.set_gex_snapshot(coordinator.derived(underlying, &config, now));
+                        let snapshot = coordinator.derived(underlying, &config, now);
+                        let history =
+                            coordinator.history(underlying, &config, levels.history_minutes, now);
+                        let freshness = coordinator.freshness(underlying, now);
+                        let error = coordinator.last_error(underlying).map(Arc::from);
+                        chart.set_gex_overlay_data(snapshot, history, freshness, error);
                     }
                     _ => {}
                 }
