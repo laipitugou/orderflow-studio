@@ -743,60 +743,23 @@ pub fn view_kline<'a>(
     }
 
     if selected.contains(&KlineIndicator::GexLevels) {
-        use data::chart::gex::{
-            GexBasisMode, GexCurrentProfileStyle, GexExpiryFilter, GexGammaSource, GexLevelColor,
-            GexLevelsConfig, GexNormalizationMode, GexOverlayMode, GexScenarioResolution,
-            GexSignModel, GexStrikeGeometry, GexTimeAggregation, GexTimeResolution,
-        };
-
+        use data::chart::gex::{GexExpiryFilter, GexGammaSource, GexLevelColor, GexLevelsConfig};
         let levels = cfg.gex_levels();
         let update = move |next: GexLevelsConfig| config_message(pane, cfg.with_gex_levels(next));
-        let supported_modes = GexOverlayMode::ALL
-            .into_iter()
-            .filter(|mode| mode.supported_by(levels.enabled_model))
-            .collect::<Vec<_>>();
-        let overlay_mode = pick_list(
-            supported_modes,
-            Some(levels.overlay_mode),
-            move |overlay_mode| {
-                update(GexLevelsConfig {
-                    overlay_mode,
-                    ..levels
+        let toggle =
+            |label: &'static str, current: bool, change: fn(&mut GexLevelsConfig, bool)| {
+                checkbox(current).label(label).on_toggle(move |value| {
+                    let mut next = levels;
+                    change(&mut next, value);
+                    update(next)
                 })
-            },
-        );
-        let model = pick_list(
-            GexSignModel::ALL,
-            Some(levels.enabled_model),
-            move |enabled_model| {
-                let overlay_mode = if levels.overlay_mode.supported_by(enabled_model) {
-                    levels.overlay_mode
-                } else {
-                    GexOverlayMode::AbsoluteHeatmap
-                };
-                update(GexLevelsConfig {
-                    enabled_model,
-                    overlay_mode,
-                    ..levels
-                })
-            },
-        );
+            };
         let expiry = pick_list(
             GexExpiryFilter::ALL,
             Some(levels.expiry_filter),
             move |expiry_filter| {
                 update(GexLevelsConfig {
                     expiry_filter,
-                    ..levels
-                })
-            },
-        );
-        let basis = pick_list(
-            GexBasisMode::ALL,
-            Some(levels.basis_mode),
-            move |basis_mode| {
-                update(GexLevelsConfig {
-                    basis_mode,
                     ..levels
                 })
             },
@@ -811,201 +774,25 @@ pub fn view_kline<'a>(
                 })
             },
         );
-        let scenario_resolution = pick_list(
-            GexScenarioResolution::ALL,
-            Some(levels.scenario_resolution),
-            move |scenario_resolution| {
+        let positive_color = pick_list(
+            GexLevelColor::ALL,
+            Some(levels.positive_color),
+            move |positive_color| {
                 update(GexLevelsConfig {
-                    scenario_resolution,
+                    positive_color,
                     ..levels
                 })
             },
         );
-        let time_resolution = pick_list(
-            GexTimeResolution::ALL,
-            Some(levels.time_resolution),
-            move |time_resolution| {
+        let negative_color = pick_list(
+            GexLevelColor::ALL,
+            Some(levels.negative_color),
+            move |negative_color| {
                 update(GexLevelsConfig {
-                    time_resolution,
+                    negative_color,
                     ..levels
                 })
             },
-        );
-        let strike_geometry = pick_list(
-            GexStrikeGeometry::ALL,
-            Some(levels.strike_geometry),
-            move |strike_geometry| {
-                update(GexLevelsConfig {
-                    strike_geometry,
-                    ..levels
-                })
-            },
-        );
-        let profile_style = pick_list(
-            GexCurrentProfileStyle::ALL,
-            Some(levels.current_profile_style),
-            move |current_profile_style| {
-                update(GexLevelsConfig {
-                    current_profile_style,
-                    ..levels
-                })
-            },
-        );
-        let max_clusters = labeled_slider(
-            "Maximum clusters",
-            0.0..=10.0,
-            levels.max_clusters as f32,
-            move |value| {
-                update(GexLevelsConfig {
-                    max_clusters: value as usize,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.0}"),
-            Some(1.0),
-        );
-        let band_width = labeled_slider(
-            "Band half-width",
-            0.1..=1.5,
-            levels.cluster_band_width,
-            move |cluster_band_width| {
-                update(GexLevelsConfig {
-                    cluster_band_width,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.1} × strike gap"),
-            Some(0.1),
-        );
-        let line_width = labeled_slider(
-            "Level line width",
-            0.5..=3.0,
-            levels.line_width,
-            move |line_width| {
-                update(GexLevelsConfig {
-                    line_width,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.1}px"),
-            Some(0.1),
-        );
-        let flip_width = labeled_slider(
-            "Gamma Flip width",
-            1.0..=4.0,
-            levels.gamma_flip_width,
-            move |gamma_flip_width| {
-                update(GexLevelsConfig {
-                    gamma_flip_width,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.1}px"),
-            Some(0.1),
-        );
-        let line_opacity = labeled_slider(
-            "Line opacity",
-            0.1..=1.0,
-            levels.line_opacity,
-            move |line_opacity| {
-                update(GexLevelsConfig {
-                    line_opacity,
-                    ..levels
-                })
-            },
-            |value| format!("{:.0}%", value * 100.0),
-            Some(0.05),
-        );
-        let band_opacity = labeled_slider(
-            "Band opacity",
-            0.02..=0.4,
-            levels.band_opacity,
-            move |band_opacity| {
-                update(GexLevelsConfig {
-                    band_opacity,
-                    ..levels
-                })
-            },
-            |value| format!("{:.0}%", value * 100.0),
-            Some(0.02),
-        );
-        let heatmap_opacity = labeled_slider(
-            "Heatmap opacity",
-            0.05..=0.60,
-            levels.heatmap_opacity,
-            move |heatmap_opacity| {
-                update(GexLevelsConfig {
-                    heatmap_opacity,
-                    ..levels
-                })
-            },
-            |value| format!("{:.0}%", value * 100.0),
-            Some(0.01),
-        );
-        let history_duration = labeled_slider(
-            "History duration",
-            30.0..=1440.0,
-            f32::from(levels.history_minutes),
-            move |value| {
-                update(GexLevelsConfig {
-                    history_minutes: value as u16,
-                    ..levels
-                })
-            },
-            |value| format!("{:.1} h", value / 60.0),
-            Some(30.0),
-        );
-        let profile_width = labeled_slider(
-            "Current profile width",
-            4.0..=10.0,
-            levels.current_profile_width_percent,
-            move |current_profile_width_percent| {
-                update(GexLevelsConfig {
-                    current_profile_width_percent,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.0}%"),
-            Some(1.0),
-        );
-        let minimum_intensity = labeled_slider(
-            "Minimum visible intensity",
-            0.0..=0.30,
-            levels.minimum_visible_intensity,
-            move |minimum_visible_intensity| {
-                update(GexLevelsConfig {
-                    minimum_visible_intensity,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.2}"),
-            Some(0.01),
-        );
-        let core_width = labeled_slider(
-            "Core width",
-            2.0..=8.0,
-            levels.strike_core_width_px,
-            move |strike_core_width_px| {
-                update(GexLevelsConfig {
-                    strike_core_width_px,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.0}px"),
-            Some(1.0),
-        );
-        let influence_width = labeled_slider(
-            "Influence width",
-            6.0..=24.0,
-            levels.strike_influence_width_px,
-            move |strike_influence_width_px| {
-                update(GexLevelsConfig {
-                    strike_influence_width_px,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.0}px"),
-            Some(1.0),
         );
         let minimum_oi = labeled_slider(
             "Minimum OI",
@@ -1033,8 +820,47 @@ pub fn view_kline<'a>(
             |value| format!("{value:.0}"),
             Some(1_000.0),
         );
-        let persistent_lookback = labeled_slider(
-            "Persistent lookback",
+        let minimum_strength = labeled_slider(
+            "Minimum zone strength",
+            0.05..=0.40,
+            levels.minimum_zone_strength,
+            move |minimum_zone_strength| {
+                update(GexLevelsConfig {
+                    minimum_zone_strength,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.2}"),
+            Some(0.01),
+        );
+        let max_positive = labeled_slider(
+            "Maximum positive zones",
+            1.0..=6.0,
+            f32::from(levels.max_positive_zones),
+            move |value| {
+                update(GexLevelsConfig {
+                    max_positive_zones: value as u8,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.0}"),
+            Some(1.0),
+        );
+        let max_negative = labeled_slider(
+            "Maximum negative zones",
+            1.0..=6.0,
+            f32::from(levels.max_negative_zones),
+            move |value| {
+                update(GexLevelsConfig {
+                    max_negative_zones: value as u8,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.0}"),
+            Some(1.0),
+        );
+        let persistence = labeled_slider(
+            "Persistence lookback",
             5.0..=60.0,
             f32::from(levels.persistent_lookback_minutes),
             move |value| {
@@ -1046,258 +872,83 @@ pub fn view_kline<'a>(
             |value| format!("{value:.0} min"),
             Some(1.0),
         );
-        let persistent_threshold = labeled_slider(
-            "Persistent threshold",
-            0.50..=0.90,
-            levels.persistent_threshold,
-            move |persistent_threshold| {
+        let fade = labeled_slider(
+            "Fade buckets",
+            1.0..=3.0,
+            f32::from(levels.fade_buckets),
+            move |value| {
                 update(GexLevelsConfig {
-                    persistent_threshold,
+                    fade_buckets: value as u8,
                     ..levels
                 })
             },
-            |value| format!("{value:.2}"),
-            Some(0.01),
+            |value| format!("{value:.0}"),
+            Some(1.0),
         );
-        let toggle =
-            |label: &'static str, current: bool, change: fn(&mut GexLevelsConfig, bool)| {
-                checkbox(current).label(label).on_toggle(move |value| {
-                    let mut next = levels;
-                    change(&mut next, value);
-                    update(next)
+        let profile_width = labeled_slider(
+            "Profile width",
+            4.0..=7.0,
+            levels.current_profile_width_percent,
+            move |current_profile_width_percent| {
+                update(GexLevelsConfig {
+                    current_profile_width_percent,
+                    ..levels
                 })
-            };
-        let colors = column![
-            row![
-                text("Gamma Flip"),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.gamma_flip_color),
-                    move |gamma_flip_color| update(GexLevelsConfig {
-                        gamma_flip_color,
-                        ..levels
-                    })
-                )
-            ]
-            .spacing(8),
-            row![
-                text("Call / Put Walls"),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.call_wall_color),
-                    move |call_wall_color| update(GexLevelsConfig {
-                        call_wall_color,
-                        ..levels
-                    })
-                ),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.put_wall_color),
-                    move |put_wall_color| update(GexLevelsConfig {
-                        put_wall_color,
-                        ..levels
-                    })
-                )
-            ]
-            .spacing(8),
-            row![
-                text("Clusters"),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.cluster_color),
-                    move |cluster_color| update(GexLevelsConfig {
-                        cluster_color,
-                        cluster_color_customized: true,
-                        ..levels
-                    })
-                )
-            ]
-            .spacing(8),
-            row![
-                text("Heatmap + / − / absolute"),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.positive_color),
-                    move |positive_color| update(GexLevelsConfig {
-                        positive_color,
-                        ..levels
-                    })
-                ),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.negative_color),
-                    move |negative_color| update(GexLevelsConfig {
-                        negative_color,
-                        ..levels
-                    })
-                ),
-                pick_list(
-                    GexLevelColor::ALL,
-                    Some(levels.absolute_color),
-                    move |absolute_color| update(GexLevelsConfig {
-                        absolute_color,
-                        ..levels
-                    })
-                )
-            ]
-            .spacing(8),
-        ]
-        .spacing(4);
-        let mut settings = column![
-            text("Uses the shared options snapshot; settings never trigger a chain fetch.")
-                .size(crate::style::text_size::SMALL),
+            },
+            |value| format!("{value:.0}%"),
+            Some(1.0),
+        );
+        let settings = column![
             text("Data").size(crate::style::text_size::SECTION),
-            text("Provider: Deribit · Underlying follows chart"),
-            text("Sign model"),
-            model,
-            text("Gamma source"),
-            gamma_source,
             text("Expiry filter"),
             expiry,
-            text("Next/1D concentrate gamma; 30D/All may create a legitimately wider surface.")
-                .size(crate::style::text_size::SMALL),
+            text("Gamma source"),
+            gamma_source,
             minimum_oi,
             minimum_gex,
-            text("Price basis"),
-            basis,
-            text("Raw strike preserves Deribit strikes; basis shift is legacy only.")
+            text("Zones").size(crate::style::text_size::SECTION),
+            row![text("Positive"), positive_color].spacing(8),
+            row![text("Negative"), negative_color].spacing(8),
+            minimum_strength,
+            max_positive,
+            max_negative,
+            persistence,
+            fade,
+            toggle(
+                "Show historical zones",
+                levels.show_historical_zones,
+                |c, v| c.show_historical_zones = v
+            ),
+            toggle(
+                "Show active projection",
+                levels.show_active_projection,
+                |c, v| c.show_active_projection = v
+            ),
+            text("Profile").size(crate::style::text_size::SECTION),
+            toggle(
+                "Show current profile",
+                levels.show_current_profile,
+                |c, v| c.show_current_profile = v
+            ),
+            profile_width,
+            text("Levels").size(crate::style::text_size::SECTION),
+            toggle("Show CW", levels.show_call_wall_marker, |c, v| c
+                .show_call_wall_marker =
+                v),
+            toggle("Show PW", levels.show_put_wall_marker, |c, v| c
+                .show_put_wall_marker =
+                v),
+            toggle("Show GF", levels.show_gamma_flip_marker, |c, v| c
+                .show_gamma_flip_marker =
+                v),
+            text("Interaction").size(crate::style::text_size::SECTION),
+            toggle("Show tooltip", levels.show_hover_tooltip, |c, v| c
+                .show_hover_tooltip =
+                v),
+            text("Local history only · remote GEX backfill unavailable")
                 .size(crate::style::text_size::SMALL),
-            text("Overlay").size(crate::style::text_size::SECTION),
-            text("Overlay mode"),
-            overlay_mode,
         ]
         .spacing(6);
-        if levels.overlay_mode == GexOverlayMode::Levels {
-            settings = settings
-                .push(toggle("Gamma Flip", levels.show_gamma_flip, |c, v| {
-                    c.show_gamma_flip = v
-                }))
-                .push(toggle("Call Wall", levels.show_call_wall, |c, v| {
-                    c.show_call_wall = v
-                }))
-                .push(toggle("Put Wall", levels.show_put_wall, |c, v| {
-                    c.show_put_wall = v
-                }))
-                .push(toggle(
-                    "Gamma Clusters",
-                    levels.show_top_clusters,
-                    |c, v| c.show_top_clusters = v,
-                ))
-                .push(max_clusters)
-                .push(band_width)
-                .push(line_width)
-                .push(flip_width)
-                .push(line_opacity)
-                .push(band_opacity);
-        } else {
-            settings = settings
-                .push(text("Time resolution"))
-                .push(time_resolution)
-                .push(text("Time aggregation"))
-                .push(pick_list(
-                    GexTimeAggregation::ALL,
-                    Some(levels.time_aggregation),
-                    move |time_aggregation| {
-                        update(GexLevelsConfig {
-                            time_aggregation,
-                            ..levels
-                        })
-                    },
-                ))
-                .push(history_duration)
-                .push(
-                    text("Local history contains only snapshots collected by Flowsurface.")
-                        .size(crate::style::text_size::SMALL),
-                )
-                .push(text("Remote GEX backfill unavailable").size(crate::style::text_size::SMALL))
-                .push(heatmap_opacity)
-                .push(minimum_intensity)
-                .push(text("Normalization"))
-                .push(pick_list(
-                    GexNormalizationMode::ALL,
-                    Some(levels.normalization_mode),
-                    move |normalization_mode| {
-                        update(GexLevelsConfig {
-                            normalization_mode,
-                            ..levels
-                        })
-                    },
-                ));
-            if levels.overlay_mode == GexOverlayMode::ScenarioHeatmap {
-                settings = settings
-                    .push(text("Scenario resolution"))
-                    .push(scenario_resolution);
-            }
-            if matches!(
-                levels.overlay_mode,
-                GexOverlayMode::NetHeatmap | GexOverlayMode::AbsoluteHeatmap
-            ) {
-                settings = settings
-                    .push(text("Strike geometry").size(crate::style::text_size::SECTION))
-                    .push(strike_geometry)
-                    .push(core_width)
-                    .push(influence_width);
-                if levels.strike_geometry == GexStrikeGeometry::VoronoiLegacy {
-                    settings = settings.push(
-                        text("Legacy filled bands: midpoint-to-midpoint geometry.")
-                            .size(crate::style::text_size::SMALL),
-                    );
-                }
-            }
-            settings = settings
-                .push(text("Current profile").size(crate::style::text_size::SECTION))
-                .push(toggle(
-                    "Current GEX profile",
-                    levels.show_current_profile,
-                    |c, v| c.show_current_profile = v,
-                ))
-                .push(profile_width)
-                .push(text("Profile style"))
-                .push(profile_style)
-                .push(text("Levels and markers").size(crate::style::text_size::SECTION))
-                .push(toggle(
-                    "Gamma Flip marker",
-                    levels.show_gamma_flip_marker,
-                    |c, v| c.show_gamma_flip_marker = v,
-                ))
-                .push(toggle(
-                    "Gamma Flip line",
-                    levels.show_gamma_flip_line,
-                    |c, v| c.show_gamma_flip_line = v,
-                ))
-                .push(toggle(
-                    "Call Wall marker",
-                    levels.show_call_wall_marker,
-                    |c, v| c.show_call_wall_marker = v,
-                ))
-                .push(toggle(
-                    "Put Wall marker",
-                    levels.show_put_wall_marker,
-                    |c, v| c.show_put_wall_marker = v,
-                ))
-                .push(text("Persistent Gamma Zones").size(crate::style::text_size::SECTION))
-                .push(toggle(
-                    "Persistent Gamma Zones",
-                    levels.show_persistent_gamma_zones,
-                    |c, v| c.show_persistent_gamma_zones = v,
-                ))
-                .push(persistent_lookback)
-                .push(persistent_threshold)
-                .push(text("Interaction").size(crate::style::text_size::SECTION))
-                .push(toggle(
-                    "Hover tooltip",
-                    levels.show_hover_tooltip,
-                    |c, v| c.show_hover_tooltip = v,
-                ))
-                .push(toggle(
-                    "Interpolate one short gap",
-                    levels.interpolate_short_gaps,
-                    |c, v| c.interpolate_short_gaps = v,
-                ));
-        }
-        settings = settings
-            .push(text("Palette roles").size(crate::style::text_size::SECTION))
-            .push(colors);
         sections = sections.push(indicator_card("GEX Overlay", settings));
     }
 

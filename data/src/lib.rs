@@ -1253,17 +1253,18 @@ mod tests {
                     levels.expiry_filter,
                     crate::chart::gex::GexExpiryFilter::ThirtyDays
                 );
-                assert_eq!(levels.max_clusters, 7);
                 assert_eq!(
-                    levels.basis_mode,
-                    crate::chart::gex::GexBasisMode::ShiftToChartPrice
+                    levels.overlay_mode,
+                    crate::chart::gex::GexOverlayMode::GexZoneOverlay
                 );
+                assert_eq!(levels.current_profile_width_percent, 5.0);
 
                 let serialized = serde_json::to_value(config).unwrap();
                 assert!(serialized.get("gex_levels").is_none());
-                assert_eq!(
-                    serialized["indicator_configs"]["gex_levels"]["max_clusters"],
-                    7
+                assert!(
+                    serialized["indicator_configs"]["gex_levels"]
+                        .get("max_clusters")
+                        .is_none()
                 );
             }
             _ => panic!("expected recovered state with migration warning"),

@@ -366,10 +366,10 @@ impl Dashboard {
                         };
                         let levels = chart.visual_config().gex_levels();
                         let config = data::chart::gex::Config {
-                            sign_model: levels.enabled_model,
+                            sign_model: data::chart::gex::GexSignModel::CallPutOiProxy,
                             expiry_filter: levels.expiry_filter,
                             gamma_source: levels.gamma_source,
-                            scenario_resolution: levels.scenario_resolution,
+                            scenario_resolution: data::chart::gex::GexScenarioResolution::Auto,
                             min_open_interest: levels.minimum_open_interest,
                             min_absolute_gex: levels.minimum_absolute_gex,
                             ..data::chart::gex::Config::default()

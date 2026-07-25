@@ -7,7 +7,7 @@ use exchange::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, f64::consts::PI, sync::Arc};
+use std::{cmp::Ordering, collections::BTreeMap, f64::consts::PI, sync::Arc};
 
 const MILLIS_PER_DAY: u64 = 86_400_000;
 const MILLIS_PER_YEAR: f64 = 365.25 * MILLIS_PER_DAY as f64;
@@ -19,25 +19,31 @@ const FLIP_BISECTION_STEPS: usize = 60;
 pub const DEFAULT_SCENARIO_POINTS: usize = 512;
 pub const NATIVE_GAMMA_MAX_AGE_MS: u64 = 90_000;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum GexOverlayMode {
     #[default]
-    Levels,
-    NetHeatmap,
-    AbsoluteHeatmap,
-    ScenarioHeatmap,
+    GexZoneOverlay,
 }
 
 impl GexOverlayMode {
-    pub const ALL: [Self; 4] = [
-        Self::Levels,
-        Self::NetHeatmap,
-        Self::AbsoluteHeatmap,
-        Self::ScenarioHeatmap,
-    ];
+    pub const ALL: [Self; 1] = [Self::GexZoneOverlay];
+}
 
-    pub fn supported_by(self, model: GexSignModel) -> bool {
-        !matches!(self, Self::NetHeatmap) || model == GexSignModel::CallPutOiProxy
+impl<'de> Deserialize<'de> for GexOverlayMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "GexZoneOverlay" | "Levels" | "NetHeatmap" | "AbsoluteHeatmap" | "ScenarioHeatmap" => {
+                Ok(Self::GexZoneOverlay)
+            }
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["GexZoneOverlay"],
+            )),
+        }
     }
 }
 
@@ -77,47 +83,6 @@ impl GexScenarioResolution {
 display_enum!(GexScenarioResolution, Auto => "Auto (512)", Samples128 => "128 samples", Samples256 => "256 samples", Samples512 => "512 samples");
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexTimeResolution {
-    #[default]
-    FollowChart,
-    Seconds30,
-    Minute1,
-    Minute5,
-}
-impl GexTimeResolution {
-    pub const ALL: [Self; 4] = [
-        Self::FollowChart,
-        Self::Seconds30,
-        Self::Minute1,
-        Self::Minute5,
-    ];
-}
-display_enum!(GexTimeResolution, FollowChart => "Follow chart", Seconds30 => "30 seconds", Minute1 => "1 minute", Minute5 => "5 minutes");
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexStrikeGeometry {
-    CompactLine,
-    #[default]
-    CompactKernel,
-    VoronoiLegacy,
-}
-impl GexStrikeGeometry {
-    pub const ALL: [Self; 3] = [Self::CompactLine, Self::CompactKernel, Self::VoronoiLegacy];
-}
-display_enum!(GexStrikeGeometry, CompactLine => "Compact line", CompactKernel => "Compact kernel", VoronoiLegacy => "Legacy filled bands");
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexCurrentProfileStyle {
-    #[default]
-    Bars,
-    Curve,
-}
-impl GexCurrentProfileStyle {
-    pub const ALL: [Self; 2] = [Self::Bars, Self::Curve];
-}
-display_enum!(GexCurrentProfileStyle, Bars => "Bars", Curve => "Curve");
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexGammaSource {
     BlackScholesDerived,
     #[default]
@@ -139,56 +104,7 @@ display_enum!(GexGammaProvenance, Native => "Provider native", Derived => "Black
 
 impl std::fmt::Display for GexOverlayMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Levels => "Levels (legacy)",
-            Self::NetHeatmap => "Net heatmap",
-            Self::AbsoluteHeatmap => "Absolute heatmap",
-            Self::ScenarioHeatmap => "Scenario heatmap",
-        })
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexNormalizationMode {
-    #[default]
-    AutoVisible,
-    UtcDayLocked,
-    GlobalHistory,
-}
-
-impl GexNormalizationMode {
-    pub const ALL: [Self; 3] = [Self::AutoVisible, Self::UtcDayLocked, Self::GlobalHistory];
-}
-
-impl std::fmt::Display for GexNormalizationMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::AutoVisible => "Auto visible",
-            Self::UtcDayLocked => "UTC day locked",
-            Self::GlobalHistory => "Global history",
-        })
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexTimeAggregation {
-    #[default]
-    Latest,
-    MaxAbsolute,
-    Mean,
-}
-
-impl GexTimeAggregation {
-    pub const ALL: [Self; 3] = [Self::Latest, Self::MaxAbsolute, Self::Mean];
-}
-
-impl std::fmt::Display for GexTimeAggregation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Latest => "Latest",
-            Self::MaxAbsolute => "Max absolute",
-            Self::Mean => "Mean",
-        })
+        f.write_str("GEX Zone Overlay")
     }
 }
 
@@ -245,27 +161,9 @@ impl std::fmt::Display for GexExpiryFilter {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum GexBasisMode {
-    #[default]
-    RawStrike,
-    ShiftToChartPrice,
-}
-
-impl GexBasisMode {
-    pub const ALL: [Self; 2] = [Self::RawStrike, Self::ShiftToChartPrice];
-}
-
-impl std::fmt::Display for GexBasisMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RawStrike => f.write_str("Raw strike"),
-            Self::ShiftToChartPrice => f.write_str("Legacy / experimental basis shift"),
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexLevelColor {
+    Cyan,
+    Magenta,
     Primary,
     Success,
     Danger,
@@ -275,7 +173,9 @@ pub enum GexLevelColor {
 }
 
 impl GexLevelColor {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
+        Self::Cyan,
+        Self::Magenta,
         Self::Primary,
         Self::Success,
         Self::Danger,
@@ -287,6 +187,8 @@ impl GexLevelColor {
 impl std::fmt::Display for GexLevelColor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Cyan => "Cyan",
+            Self::Magenta => "Red / magenta",
             Self::Primary => "Primary",
             Self::Success => "Success",
             Self::Danger => "Danger",
@@ -299,131 +201,66 @@ impl std::fmt::Display for GexLevelColor {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GexLevelsConfig {
-    #[serde(default = "legacy_overlay_mode")]
+    #[serde(default)]
     pub overlay_mode: GexOverlayMode,
-    pub enabled_model: GexSignModel,
     pub expiry_filter: GexExpiryFilter,
     pub gamma_source: GexGammaSource,
     pub minimum_open_interest: f64,
     pub minimum_absolute_gex: f64,
-    pub scenario_resolution: GexScenarioResolution,
-    pub time_resolution: GexTimeResolution,
-    pub strike_geometry: GexStrikeGeometry,
-    pub strike_core_width_px: f32,
-    pub strike_influence_width_px: f32,
-    pub minimum_visible_intensity: f32,
-    pub interpolate_short_gaps: bool,
-    pub maximum_gap_buckets: u8,
-    pub show_gamma_flip: bool,
-    pub show_call_wall: bool,
-    pub show_put_wall: bool,
-    pub show_top_clusters: bool,
-    pub max_clusters: usize,
-    pub clusters_as_bands: bool,
-    /// Half-width of a cluster band as a fraction of the adjacent strike gap.
-    pub cluster_band_width: f32,
-    pub show_value: bool,
-    pub show_distance_percent: bool,
-    pub basis_mode: GexBasisMode,
-    pub line_width: f32,
-    pub gamma_flip_width: f32,
-    pub line_opacity: f32,
-    pub band_opacity: f32,
-    pub horizontal_span_percent: f32,
-    pub gamma_flip_color: GexLevelColor,
-    pub call_wall_color: GexLevelColor,
-    pub put_wall_color: GexLevelColor,
-    pub cluster_color: GexLevelColor,
     pub positive_color: GexLevelColor,
     pub negative_color: GexLevelColor,
-    pub absolute_color: GexLevelColor,
-    pub heatmap_opacity: f32,
+    pub minimum_zone_strength: f32,
+    pub max_positive_zones: u8,
+    pub max_negative_zones: u8,
     pub history_minutes: u16,
-    pub normalization_mode: GexNormalizationMode,
-    pub time_aggregation: GexTimeAggregation,
+    pub persistent_lookback_minutes: u16,
+    pub fade_buckets: u8,
+    pub show_historical_zones: bool,
+    pub show_active_projection: bool,
     pub show_current_profile: bool,
     pub current_profile_width_percent: f32,
-    pub current_profile_style: GexCurrentProfileStyle,
-    pub show_persistent_gamma_zones: bool,
-    pub persistent_lookback_minutes: u16,
-    pub persistent_threshold: f32,
     pub show_gamma_flip_marker: bool,
-    pub show_gamma_flip_line: bool,
     pub show_call_wall_marker: bool,
     pub show_put_wall_marker: bool,
     pub show_hover_tooltip: bool,
-    #[serde(default)]
-    pub cluster_color_customized: bool,
-}
-
-const fn legacy_overlay_mode() -> GexOverlayMode {
-    GexOverlayMode::Levels
 }
 
 impl Default for GexLevelsConfig {
     fn default() -> Self {
         Self {
-            overlay_mode: GexOverlayMode::ScenarioHeatmap,
-            enabled_model: GexSignModel::CallPutOiProxy,
+            overlay_mode: GexOverlayMode::GexZoneOverlay,
             expiry_filter: GexExpiryFilter::SevenDays,
             gamma_source: GexGammaSource::ProviderNativePreferred,
             minimum_open_interest: 0.0,
             minimum_absolute_gex: 0.0,
-            scenario_resolution: GexScenarioResolution::Auto,
-            time_resolution: GexTimeResolution::FollowChart,
-            strike_geometry: GexStrikeGeometry::CompactKernel,
-            strike_core_width_px: 3.0,
-            strike_influence_width_px: 10.0,
-            minimum_visible_intensity: 0.08,
-            interpolate_short_gaps: false,
-            maximum_gap_buckets: 1,
-            show_gamma_flip: true,
-            show_call_wall: true,
-            show_put_wall: true,
-            show_top_clusters: true,
-            max_clusters: 3,
-            clusters_as_bands: true,
-            cluster_band_width: 0.5,
-            show_value: true,
-            show_distance_percent: true,
-            basis_mode: GexBasisMode::RawStrike,
-            line_width: 1.0,
-            gamma_flip_width: 1.8,
-            line_opacity: 0.78,
-            band_opacity: 0.12,
-            horizontal_span_percent: 35.0,
-            gamma_flip_color: GexLevelColor::Warning,
-            call_wall_color: GexLevelColor::Success,
-            put_wall_color: GexLevelColor::Danger,
-            cluster_color: GexLevelColor::Primary,
-            positive_color: GexLevelColor::Success,
-            negative_color: GexLevelColor::Danger,
-            absolute_color: GexLevelColor::Primary,
-            heatmap_opacity: 0.28,
+            positive_color: GexLevelColor::Cyan,
+            negative_color: GexLevelColor::Magenta,
+            minimum_zone_strength: 0.12,
+            max_positive_zones: 6,
+            max_negative_zones: 6,
             history_minutes: 240,
-            normalization_mode: GexNormalizationMode::AutoVisible,
-            time_aggregation: GexTimeAggregation::Latest,
-            show_current_profile: true,
-            current_profile_width_percent: 6.0,
-            current_profile_style: GexCurrentProfileStyle::Curve,
-            show_persistent_gamma_zones: true,
             persistent_lookback_minutes: 15,
-            persistent_threshold: 0.65,
+            fade_buckets: 3,
+            show_historical_zones: true,
+            show_active_projection: true,
+            show_current_profile: true,
+            current_profile_width_percent: 5.0,
             show_gamma_flip_marker: true,
-            show_gamma_flip_line: false,
             show_call_wall_marker: true,
             show_put_wall_marker: true,
             show_hover_tooltip: true,
-            cluster_color_customized: false,
         }
     }
 }
 
 impl GexLevelsConfig {
     pub fn migrate_legacy_defaults(&mut self) {
-        if !self.cluster_color_customized && self.cluster_color == GexLevelColor::Secondary {
-            self.cluster_color = GexLevelColor::Primary;
-        }
+        self.overlay_mode = GexOverlayMode::GexZoneOverlay;
+        self.minimum_zone_strength = self.minimum_zone_strength.clamp(0.01, 1.0);
+        self.max_positive_zones = self.max_positive_zones.clamp(1, 6);
+        self.max_negative_zones = self.max_negative_zones.clamp(1, 6);
+        self.fade_buckets = self.fade_buckets.clamp(1, 3);
+        self.current_profile_width_percent = self.current_profile_width_percent.clamp(4.0, 7.0);
     }
 }
 
@@ -703,6 +540,75 @@ pub struct GexSnapshot {
 }
 
 pub type GexHeatmapSnapshot = GexSnapshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub enum GexZoneSign {
+    Positive,
+    Negative,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexZoneState {
+    #[default]
+    Active,
+    Fading,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GexZone {
+    pub id: u64,
+    pub observed_at: UnixMs,
+    pub lower_price: f64,
+    pub upper_price: f64,
+    pub peak_price: f64,
+    pub net_gex_1pct: f64,
+    pub absolute_gex_1pct: f64,
+    pub normalized_strength: f32,
+    pub persistence_score: f32,
+    pub sign: GexZoneSign,
+    pub dominant_expiry: Option<UnixMs>,
+    pub gamma_provenance: GexGammaProvenance,
+    #[serde(default)]
+    pub state: GexZoneState,
+    #[serde(default)]
+    pub missing_buckets: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GexZoneFrame {
+    pub bucket_start: UnixMs,
+    pub source_spot: f64,
+    pub zones: Arc<[GexZone]>,
+}
+
+impl GexZone {
+    pub fn is_semantically_valid(&self) -> bool {
+        self.id != 0
+            && self.observed_at.as_u64() > 0
+            && self.lower_price.is_finite()
+            && self.upper_price.is_finite()
+            && self.peak_price.is_finite()
+            && self.lower_price > 0.0
+            && self.lower_price <= self.peak_price
+            && self.peak_price <= self.upper_price
+            && self.net_gex_1pct.is_finite()
+            && self.absolute_gex_1pct.is_finite()
+            && self.absolute_gex_1pct >= 0.0
+            && self.normalized_strength.is_finite()
+            && (0.0..=1.0).contains(&self.normalized_strength)
+            && self.persistence_score.is_finite()
+            && (0.0..=1.0).contains(&self.persistence_score)
+    }
+}
+
+impl GexZoneFrame {
+    pub fn is_semantically_valid(&self) -> bool {
+        self.bucket_start.as_u64() > 0
+            && self.source_spot.is_finite()
+            && self.source_spot > 0.0
+            && self.zones.iter().all(GexZone::is_semantically_valid)
+    }
+}
 
 impl GexSnapshot {
     pub fn is_semantically_valid(&self) -> bool {
@@ -1418,6 +1324,440 @@ pub fn find_gamma_flip(
     build_scenario_curve(contracts, spot, now, range_percent, FLIP_SCAN_STEPS + 1).1
 }
 
+#[derive(Clone, Copy)]
+struct ZoneStrike<'a> {
+    index: usize,
+    strike: &'a GexStrike,
+    sign: GexZoneSign,
+    strength: f32,
+    local_gap: f64,
+}
+
+pub fn extract_gex_zones(
+    snapshot: &GexSnapshot,
+    minimum_strength: f32,
+    max_positive: u8,
+    max_negative: u8,
+) -> Vec<GexZone> {
+    let mut strikes = snapshot.strikes.iter().collect::<Vec<_>>();
+    strikes.sort_by(|a, b| a.strike.total_cmp(&b.strike));
+    if strikes.is_empty() {
+        return Vec::new();
+    }
+    let positive_scale = gex_percentile_95(
+        strikes
+            .iter()
+            .map(|strike| strike.net_gex_1pct)
+            .filter(|value| *value > 0.0),
+    );
+    let negative_scale = gex_percentile_95(
+        strikes
+            .iter()
+            .map(|strike| strike.net_gex_1pct)
+            .filter(|value| *value < 0.0),
+    );
+    let gaps = strikes
+        .windows(2)
+        .map(|pair| pair[1].strike - pair[0].strike)
+        .filter(|gap| gap.is_finite() && *gap > 0.0)
+        .collect::<Vec<_>>();
+    let fallback_gap = median(&gaps).unwrap_or(snapshot.source_spot * 0.001);
+    let threshold = minimum_strength.clamp(0.01, 1.0);
+    let mut clusters: Vec<Vec<ZoneStrike<'_>>> = Vec::new();
+    let mut current: Vec<ZoneStrike<'_>> = Vec::new();
+
+    for (index, strike) in strikes.iter().enumerate() {
+        let (sign, scale) = if strike.net_gex_1pct > 0.0 {
+            (GexZoneSign::Positive, positive_scale)
+        } else if strike.net_gex_1pct < 0.0 {
+            (GexZoneSign::Negative, negative_scale)
+        } else {
+            if !current.is_empty() {
+                clusters.push(std::mem::take(&mut current));
+            }
+            continue;
+        };
+        let Some(scale) = scale else {
+            continue;
+        };
+        let strength =
+            ((strike.net_gex_1pct.abs() / scale).asinh() / 1.0f64.asinh()).clamp(0.0, 1.0) as f32;
+        if strength < threshold {
+            if !current.is_empty() {
+                clusters.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let local_gap = local_median_gap(&gaps, index, fallback_gap);
+        let candidate = ZoneStrike {
+            index,
+            strike,
+            sign,
+            strength,
+            local_gap,
+        };
+        let joins = current.last().is_some_and(|previous| {
+            previous.sign == sign
+                && index == previous.index + 1
+                && strike.strike - previous.strike.strike
+                    <= 1.5 * ((previous.local_gap + local_gap) * 0.5)
+        });
+        if !joins && !current.is_empty() {
+            clusters.push(std::mem::take(&mut current));
+        }
+        current.push(candidate);
+    }
+    if !current.is_empty() {
+        clusters.push(current);
+    }
+
+    let mut zones = clusters
+        .into_iter()
+        .map(|cluster| zone_from_cluster(snapshot, &cluster, fallback_gap))
+        .collect::<Vec<_>>();
+    let retain_best = |sign: GexZoneSign, limit: u8, zones: &mut Vec<GexZone>| {
+        let mut indices = zones
+            .iter()
+            .enumerate()
+            .filter(|(_, zone)| zone.sign == sign)
+            .map(|(index, zone)| (index, zone.normalized_strength, zone.absolute_gex_1pct))
+            .collect::<Vec<_>>();
+        indices.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| b.2.total_cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let keep = indices
+            .into_iter()
+            .take(usize::from(limit.clamp(1, 6)))
+            .map(|value| value.0)
+            .collect::<FxHashSet<_>>();
+        for (index, zone) in zones.iter_mut().enumerate() {
+            if zone.sign == sign && !keep.contains(&index) {
+                zone.normalized_strength = -1.0;
+            }
+        }
+    };
+    retain_best(GexZoneSign::Positive, max_positive, &mut zones);
+    retain_best(GexZoneSign::Negative, max_negative, &mut zones);
+    zones.retain(|zone| zone.normalized_strength >= 0.0);
+    zones.sort_by(|a, b| {
+        a.peak_price
+            .total_cmp(&b.peak_price)
+            .then_with(|| a.sign.cmp(&b.sign))
+    });
+    zones
+}
+
+fn zone_from_cluster(
+    snapshot: &GexSnapshot,
+    cluster: &[ZoneStrike<'_>],
+    fallback_gap: f64,
+) -> GexZone {
+    let local_gap = median(
+        &cluster
+            .iter()
+            .map(|value| value.local_gap)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(fallback_gap)
+    .max(f64::EPSILON);
+    let first = cluster.first().expect("non-empty GEX cluster");
+    let last = cluster.last().expect("non-empty GEX cluster");
+    let peak = cluster
+        .iter()
+        .max_by(|a, b| {
+            a.strength
+                .total_cmp(&b.strength)
+                .then_with(|| {
+                    a.strike
+                        .net_gex_1pct
+                        .abs()
+                        .total_cmp(&b.strike.net_gex_1pct.abs())
+                })
+                .then_with(|| b.strike.strike.total_cmp(&a.strike.strike))
+        })
+        .expect("non-empty GEX cluster");
+    let (lower_price, upper_price) = if cluster.len() == 1 {
+        let half_width = (0.08 * local_gap).clamp(
+            snapshot.source_spot * 0.00025,
+            snapshot.source_spot * 0.0008,
+        );
+        (
+            first.strike.strike - half_width,
+            first.strike.strike + half_width,
+        )
+    } else {
+        let padding = (0.20 * local_gap).min(snapshot.source_spot * 0.001);
+        (first.strike.strike - padding, last.strike.strike + padding)
+    };
+    let net_gex_1pct = cluster.iter().map(|value| value.strike.net_gex_1pct).sum();
+    let absolute_gex_1pct = cluster
+        .iter()
+        .map(|value| value.strike.absolute_gamma_1pct)
+        .sum();
+    let cluster_prices = cluster
+        .iter()
+        .map(|value| value.strike.strike.to_bits())
+        .collect::<FxHashSet<_>>();
+    let mut expiry_contributions: FxHashMap<UnixMs, f64> = FxHashMap::default();
+    for value in snapshot
+        .expiry_strikes
+        .iter()
+        .filter(|value| cluster_prices.contains(&value.strike.to_bits()))
+    {
+        *expiry_contributions.entry(value.expiration).or_default() += value.net_gex_1pct.abs();
+    }
+    let dominant_expiry = expiry_contributions
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|value| value.0);
+    let native = cluster
+        .iter()
+        .any(|value| value.strike.gamma_provenance == GexGammaProvenance::Native);
+    let derived = cluster
+        .iter()
+        .any(|value| value.strike.gamma_provenance == GexGammaProvenance::Derived);
+    let mixed = cluster
+        .iter()
+        .any(|value| value.strike.gamma_provenance == GexGammaProvenance::Mixed);
+    let gamma_provenance = if mixed || (native && derived) {
+        GexGammaProvenance::Mixed
+    } else if native {
+        GexGammaProvenance::Native
+    } else {
+        GexGammaProvenance::Derived
+    };
+    GexZone {
+        id: 0,
+        observed_at: snapshot.observed_at,
+        lower_price,
+        upper_price,
+        peak_price: peak.strike.strike,
+        net_gex_1pct,
+        absolute_gex_1pct,
+        normalized_strength: peak.strength,
+        persistence_score: peak.strength * 0.5,
+        sign: peak.sign,
+        dominant_expiry,
+        gamma_provenance,
+        state: GexZoneState::Active,
+        missing_buckets: 0,
+    }
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let mut values = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
+}
+
+fn local_median_gap(gaps: &[f64], strike_index: usize, fallback: f64) -> f64 {
+    let from = strike_index.saturating_sub(2).min(gaps.len());
+    let to = (strike_index + 2).min(gaps.len());
+    median(&gaps[from..to]).unwrap_or(fallback)
+}
+
+pub fn zone_overlap_ratio(a: &GexZone, b: &GexZone) -> f64 {
+    let overlap = (a.upper_price.min(b.upper_price) - a.lower_price.max(b.lower_price)).max(0.0);
+    let minimum_width = (a.upper_price - a.lower_price)
+        .min(b.upper_price - b.lower_price)
+        .max(f64::EPSILON);
+    overlap / minimum_width
+}
+
+fn zone_matches(previous: &GexZone, current: &GexZone, spot: f64) -> bool {
+    if previous.sign != current.sign {
+        return false;
+    }
+    let overlap = zone_overlap_ratio(previous, current);
+    let combined_half_width = ((previous.upper_price - previous.lower_price)
+        + (current.upper_price - current.lower_price))
+        * 0.25;
+    overlap >= 0.30
+        || (previous.peak_price - current.peak_price).abs()
+            <= (spot * 0.002).max(combined_half_width)
+}
+
+pub fn build_gex_zone_frames(
+    history: &[Arc<GexSnapshot>],
+    bucket_ms: u64,
+    config: &GexLevelsConfig,
+) -> Vec<GexZoneFrame> {
+    let bucket_ms = bucket_ms.max(1);
+    let mut snapshots = BTreeMap::new();
+    for snapshot in history {
+        snapshots.insert(
+            gex_bucket_start(snapshot.observed_at, bucket_ms),
+            snapshot.as_ref(),
+        );
+    }
+    let mut frames = Vec::with_capacity(snapshots.len());
+    let mut previous: Vec<GexZone> = Vec::new();
+    let mut previous_bucket = None;
+    let mut track_history: FxHashMap<u64, Vec<(UnixMs, f32)>> = FxHashMap::default();
+
+    for (bucket_start, snapshot) in snapshots {
+        let consecutive = previous_bucket
+            .is_some_and(|value: UnixMs| bucket_start.saturating_diff(value) == bucket_ms);
+        if !consecutive {
+            previous.clear();
+        }
+        let mut current = extract_gex_zones(
+            snapshot,
+            config.minimum_zone_strength,
+            config.max_positive_zones,
+            config.max_negative_zones,
+        );
+        let mut candidates = Vec::new();
+        if consecutive {
+            for (current_index, zone) in current.iter().enumerate() {
+                for (previous_index, old) in previous.iter().enumerate() {
+                    if zone_matches(old, zone, snapshot.source_spot) {
+                        candidates.push((
+                            current_index,
+                            previous_index,
+                            zone_overlap_ratio(old, zone),
+                            (old.peak_price - zone.peak_price).abs(),
+                            zone.absolute_gex_1pct,
+                            old.id,
+                        ));
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| a.3.total_cmp(&b.3))
+                .then_with(|| b.4.total_cmp(&a.4))
+                .then_with(|| a.5.cmp(&b.5))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut used_current = FxHashSet::default();
+        let mut used_previous = FxHashSet::default();
+        for (current_index, previous_index, ..) in candidates {
+            if used_current.insert(current_index) && used_previous.insert(previous_index) {
+                current[current_index].id = previous[previous_index].id;
+            }
+        }
+        for (ordinal, zone) in current.iter_mut().enumerate() {
+            if zone.id == 0 {
+                zone.id = deterministic_zone_id(bucket_start, zone, ordinal);
+            }
+            let lookback_ms = u64::from(config.persistent_lookback_minutes.clamp(1, 60)) * 60_000;
+            let cutoff = bucket_start.saturating_sub(lookback_ms);
+            let entries = track_history.entry(zone.id).or_default();
+            entries.retain(|(time, _)| *time >= cutoff);
+            let expected = (lookback_ms / bucket_ms).max(1) as f32;
+            let presence_ratio = (entries.len() as f32 / expected).clamp(0.0, 1.0);
+            let average_strength = if entries.is_empty() {
+                0.0
+            } else {
+                entries.iter().map(|(_, strength)| *strength).sum::<f32>() / entries.len() as f32
+            };
+            zone.persistence_score =
+                (0.50 * zone.normalized_strength + 0.30 * presence_ratio + 0.20 * average_strength)
+                    .clamp(0.0, 1.0);
+            entries.push((bucket_start, zone.normalized_strength));
+        }
+        if consecutive {
+            for (index, zone) in previous.iter().enumerate() {
+                if used_previous.contains(&index) {
+                    continue;
+                }
+                let missing = zone.missing_buckets.saturating_add(1);
+                if missing < config.fade_buckets.clamp(1, 3) {
+                    let mut fading = zone.clone();
+                    fading.state = GexZoneState::Fading;
+                    fading.missing_buckets = missing;
+                    current.push(fading);
+                }
+            }
+        }
+        current.retain(|zone| {
+            zone.normalized_strength >= config.minimum_zone_strength
+                || zone.persistence_score >= 0.25
+                || zone.state == GexZoneState::Fading
+        });
+        limit_tracked_zones(
+            &mut current,
+            GexZoneSign::Positive,
+            config.max_positive_zones,
+        );
+        limit_tracked_zones(
+            &mut current,
+            GexZoneSign::Negative,
+            config.max_negative_zones,
+        );
+        current.sort_by_key(|zone| zone.id);
+        frames.push(GexZoneFrame {
+            bucket_start,
+            source_spot: snapshot.source_spot,
+            zones: current.clone().into(),
+        });
+        previous = current;
+        previous_bucket = Some(bucket_start);
+    }
+    frames
+}
+
+fn limit_tracked_zones(zones: &mut Vec<GexZone>, sign: GexZoneSign, limit: u8) {
+    let mut ranked = zones
+        .iter()
+        .enumerate()
+        .filter(|(_, zone)| zone.sign == sign)
+        .map(|(index, zone)| {
+            (
+                index,
+                zone.persistence_score,
+                zone.normalized_strength,
+                zone.absolute_gex_1pct,
+                zone.id,
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| b.2.total_cmp(&a.2))
+            .then_with(|| b.3.total_cmp(&a.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    let keep = ranked
+        .into_iter()
+        .take(usize::from(limit.clamp(1, 6)))
+        .map(|value| value.0)
+        .collect::<FxHashSet<_>>();
+    let mut index = 0usize;
+    zones.retain(|zone| {
+        let retain = zone.sign != sign || keep.contains(&index);
+        index += 1;
+        retain
+    });
+}
+
+fn deterministic_zone_id(bucket: UnixMs, zone: &GexZone, ordinal: usize) -> u64 {
+    let sign = match zone.sign {
+        GexZoneSign::Positive => 0x9e37_79b9_7f4a_7c15,
+        GexZoneSign::Negative => 0xc2b2_ae3d_27d4_eb4f,
+    };
+    let mut value = bucket.as_u64() ^ zone.peak_price.to_bits().rotate_left(17) ^ sign;
+    value ^= (ordinal as u64).wrapping_mul(0x1000_0000_01b3);
+    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    value ^ (value >> 33)
+}
+
 pub fn gex_percentile_95(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     let mut values = values
         .into_iter()
@@ -1434,127 +1774,9 @@ pub fn gex_percentile_95(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     values.get(index).copied()
 }
 
-pub fn gex_normalized_intensity(value: f64, scale: f64) -> Option<f32> {
-    gex_normalized_intensity_with_max(value, scale, 1.0)
-}
-
-pub fn gex_normalized_intensity_with_max(
-    value: f64,
-    scale: f64,
-    transformed_max: f64,
-) -> Option<f32> {
-    if !value.is_finite() || !scale.is_finite() || scale <= 0.0 || value == 0.0 {
-        return None;
-    }
-    if !transformed_max.is_finite() || transformed_max <= 0.0 {
-        return None;
-    }
-    Some(((value.abs() / scale).asinh() / transformed_max).clamp(0.0, 1.0) as f32)
-}
-
-pub fn gex_time_bucket_ms(resolution: GexTimeResolution, chart_interval_ms: u64) -> u64 {
-    match resolution {
-        GexTimeResolution::FollowChart => chart_interval_ms.max(1),
-        GexTimeResolution::Seconds30 => 30_000,
-        GexTimeResolution::Minute1 => 60_000,
-        GexTimeResolution::Minute5 => 300_000,
-    }
-}
-
 pub fn gex_bucket_start(timestamp: UnixMs, bucket_ms: u64) -> UnixMs {
     let bucket_ms = bucket_ms.max(1);
     UnixMs::new(timestamp.as_u64() / bucket_ms * bucket_ms)
-}
-
-pub fn regular_price_bins(low: f64, high: f64, count: usize) -> Vec<(f64, f64, f64)> {
-    if !low.is_finite() || !high.is_finite() || high <= low || count == 0 {
-        return Vec::new();
-    }
-    let step = (high - low) / count as f64;
-    (0..count)
-        .map(|index| {
-            let lower = low + index as f64 * step;
-            let upper = if index + 1 == count {
-                high
-            } else {
-                lower + step
-            };
-            (lower, upper, (lower + upper) * 0.5)
-        })
-        .collect()
-}
-
-pub fn interpolate_scenario_point(
-    curve: &[GexScenarioPoint],
-    price: f64,
-) -> Option<GexScenarioPoint> {
-    if curve.is_empty()
-        || !price.is_finite()
-        || price < curve.first()?.price
-        || price > curve.last()?.price
-    {
-        return None;
-    }
-    match curve.binary_search_by(|point| point.price.total_cmp(&price)) {
-        Ok(index) => curve.get(index).cloned(),
-        Err(index) if index > 0 && index < curve.len() => {
-            let left = &curve[index - 1];
-            let right = &curve[index];
-            let span = right.price - left.price;
-            if !span.is_finite() || span <= 0.0 {
-                return None;
-            }
-            let weight = ((price - left.price) / span).clamp(0.0, 1.0);
-            Some(GexScenarioPoint {
-                price,
-                net_gex_1pct: left.net_gex_1pct + (right.net_gex_1pct - left.net_gex_1pct) * weight,
-                absolute_gex_1pct: left.absolute_gex_1pct
-                    + (right.absolute_gex_1pct - left.absolute_gex_1pct) * weight,
-            })
-        }
-        _ => None,
-    }
-}
-
-pub fn compact_kernel_alpha(distance_px: f32, core_width_px: f32, influence_width_px: f32) -> f32 {
-    let distance = distance_px.abs();
-    let core_half = core_width_px.clamp(2.0, 8.0) * 0.5;
-    let influence_half = influence_width_px.clamp(6.0, 24.0) * 0.5;
-    if distance <= core_half {
-        return 1.0;
-    }
-    if distance >= influence_half {
-        return 0.0;
-    }
-    let sigma = ((influence_half - core_half) / 2.5).max(0.1);
-    (-0.5 * ((distance - core_half) / sigma).powi(2)).exp()
-}
-
-pub fn gex_band_bounds(prices: &[f64]) -> Vec<(f64, f64)> {
-    if prices.is_empty() {
-        return Vec::new();
-    }
-    if prices.len() == 1 {
-        let half = (prices[0].abs() * 0.005).max(f64::EPSILON);
-        return vec![(prices[0] - half, prices[0] + half)];
-    }
-    prices
-        .iter()
-        .enumerate()
-        .map(|(index, &price)| {
-            let previous_gap = index
-                .checked_sub(1)
-                .map(|previous| price - prices[previous])
-                .filter(|gap| gap.is_finite() && *gap > 0.0);
-            let next_gap = prices
-                .get(index + 1)
-                .map(|next| *next - price)
-                .filter(|gap| gap.is_finite() && *gap > 0.0);
-            let lower_gap = previous_gap.or(next_gap).unwrap_or(price.abs() * 0.01);
-            let upper_gap = next_gap.or(previous_gap).unwrap_or(price.abs() * 0.01);
-            (price - lower_gap * 0.5, price + upper_gap * 0.5)
-        })
-        .collect()
 }
 
 pub fn dominant_expiry(values: &[GexExpiryStrike], strike: f64) -> Option<(UnixMs, f64)> {
@@ -1576,49 +1798,6 @@ pub fn dominant_expiry(values: &[GexExpiryStrike], strike: f64) -> Option<(UnixM
         0.0
     };
     Some((dominant.expiration, share))
-}
-
-pub fn persistent_gamma_zone_score(
-    current_magnitude: f64,
-    persistence_ratio: f64,
-    local_max_ratio: f64,
-) -> f64 {
-    (current_magnitude.clamp(0.0, 1.0) * 0.50
-        + persistence_ratio.clamp(0.0, 1.0) * 0.30
-        + local_max_ratio.clamp(0.0, 1.0) * 0.20)
-        .clamp(0.0, 1.0)
-}
-
-pub fn aggregate_gex_values(mode: GexTimeAggregation, values: &[f64]) -> Option<f64> {
-    let mut valid = values.iter().copied().filter(|value| value.is_finite());
-    match mode {
-        GexTimeAggregation::Latest => valid.next_back(),
-        GexTimeAggregation::MaxAbsolute => valid.max_by(|a, b| a.abs().total_cmp(&b.abs())),
-        GexTimeAggregation::Mean => {
-            let (sum, count) = valid.fold((0.0, 0usize), |(sum, count), value| {
-                (sum + value, count + 1)
-            });
-            (count > 0).then_some(sum / count as f64)
-        }
-    }
-}
-
-pub fn gex_column_end(
-    observed_at: UnixMs,
-    next_observed_at: Option<UnixMs>,
-    freshness: GexFreshness,
-    now: UnixMs,
-    maximum_extension_ms: u64,
-) -> UnixMs {
-    if let Some(next) = next_observed_at {
-        return next;
-    }
-    let cap = observed_at.saturating_add(maximum_extension_ms);
-    if freshness == GexFreshness::Fresh {
-        now.min(cap)
-    } else {
-        cap
-    }
 }
 
 #[cfg(test)]
@@ -1957,54 +2136,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_levels_config_loads_and_migrates_old_cluster_default() {
-        let mut legacy: GexLevelsConfig = serde_json::from_str(
-            r#"{
-                "clusters_as_bands": false,
-                "show_value": false,
-                "show_distance_percent": false,
-                "cluster_color": "Secondary"
-            }"#,
-        )
-        .expect("legacy levels config");
-        legacy.migrate_legacy_defaults();
-        assert_eq!(legacy.cluster_color, GexLevelColor::Primary);
-        assert_eq!(legacy.horizontal_span_percent, 35.0);
-        assert_eq!(legacy.overlay_mode, GexOverlayMode::Levels);
-
-        let mut customized = GexLevelsConfig {
-            cluster_color: GexLevelColor::Secondary,
-            cluster_color_customized: true,
-            ..GexLevelsConfig::default()
-        };
-        customized.migrate_legacy_defaults();
-        assert_eq!(customized.cluster_color, GexLevelColor::Secondary);
-
-        let first_heatmap: GexLevelsConfig =
-            serde_json::from_str(r#"{"overlay_mode":"ScenarioHeatmap"}"#)
-                .expect("first heatmap config");
-        assert_eq!(first_heatmap.overlay_mode, GexOverlayMode::ScenarioHeatmap);
-        assert_eq!(
-            first_heatmap.strike_geometry,
-            GexStrikeGeometry::CompactKernel
-        );
-        assert_eq!(
-            first_heatmap.time_resolution,
-            GexTimeResolution::FollowChart
-        );
-    }
-
-    #[test]
-    fn strike_midpoints_cover_regular_irregular_and_single_strikes() {
-        assert_eq!(
-            gex_band_bounds(&[90.0, 100.0, 110.0]),
-            vec![(85.0, 95.0), (95.0, 105.0), (105.0, 115.0)]
-        );
-        assert_eq!(
-            gex_band_bounds(&[90.0, 100.0, 130.0]),
-            vec![(85.0, 95.0), (95.0, 115.0), (115.0, 145.0)]
-        );
-        assert_eq!(gex_band_bounds(&[100.0]), vec![(99.5, 100.5)]);
+    fn legacy_overlay_modes_migrate_to_zone_overlay() {
+        for mode in ["Levels", "NetHeatmap", "AbsoluteHeatmap", "ScenarioHeatmap"] {
+            let mut config: GexLevelsConfig = serde_json::from_value(serde_json::json!({
+                "overlay_mode": mode,
+                "current_profile_width_percent": 15.0
+            }))
+            .expect("legacy GEX overlay config");
+            config.migrate_legacy_defaults();
+            assert_eq!(config.overlay_mode, GexOverlayMode::GexZoneOverlay);
+            assert_eq!(config.current_profile_width_percent, 7.0);
+        }
     }
 
     #[test]
@@ -2014,7 +2156,6 @@ mod tests {
         assert_eq!(gex_percentile_95(values), Some(19.0));
         assert_eq!(gex_percentile_95([0.0, f64::NAN, f64::INFINITY]), None);
         assert_eq!(gex_percentile_95([-1.0, -2.0, -3.0]), Some(3.0));
-        assert!(gex_normalized_intensity(-2.0, 3.0).is_some());
     }
 
     #[test]
@@ -2062,62 +2203,15 @@ mod tests {
     }
 
     #[test]
-    fn persistent_zone_score_requires_history_contribution() {
-        assert_eq!(persistent_gamma_zone_score(1.0, 0.0, 0.0), 0.5);
-        assert!(persistent_gamma_zone_score(0.9, 0.8, 0.8) >= 0.65);
-    }
-
-    #[test]
-    fn new_config_roundtrips_with_scenario_default() {
+    fn new_config_roundtrips_with_zone_defaults() {
         let config = GexLevelsConfig::default();
-        assert_eq!(config.overlay_mode, GexOverlayMode::ScenarioHeatmap);
-        assert_eq!(config.current_profile_width_percent, 6.0);
-        assert!(config.current_profile_width_percent.clamp(4.0, 10.0) <= 10.0);
+        assert_eq!(config.overlay_mode, GexOverlayMode::GexZoneOverlay);
+        assert_eq!(config.current_profile_width_percent, 5.0);
+        assert_eq!(config.positive_color, GexLevelColor::Cyan);
+        assert_eq!(config.negative_color, GexLevelColor::Magenta);
         let encoded = serde_json::to_string(&config).expect("serialize");
         let decoded: GexLevelsConfig = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
-    }
-
-    #[test]
-    fn temporal_aggregation_modes_preserve_their_contract() {
-        let values = [1.0, -5.0, 3.0];
-        assert_eq!(
-            aggregate_gex_values(GexTimeAggregation::Latest, &values),
-            Some(3.0)
-        );
-        assert_eq!(
-            aggregate_gex_values(GexTimeAggregation::MaxAbsolute, &values),
-            Some(-5.0)
-        );
-        assert_eq!(
-            aggregate_gex_values(GexTimeAggregation::Mean, &values),
-            Some(-1.0 / 3.0)
-        );
-    }
-
-    #[test]
-    fn expired_snapshot_does_not_extend_to_present() {
-        let observed = UnixMs::new(1_000);
-        assert_eq!(
-            gex_column_end(
-                observed,
-                None,
-                GexFreshness::Expired,
-                UnixMs::new(100_000),
-                45_000
-            ),
-            UnixMs::new(46_000)
-        );
-        assert_eq!(
-            gex_column_end(
-                observed,
-                None,
-                GexFreshness::Fresh,
-                UnixMs::new(2_000),
-                45_000
-            ),
-            UnixMs::new(2_000)
-        );
     }
 
     #[test]
@@ -2147,68 +2241,292 @@ mod tests {
         }
     }
 
+    fn zone_snapshot(observed_at: u64, values: &[(f64, f64)]) -> Arc<GexSnapshot> {
+        let strikes = values
+            .iter()
+            .map(|(strike, net)| GexStrike {
+                strike: *strike,
+                call_gex_1pct: net.max(0.0),
+                put_gex_1pct: net.min(0.0),
+                net_gex_1pct: *net,
+                absolute_gamma_1pct: net.abs(),
+                call_open_interest: net.max(0.0),
+                put_open_interest: (-net).max(0.0),
+                expiration_count: 1,
+                gamma_provenance: GexGammaProvenance::Derived,
+            })
+            .collect::<Vec<_>>();
+        Arc::new(GexSnapshot {
+            provider: OptionsProvider::Deribit,
+            underlying: OptionsUnderlying::Btc,
+            model: GexSignModel::CallPutOiProxy,
+            expiry_filter: GexExpiryFilter::SevenDays,
+            gamma_source: GexGammaSource::BlackScholesDerived,
+            gamma_provenance: GexGammaProvenance::Derived,
+            source_spot: 100_000.0,
+            observed_at: UnixMs::new(observed_at),
+            calculated_at: UnixMs::new(observed_at),
+            net_gex_1pct: Some(values.iter().map(|(_, value)| value).sum()),
+            absolute_gex_1pct: values.iter().map(|(_, value)| value.abs()).sum(),
+            call_wall: None,
+            put_wall: None,
+            gamma_flip: None,
+            intrinsic_stress: IntrinsicStressMetrics::default(),
+            gamma_vega: GammaVegaMetrics::default(),
+            strikes: strikes.into(),
+            expiry_strikes: Arc::from([]),
+            scenario_curve: Arc::from([]),
+            scale_p95: 1.0,
+        })
+    }
+
     #[test]
-    fn regular_scenario_bins_and_interpolation_do_not_use_strike_midpoints() {
-        let bins = regular_price_bins(90.0, 110.0, 4);
-        assert_eq!(
-            bins,
-            vec![
-                (90.0, 95.0, 92.5),
-                (95.0, 100.0, 97.5),
-                (100.0, 105.0, 102.5),
-                (105.0, 110.0, 107.5)
-            ]
+    fn zone_clustering_groups_adjacent_sign_and_splits_sign_or_large_gap() {
+        let adjacent = zone_snapshot(
+            300_001,
+            &[(69_900.0, 8.0), (70_000.0, 10.0), (70_100.0, 7.0)],
         );
-        let curve = [
-            GexScenarioPoint {
-                price: 90.0,
-                net_gex_1pct: -10.0,
-                absolute_gex_1pct: 10.0,
-            },
-            GexScenarioPoint {
-                price: 110.0,
-                net_gex_1pct: 10.0,
-                absolute_gex_1pct: 30.0,
-            },
+        let zones = extract_gex_zones(&adjacent, 0.12, 6, 6);
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].peak_price, 70_000.0);
+
+        let sign_change = zone_snapshot(300_001, &[(69_900.0, 8.0), (70_000.0, -10.0)]);
+        assert_eq!(extract_gex_zones(&sign_change, 0.12, 6, 6).len(), 2);
+
+        let large_gap = zone_snapshot(
+            300_001,
+            &[(69_900.0, 8.0), (70_000.0, 10.0), (72_000.0, 9.0)],
+        );
+        assert_eq!(extract_gex_zones(&large_gap, 0.12, 6, 6).len(), 2);
+    }
+
+    #[test]
+    fn isolated_zone_and_padding_are_strictly_bounded() {
+        let isolated = zone_snapshot(300_001, &[(70_000.0, 10.0)]);
+        let zone = extract_gex_zones(&isolated, 0.12, 6, 6).remove(0);
+        let half = (zone.upper_price - zone.lower_price) * 0.5;
+        assert!((25.0..=80.0).contains(&half));
+
+        let cluster = zone_snapshot(300_001, &[(69_000.0, 8.0), (70_000.0, 10.0)]);
+        let zone = extract_gex_zones(&cluster, 0.12, 6, 6).remove(0);
+        assert!(69_000.0 - zone.lower_price <= 100.0);
+        assert!(zone.upper_price - 70_000.0 <= 100.0);
+    }
+
+    #[test]
+    fn zone_limits_and_positive_negative_scales_are_independent() {
+        let values = (0..20)
+            .map(|index| {
+                let value = if index % 2 == 0 {
+                    10.0 + f64::from(index)
+                } else {
+                    -1_000.0 - f64::from(index)
+                };
+                (60_000.0 + f64::from(index) * 1_000.0, value)
+            })
+            .collect::<Vec<_>>();
+        let snapshot = zone_snapshot(300_001, &values);
+        let zones = extract_gex_zones(&snapshot, 0.12, 6, 6);
+        assert!(
+            zones
+                .iter()
+                .filter(|zone| zone.sign == GexZoneSign::Positive)
+                .count()
+                <= 6
+        );
+        assert!(
+            zones
+                .iter()
+                .filter(|zone| zone.sign == GexZoneSign::Negative)
+                .count()
+                <= 6
+        );
+        assert!(zones.iter().any(|zone| zone.sign == GexZoneSign::Positive));
+        assert!(zones.iter().any(|zone| zone.sign == GexZoneSign::Negative));
+    }
+
+    #[test]
+    fn tracking_preserves_id_by_overlap_and_peak_distance() {
+        let config = GexLevelsConfig::default();
+        let overlap = vec![
+            zone_snapshot(300_001, &[(70_000.0, 10.0), (70_100.0, 8.0)]),
+            zone_snapshot(600_001, &[(70_050.0, 11.0), (70_150.0, 7.0)]),
         ];
-        let midpoint = interpolate_scenario_point(&curve, 100.0).expect("interpolated");
-        assert_eq!(midpoint.net_gex_1pct, 0.0);
-        assert_eq!(midpoint.absolute_gex_1pct, 20.0);
+        let frames = build_gex_zone_frames(&overlap, 300_000, &config);
+        assert_eq!(frames[0].zones[0].id, frames[1].zones[0].id);
+
+        let nearby = vec![
+            zone_snapshot(300_001, &[(70_000.0, 10.0)]),
+            zone_snapshot(600_001, &[(70_150.0, 9.0)]),
+        ];
+        let frames = build_gex_zone_frames(&nearby, 300_000, &config);
+        assert_eq!(frames[0].zones[0].id, frames[1].zones[0].id);
     }
 
     #[test]
-    fn compact_kernel_has_exact_core_and_finite_influence() {
-        assert_eq!(compact_kernel_alpha(0.0, 3.0, 10.0), 1.0);
-        assert_eq!(compact_kernel_alpha(1.5, 3.0, 10.0), 1.0);
-        assert!(compact_kernel_alpha(3.0, 3.0, 10.0) > 0.0);
-        assert_eq!(compact_kernel_alpha(5.0, 3.0, 10.0), 0.0);
-        assert_eq!(compact_kernel_alpha(50.0, 3.0, 10.0), 0.0);
+    fn frame_uses_latest_snapshot_inside_chart_bucket() {
+        let history = vec![
+            zone_snapshot(300_001, &[(70_000.0, 8.0)]),
+            zone_snapshot(450_001, &[(72_000.0, 12.0)]),
+        ];
+        let frames = build_gex_zone_frames(&history, 300_000, &GexLevelsConfig::default());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].zones[0].peak_price, 72_000.0);
     }
 
     #[test]
-    fn chart_time_resolutions_align_to_unix_milliseconds() {
+    fn split_and_merge_choose_one_previous_id_deterministically() {
+        let config = GexLevelsConfig::default();
+        let split = vec![
+            zone_snapshot(
+                300_001,
+                &[(69_900.0, 9.0), (70_000.0, 10.0), (70_100.0, 8.0)],
+            ),
+            zone_snapshot(
+                600_001,
+                &[(69_900.0, 9.0), (70_000.0, 0.0), (70_100.0, 8.0)],
+            ),
+        ];
+        let frames = build_gex_zone_frames(&split, 300_000, &config);
+        let old_id = frames[0].zones[0].id;
         assert_eq!(
-            gex_time_bucket_ms(GexTimeResolution::FollowChart, 60_000),
-            60_000
+            frames[1]
+                .zones
+                .iter()
+                .filter(|zone| zone.id == old_id)
+                .count(),
+            1
         );
-        assert_eq!(
-            gex_time_bucket_ms(GexTimeResolution::FollowChart, 180_000),
-            180_000
-        );
-        assert_eq!(
-            gex_time_bucket_ms(GexTimeResolution::FollowChart, 300_000),
-            300_000
-        );
-        assert_eq!(
-            gex_bucket_start(UnixMs::new(179_999), 60_000),
-            UnixMs::new(120_000)
-        );
+
+        let merge = vec![
+            zone_snapshot(
+                300_001,
+                &[(69_900.0, 9.0), (70_000.0, 0.0), (70_100.0, 8.0)],
+            ),
+            zone_snapshot(
+                600_001,
+                &[(69_900.0, 9.0), (70_000.0, 10.0), (70_100.0, 8.0)],
+            ),
+        ];
+        let first = build_gex_zone_frames(&merge, 300_000, &config);
+        let second = build_gex_zone_frames(&merge, 300_000, &config);
+        assert_eq!(first, second);
+        let previous_ids = first[0]
+            .zones
+            .iter()
+            .map(|zone| zone.id)
+            .collect::<FxHashSet<_>>();
+        assert!(previous_ids.contains(&first[1].zones[0].id));
     }
 
     #[test]
-    fn minimum_visible_intensity_can_remove_weak_cells() {
-        let weak = gex_normalized_intensity_with_max(0.01, 10.0, 1.0).expect("weak");
-        assert!(weak < GexLevelsConfig::default().minimum_visible_intensity);
+    fn persistence_fade_expiration_and_real_gap_are_bounded() {
+        let config = GexLevelsConfig::default();
+        let history = vec![
+            zone_snapshot(300_001, &[(70_000.0, 10.0)]),
+            zone_snapshot(600_001, &[(70_000.0, 10.0)]),
+            zone_snapshot(900_001, &[(70_000.0, 10.0)]),
+            zone_snapshot(1_200_001, &[]),
+            zone_snapshot(1_500_001, &[]),
+            zone_snapshot(1_800_001, &[]),
+        ];
+        let frames = build_gex_zone_frames(&history, 300_000, &config);
+        assert!(frames[2].zones[0].persistence_score >= 0.65);
+        assert_eq!(frames[3].zones[0].state, GexZoneState::Fading);
+        assert_eq!(frames[3].zones[0].missing_buckets, 1);
+        assert_eq!(frames[4].zones[0].missing_buckets, 2);
+        assert!(frames[5].zones.is_empty());
+
+        let gap = vec![
+            zone_snapshot(300_001, &[(70_000.0, 10.0)]),
+            zone_snapshot(1_200_001, &[(70_000.0, 10.0)]),
+        ];
+        let frames = build_gex_zone_frames(&gap, 300_000, &config);
+        assert_ne!(frames[0].zones[0].id, frames[1].zones[0].id);
+    }
+
+    #[test]
+    fn persistent_zone_remains_visible_when_current_strength_is_below_threshold() {
+        let config = GexLevelsConfig {
+            minimum_zone_strength: 0.90,
+            ..GexLevelsConfig::default()
+        };
+        let history = vec![
+            zone_snapshot(
+                300_001,
+                &[(70_000.0, 10.0), (70_500.0, 0.0), (71_000.0, 10.0)],
+            ),
+            zone_snapshot(
+                600_001,
+                &[(70_000.0, 0.1), (70_500.0, 0.0), (71_000.0, 10.0)],
+            ),
+        ];
+        let frames = build_gex_zone_frames(&history, 300_000, &config);
+        let old_id = frames[0]
+            .zones
+            .iter()
+            .find(|zone| zone.peak_price == 70_000.0)
+            .expect("initial zone")
+            .id;
+        let fading = frames[1]
+            .zones
+            .iter()
+            .find(|zone| zone.id == old_id)
+            .expect("persistent fading zone");
+        assert_eq!(fading.state, GexZoneState::Fading);
+        assert!(fading.persistence_score >= 0.25);
+    }
+
+    #[test]
+    fn deterministic_five_minute_zone_render_fixture_has_gap_and_fade() {
+        let history = vec![
+            zone_snapshot(
+                300_001,
+                &[(65_000.0, -12.0), (70_000.0, 15.0), (72_000.0, 11.0)],
+            ),
+            zone_snapshot(
+                600_001,
+                &[(65_100.0, -13.0), (70_000.0, 16.0), (72_000.0, 10.0)],
+            ),
+            zone_snapshot(
+                900_001,
+                &[
+                    (65_200.0, -11.0),
+                    (69_950.0, 14.0),
+                    (70_050.0, 15.0),
+                    (72_000.0, 9.0),
+                ],
+            ),
+            // No 1_200_000 bucket: this must remain a real visual gap.
+            zone_snapshot(1_500_001, &[(65_300.0, -10.0), (70_000.0, 14.0)]),
+            zone_snapshot(1_800_001, &[(65_400.0, -9.0)]),
+        ];
+        let frames = build_gex_zone_frames(&history, 300_000, &GexLevelsConfig::default());
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            frames[3]
+                .bucket_start
+                .saturating_diff(frames[2].bucket_start),
+            600_000
+        );
+        assert!(
+            frames[0]
+                .zones
+                .iter()
+                .any(|zone| zone.sign == GexZoneSign::Positive)
+        );
+        assert!(
+            frames[0]
+                .zones
+                .iter()
+                .any(|zone| zone.sign == GexZoneSign::Negative)
+        );
+        assert!(
+            frames[4]
+                .zones
+                .iter()
+                .any(|zone| zone.state == GexZoneState::Fading)
+        );
     }
 
     #[test]
