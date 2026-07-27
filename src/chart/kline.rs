@@ -241,6 +241,8 @@ pub struct KlineChart {
     gex_proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
     gex_proxy_freshness: data::chart::gex::GexFreshness,
     gex_proxy_error: Option<Arc<str>>,
+    derive_flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>,
+    derive_freshness: data::chart::gex::GexFreshness,
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
@@ -372,6 +374,8 @@ impl KlineChart {
                     gex_proxy_history: Vec::new(),
                     gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_proxy_error: None,
+                    derive_flow: None,
+                    derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -446,6 +450,8 @@ impl KlineChart {
                     gex_proxy_history: Vec::new(),
                     gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_proxy_error: None,
+                    derive_flow: None,
+                    derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -1426,6 +1432,8 @@ impl KlineChart {
         proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
         proxy_freshness: data::chart::gex::GexFreshness,
         proxy_error: Option<Arc<str>>,
+        derive_flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>,
+        derive_freshness: data::chart::gex::GexFreshness,
     ) {
         let unchanged = self.gex_snapshot.as_ref().map(|value| value.observed_at)
             == snapshot.as_ref().map(|value| value.observed_at)
@@ -1440,6 +1448,10 @@ impl KlineChart {
                 == proxy_history.last().map(|value| value.observed_at)
             && self.gex_proxy_freshness == proxy_freshness
             && self.gex_proxy_error == proxy_error;
+        let unchanged = unchanged
+            && self.derive_flow.as_ref().map(|flow| flow.observed_at)
+                == derive_flow.as_ref().map(|flow| flow.observed_at)
+            && self.derive_freshness == derive_freshness;
         if unchanged {
             return;
         }
@@ -1450,6 +1462,8 @@ impl KlineChart {
         self.gex_proxy_history = proxy_history;
         self.gex_proxy_freshness = proxy_freshness;
         self.gex_proxy_error = proxy_error;
+        self.derive_flow = derive_flow;
+        self.derive_freshness = derive_freshness;
         self.chart.cache.clear_all();
     }
 
@@ -2612,6 +2626,7 @@ impl canvas::Program<Message> for KlineChart {
                             snapshot,
                             &self.gex_history,
                             self.gex_freshness,
+                            self.derive_flow.as_deref(),
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
                             chart.tick_size,
@@ -2672,6 +2687,7 @@ impl canvas::Program<Message> for KlineChart {
                         &self.gex_history,
                         &self.gex_proxy_history,
                         self.gex_freshness,
+                        self.derive_flow.as_deref(),
                         &self.gex_render_cache,
                         &self.visual_config.gex_levels(),
                         cursor_position,
@@ -2732,6 +2748,7 @@ fn draw_gex_hover_tooltip(
     history: &[Arc<data::chart::gex::GexSnapshot>],
     proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
     freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2755,6 +2772,7 @@ fn draw_gex_hover_tooltip(
         chart,
         history,
         freshness,
+        derive_flow,
         render_cache,
         config,
         cursor,
@@ -2838,6 +2856,7 @@ fn draw_gex_zone_tooltip(
     chart: &ViewState,
     history: &[Arc<data::chart::gex::GexSnapshot>],
     freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2932,6 +2951,21 @@ fn draw_gex_zone_tooltip(
             format!("Last update: {} UTC", zone.observed_at.as_u64()),
             format!("Freshness: {freshness:?}"),
         ]);
+    }
+    if let Some(flow) = derive_flow {
+        let window = &flow.thirty_minutes;
+        if window.direction != data::chart::gex::ObservedGammaDirection::Unavailable {
+            lines.extend([
+                format!("Derive observed maker flow: {}", window.direction),
+                format!("30m imbalance: {:+.0}%", window.imbalance * 100.0),
+                format!(
+                    "Matched share: {:.0}%",
+                    window.matched_deribit_gex_share * 100.0
+                ),
+                format!("Trades: {}", window.trade_count),
+                "Source: Derive · observed settled maker flow".to_owned(),
+            ]);
+        }
     }
     let width = 300.0;
     let height = 12.0 + lines.len() as f32 * 16.0;
@@ -3360,6 +3394,7 @@ fn draw_gex_overlay_foreground(
     snapshot: &data::chart::gex::GexSnapshot,
     history: &[Arc<data::chart::gex::GexSnapshot>],
     _freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     tick_size: PriceStep,
@@ -3405,6 +3440,25 @@ fn draw_gex_overlay_foreground(
         chart_scaling,
         palette,
     );
+    if let Some(flow) = derive_flow {
+        let window = &flow.thirty_minutes;
+        let imbalance = window.imbalance.abs() * 100.0;
+        draw_cluster_text(
+            frame,
+            &format!(
+                "Derive flow 30m: {} · {:.0}% · {}",
+                window.direction, imbalance, window.quality
+            ),
+            Point::new(
+                visible_region.x + gex_screen_width_to_world(8.0, chart_scaling),
+                visible_region.y + gex_screen_width_to_world(14.0, chart_scaling),
+            ),
+            gex_screen_width_to_world(10.0, chart_scaling),
+            palette.background.base.text,
+            Alignment::Start,
+            Alignment::Center,
+        );
+    }
 }
 
 fn cached_gex_zone_frames(

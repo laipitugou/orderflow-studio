@@ -47,6 +47,7 @@ pub enum Action {
 pub struct GexChart {
     underlying: OptionsUnderlying,
     snapshot: Option<Arc<GexSnapshot>>,
+    derive_flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>,
     freshness: GexFreshness,
     config: Config,
     visible_fraction: f64,
@@ -72,6 +73,7 @@ impl GexChart {
         Self {
             underlying,
             snapshot: None,
+            derive_flow: None,
             freshness: GexFreshness::Loading,
             config: config.unwrap_or_default(),
             visible_fraction: 1.0,
@@ -97,6 +99,7 @@ impl GexChart {
         if self.underlying != underlying {
             self.underlying = underlying;
             self.snapshot = None;
+            self.derive_flow = None;
             self.freshness = GexFreshness::Loading;
             self.error = None;
             self.liquidity_metrics = None;
@@ -129,6 +132,15 @@ impl GexChart {
 
     pub fn snapshot(&self) -> Option<&Arc<GexSnapshot>> {
         self.snapshot.as_ref()
+    }
+
+    pub fn set_derive_flow(&mut self, flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>) {
+        self.derive_flow = flow;
+        self.last_tick = Instant::now();
+    }
+
+    pub fn derive_flow(&self) -> Option<&data::chart::gex::DeriveMakerGammaFlow> {
+        self.derive_flow.as_deref()
     }
 
     pub fn freshness(&self) -> GexFreshness {

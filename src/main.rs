@@ -139,6 +139,7 @@ struct Flowsurface {
     debug_terminal_compact_mode: bool,
     gex_coordinator: connector::gex::GexDataCoordinator,
     deribit_options_client: Option<exchange::options::deribit::DeribitOptionsClient>,
+    derive_options_client: Option<exchange::options::derive::DeriveOptionsClient>,
     gex_monitor_client: Option<exchange::options::gex_monitor::GexMonitorClient>,
     startup_loading: StartupLoading,
     startup_main_window_target: StartupMainWindowTarget,
@@ -270,6 +271,8 @@ enum Message {
     },
     Tick(std::time::Instant),
     GexFetchCompleted(connector::gex::GexFetchResult),
+    DeriveInstrumentsFetchCompleted(connector::gex::DeriveInstrumentsFetchResult),
+    DeriveTradesFetchCompleted(connector::gex::DeriveTradesFetchResult),
     GexProxyFetchCompleted(
         (
             exchange::options::OptionsUnderlying,
@@ -717,6 +720,13 @@ impl Flowsurface {
                     error
                 })
                 .ok();
+        let derive_options_client =
+            exchange::options::derive::DeriveOptionsClient::new(saved_state.proxy_cfg.as_ref())
+                .map_err(|error| {
+                    log::error!("Derive options client initialization failed: {error}");
+                    error
+                })
+                .ok();
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state, handles.clone());
 
@@ -772,6 +782,7 @@ impl Flowsurface {
             debug_terminal_compact_mode: true,
             gex_coordinator: connector::gex::GexDataCoordinator::default(),
             deribit_options_client,
+            derive_options_client,
             gex_monitor_client,
             startup_loading: StartupLoading::new(),
             startup_main_window_target,
@@ -1157,6 +1168,45 @@ impl Flowsurface {
                 } else {
                     Vec::new()
                 };
+                let derive_instrument_tasks =
+                    if let Some(client) = self.derive_options_client.clone() {
+                        self.gex_coordinator
+                            .due_derive_instrument_fetches(gex_now, true)
+                            .into_iter()
+                            .map(|underlying| {
+                                Task::perform(
+                                    connector::gex::execute_derive_instruments_fetch(
+                                        client.clone(),
+                                        underlying,
+                                    ),
+                                    Message::DeriveInstrumentsFetchCompleted,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                let derive_trade_tasks = if let Some(client) = self.derive_options_client.clone() {
+                    self.gex_coordinator
+                        .due_derive_trade_fetches(gex_now, true)
+                        .into_iter()
+                        .map(|request| {
+                            let instruments = self
+                                .gex_coordinator
+                                .derive_instruments_for(request.underlying);
+                            Task::perform(
+                                connector::gex::execute_derive_trades_fetch(
+                                    client.clone(),
+                                    request,
+                                    instruments,
+                                ),
+                                Message::DeriveTradesFetchCompleted,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
 
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
@@ -1174,6 +1224,8 @@ impl Flowsurface {
                         .into_iter()
                         .chain(gex_tasks)
                         .chain(proxy_tasks)
+                        .chain(derive_instrument_tasks)
+                        .chain(derive_trade_tasks)
                         .collect::<Vec<_>>(),
                 );
             }
@@ -1187,6 +1239,21 @@ impl Flowsurface {
             Message::GexProxyFetchCompleted((underlying, result)) => {
                 let now = exchange::UnixMs::now();
                 self.gex_coordinator.complete_proxy(underlying, result, now);
+                self.sync_gex_dashboard(now);
+                self.dirty_flag.mark_dirty();
+                return Task::none();
+            }
+            Message::DeriveInstrumentsFetchCompleted(completion) => {
+                let now = exchange::UnixMs::now();
+                self.gex_coordinator
+                    .complete_derive_instruments(completion, now);
+                self.sync_gex_dashboard(now);
+                self.dirty_flag.mark_dirty();
+                return Task::none();
+            }
+            Message::DeriveTradesFetchCompleted(completion) => {
+                let now = exchange::UnixMs::now();
+                self.gex_coordinator.complete_derive_trades(completion, now);
                 self.sync_gex_dashboard(now);
                 self.dirty_flag.mark_dirty();
                 return Task::none();

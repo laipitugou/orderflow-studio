@@ -339,6 +339,8 @@ impl Dashboard {
                         let freshness = coordinator.freshness(*underlying, now);
                         let error = coordinator.last_error(*underlying).map(Arc::from);
                         chart.set_snapshot(snapshot, freshness, error);
+                        let flow = coordinator.derive_flow(*underlying, chart.config(), now);
+                        chart.set_derive_flow(flow);
                     }
                     pane::Content::Kline {
                         chart: Some(chart),
@@ -355,6 +357,8 @@ impl Dashboard {
                                 Vec::new(),
                                 data::chart::gex::GexFreshness::Loading,
                                 None,
+                                None,
+                                data::chart::gex::GexFreshness::Loading,
                             );
                             return;
                         }
@@ -367,6 +371,8 @@ impl Dashboard {
                                 Vec::new(),
                                 data::chart::gex::GexFreshness::Loading,
                                 None,
+                                None,
+                                data::chart::gex::GexFreshness::Loading,
                             );
                             return;
                         };
@@ -390,6 +396,8 @@ impl Dashboard {
                         let proxy_history = coordinator.proxy_history(underlying, now);
                         let proxy_freshness = coordinator.proxy_freshness(underlying, now);
                         let proxy_error = coordinator.proxy_error(underlying).map(Arc::from);
+                        let derive_flow = coordinator.derive_flow(underlying, &config, now);
+                        let derive_freshness = coordinator.derive_freshness(underlying, now);
                         chart.set_gex_overlay_data(
                             snapshot,
                             history,
@@ -398,6 +406,8 @@ impl Dashboard {
                             proxy_history,
                             proxy_freshness,
                             proxy_error,
+                            derive_flow,
+                            derive_freshness,
                         );
                     }
                     _ => {}

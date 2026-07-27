@@ -1,12 +1,14 @@
 use data::chart::gex::{
-    Config, GexExpiryFilter, GexFreshness, GexGammaSource, GexScenarioResolution, GexSignModel,
-    GexSnapshot, calculate_gex_at,
+    Config, DeriveMakerGammaFlow, GexExpiryFilter, GexFreshness, GexGammaSource,
+    GexScenarioResolution, GexSignModel, GexSnapshot, calculate_derive_maker_gamma_flow,
+    calculate_gex_at,
 };
 use exchange::{
     UnixMs,
     options::{
         OptionInstrument, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
         deribit::{DeribitError, DeribitOptionsClient},
+        derive::{DeriveMakerTrade, DeriveOptionInstrument, DeriveOptionsClient},
         gex_monitor::{GexMonitorClient, GexProxyHistoryPoint, GexProxyHistoryResponse},
     },
 };
@@ -68,6 +70,11 @@ pub const MARKET_SNAPSHOT_TTL_MS: u64 = 15 * 1_000;
 pub const FRESH_THRESHOLD_MS: u64 = 45 * 1_000;
 pub const EXPIRED_THRESHOLD_MS: u64 = 5 * 60 * 1_000;
 pub const PROXY_REFRESH_MS: u64 = 5 * 60 * 1_000;
+pub const DERIVE_INSTRUMENT_REFRESH_MS: u64 = 10 * 60 * 1_000;
+pub const DERIVE_TRADE_REFRESH_MS: u64 = 5 * 1_000;
+pub const DERIVE_INITIAL_BACKFILL_MS: u64 = 2 * 60 * 60 * 1_000;
+pub const DERIVE_FETCH_OVERLAP_MS: u64 = 10 * 1_000;
+pub const DERIVE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const FAILURE_BACKOFF_BASE_MS: u64 = 5_000;
 const FAILURE_BACKOFF_MAX_MS: u64 = 2 * 60 * 1_000;
 const CACHE_SCHEMA: u32 = 1;
@@ -112,6 +119,25 @@ pub enum GexFetchResult {
         key: OptionsChainKey,
         result: Result<RawOptionChainSnapshot, Arc<str>>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct DeriveInstrumentsFetchResult {
+    pub underlying: OptionsUnderlying,
+    pub result: Result<Vec<DeriveOptionInstrument>, Arc<str>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeriveTradesFetchResult {
+    pub underlying: OptionsUnderlying,
+    pub result: Result<Vec<DeriveMakerTrade>, Arc<str>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeriveTradeFetchRequest {
+    pub underlying: OptionsUnderlying,
+    pub from: UnixMs,
+    pub to: UnixMs,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +214,19 @@ pub struct GexDataCoordinator {
     proxy_force_refresh: FxHashSet<OptionsUnderlying>,
     proxy_refreshed_at: FxHashMap<OptionsUnderlying, UnixMs>,
     proxy_stale: FxHashSet<OptionsUnderlying>,
+    derive_instruments: FxHashMap<OptionsUnderlying, Arc<[DeriveOptionInstrument]>>,
+    derive_trades: FxHashMap<OptionsUnderlying, Vec<DeriveMakerTrade>>,
+    derive_loaded: FxHashSet<OptionsUnderlying>,
+    derive_instruments_in_flight: FxHashSet<OptionsUnderlying>,
+    derive_trades_in_flight: FxHashSet<OptionsUnderlying>,
+    derive_instrument_failures: FxHashMap<OptionsUnderlying, FailureState>,
+    derive_trade_failures: FxHashMap<OptionsUnderlying, FailureState>,
+    derive_instruments_refreshed_at: FxHashMap<OptionsUnderlying, UnixMs>,
+    derive_trades_refreshed_at: FxHashMap<OptionsUnderlying, UnixMs>,
+    derive_watermarks: FxHashMap<OptionsUnderlying, UnixMs>,
+    derive_force_instruments: FxHashSet<OptionsUnderlying>,
+    derive_force_trades: FxHashSet<OptionsUnderlying>,
+    derive_stale: FxHashSet<OptionsUnderlying>,
     next_revision: u64,
     cache_path: PathBuf,
     persist_heatmap: bool,
@@ -221,6 +260,19 @@ impl GexDataCoordinator {
             proxy_force_refresh: FxHashSet::default(),
             proxy_refreshed_at: FxHashMap::default(),
             proxy_stale: FxHashSet::default(),
+            derive_instruments: FxHashMap::default(),
+            derive_trades: FxHashMap::default(),
+            derive_loaded: FxHashSet::default(),
+            derive_instruments_in_flight: FxHashSet::default(),
+            derive_trades_in_flight: FxHashSet::default(),
+            derive_instrument_failures: FxHashMap::default(),
+            derive_trade_failures: FxHashMap::default(),
+            derive_instruments_refreshed_at: FxHashMap::default(),
+            derive_trades_refreshed_at: FxHashMap::default(),
+            derive_watermarks: FxHashMap::default(),
+            derive_force_instruments: FxHashSet::default(),
+            derive_force_trades: FxHashSet::default(),
+            derive_stale: FxHashSet::default(),
             next_revision: 1,
             cache_path,
             persist_heatmap,
@@ -247,6 +299,9 @@ impl GexDataCoordinator {
             if count > 0 && self.subscribers.get(&key).copied().unwrap_or(0) == 0 {
                 self.force_refresh.insert(key);
                 self.proxy_force_refresh.insert(key.underlying);
+                self.ensure_derive_loaded(key.underlying);
+                self.derive_force_instruments.insert(key.underlying);
+                self.derive_force_trades.insert(key.underlying);
             }
         }
         self.subscribers = next;
@@ -266,6 +321,16 @@ impl GexDataCoordinator {
                 .filter_map(|(&key, &count)| (count > 0).then_some(key)),
         );
         self.proxy_force_refresh.extend(
+            self.subscribers
+                .iter()
+                .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying)),
+        );
+        self.derive_force_instruments.extend(
+            self.subscribers
+                .iter()
+                .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying)),
+        );
+        self.derive_force_trades.extend(
             self.subscribers
                 .iter()
                 .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying)),
@@ -444,6 +509,260 @@ impl GexDataCoordinator {
             .saturating_mul(1u64 << exponent)
             .min(FAILURE_BACKOFF_MAX_MS);
         self.proxy_failures.insert(
+            underlying,
+            FailureState {
+                attempts,
+                retry_after: now.saturating_add(delay),
+                last_error: error,
+            },
+        );
+    }
+
+    pub fn due_derive_instrument_fetches(
+        &mut self,
+        now: UnixMs,
+        online: bool,
+    ) -> Vec<OptionsUnderlying> {
+        if !online {
+            return Vec::new();
+        }
+        let underlyings = self.active_underlyings();
+        let mut due = Vec::new();
+        for underlying in underlyings {
+            self.ensure_derive_loaded(underlying);
+            let force = self.derive_force_instruments.contains(&underlying);
+            if !force
+                && self
+                    .derive_instrument_failures
+                    .get(&underlying)
+                    .is_some_and(|failure| now < failure.retry_after)
+            {
+                continue;
+            }
+            let expired = self
+                .derive_instruments_refreshed_at
+                .get(&underlying)
+                .is_none_or(|last| now.saturating_diff(*last) >= DERIVE_INSTRUMENT_REFRESH_MS);
+            if (force || expired) && self.derive_instruments_in_flight.insert(underlying) {
+                due.push(underlying);
+            }
+        }
+        due
+    }
+
+    pub fn due_derive_trade_fetches(
+        &mut self,
+        now: UnixMs,
+        online: bool,
+    ) -> Vec<DeriveTradeFetchRequest> {
+        if !online {
+            return Vec::new();
+        }
+        let underlyings = self.active_underlyings();
+        let mut due = Vec::new();
+        for underlying in underlyings {
+            self.ensure_derive_loaded(underlying);
+            if self
+                .derive_instruments
+                .get(&underlying)
+                .is_none_or(|values| values.is_empty())
+            {
+                continue;
+            }
+            let force = self.derive_force_trades.contains(&underlying);
+            if !force
+                && self
+                    .derive_trade_failures
+                    .get(&underlying)
+                    .is_some_and(|failure| now < failure.retry_after)
+            {
+                continue;
+            }
+            let expired = self
+                .derive_trades_refreshed_at
+                .get(&underlying)
+                .is_none_or(|last| now.saturating_diff(*last) >= DERIVE_TRADE_REFRESH_MS);
+            if (force || expired) && self.derive_trades_in_flight.insert(underlying) {
+                let from = self
+                    .derive_watermarks
+                    .get(&underlying)
+                    .copied()
+                    .map(|watermark| watermark.saturating_sub(DERIVE_FETCH_OVERLAP_MS))
+                    .unwrap_or_else(|| now.saturating_sub(DERIVE_INITIAL_BACKFILL_MS));
+                due.push(DeriveTradeFetchRequest {
+                    underlying,
+                    from,
+                    to: now,
+                });
+            }
+        }
+        due
+    }
+
+    pub fn derive_instruments_for(
+        &self,
+        underlying: OptionsUnderlying,
+    ) -> Arc<[DeriveOptionInstrument]> {
+        self.derive_instruments
+            .get(&underlying)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn complete_derive_instruments(
+        &mut self,
+        completion: DeriveInstrumentsFetchResult,
+        now: UnixMs,
+    ) {
+        let underlying = completion.underlying;
+        self.derive_instruments_in_flight.remove(&underlying);
+        self.derive_force_instruments.remove(&underlying);
+        match completion.result {
+            Ok(values) if !values.is_empty() => {
+                self.derive_instruments.insert(underlying, values.into());
+                self.derive_instruments_refreshed_at.insert(underlying, now);
+                self.derive_instrument_failures.remove(&underlying);
+                self.derive_force_trades.insert(underlying);
+            }
+            Ok(_) => self.record_derive_failure(
+                underlying,
+                "empty Derive instrument metadata".into(),
+                now,
+                true,
+            ),
+            Err(error) => self.record_derive_failure(underlying, error, now, true),
+        }
+    }
+
+    pub fn complete_derive_trades(&mut self, completion: DeriveTradesFetchResult, now: UnixMs) {
+        let underlying = completion.underlying;
+        self.derive_trades_in_flight.remove(&underlying);
+        self.derive_force_trades.remove(&underlying);
+        match completion.result {
+            Ok(values) => {
+                let mut by_id = self
+                    .derive_trades
+                    .remove(&underlying)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|trade| (trade.trade_id.clone(), trade))
+                    .collect::<FxHashMap<_, _>>();
+                for trade in values {
+                    by_id.insert(trade.trade_id.clone(), trade);
+                }
+                let cutoff = now.saturating_sub(DERIVE_RETENTION_MS);
+                let mut trades = by_id
+                    .into_values()
+                    .filter(|trade| trade.timestamp >= cutoff && trade.timestamp <= now)
+                    .collect::<Vec<_>>();
+                trades.sort_by_key(|trade| trade.timestamp);
+                if trades.len() > 50_000 {
+                    trades.drain(..trades.len() - 50_000);
+                }
+                if let Some(latest) = trades.last().map(|trade| trade.timestamp) {
+                    self.derive_watermarks.insert(underlying, latest);
+                }
+                self.derive_trades.insert(underlying, trades);
+                self.derive_trades_refreshed_at.insert(underlying, now);
+                self.derive_trade_failures.remove(&underlying);
+                self.derive_stale.remove(&underlying);
+                if self.persist_heatmap
+                    && let Some(cache) = crate::connector::persistent_cache::market_cache()
+                    && let Some(trades) = self.derive_trades.get(&underlying)
+                {
+                    cache.store_derive_maker_trades(&derive_cache_key(underlying), trades, now);
+                }
+            }
+            Err(error) => self.record_derive_failure(underlying, error, now, false),
+        }
+    }
+
+    pub fn derive_flow(
+        &self,
+        underlying: OptionsUnderlying,
+        config: &Config,
+        now: UnixMs,
+    ) -> Option<Arc<DeriveMakerGammaFlow>> {
+        let raw = self
+            .raw_snapshots
+            .get(&OptionsChainKey::deribit(underlying))?;
+        let trades = self.derive_trades.get(&underlying)?;
+        Some(Arc::new(calculate_derive_maker_gamma_flow(
+            &raw.value, trades, config, now,
+        )))
+    }
+
+    pub fn derive_freshness(&self, underlying: OptionsUnderlying, now: UnixMs) -> GexFreshness {
+        if self.derive_trade_failures.contains_key(&underlying)
+            || self.derive_instrument_failures.contains_key(&underlying)
+        {
+            GexFreshness::Error
+        } else if self.derive_stale.contains(&underlying) {
+            GexFreshness::Stale
+        } else if self.derive_trades_in_flight.contains(&underlying)
+            && self
+                .derive_trades
+                .get(&underlying)
+                .is_none_or(Vec::is_empty)
+        {
+            GexFreshness::Loading
+        } else if self
+            .derive_trades_refreshed_at
+            .get(&underlying)
+            .is_some_and(|last| now.saturating_diff(*last) < DERIVE_TRADE_REFRESH_MS * 2)
+        {
+            GexFreshness::Fresh
+        } else if self.derive_trades.contains_key(&underlying) {
+            GexFreshness::Stale
+        } else {
+            GexFreshness::Loading
+        }
+    }
+
+    fn active_underlyings(&self) -> FxHashSet<OptionsUnderlying> {
+        self.subscribers
+            .iter()
+            .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying))
+            .collect()
+    }
+
+    fn ensure_derive_loaded(&mut self, underlying: OptionsUnderlying) {
+        if !self.persist_heatmap || !self.derive_loaded.insert(underlying) {
+            return;
+        }
+        let Some(cache) = crate::connector::persistent_cache::market_cache() else {
+            return;
+        };
+        let trades = cache.read_derive_maker_trades(&derive_cache_key(underlying));
+        if trades.is_empty() {
+            return;
+        }
+        if let Some(latest) = trades.last().map(|trade| trade.timestamp) {
+            self.derive_watermarks.insert(underlying, latest);
+        }
+        self.derive_trades.insert(underlying, trades);
+        self.derive_stale.insert(underlying);
+    }
+
+    fn record_derive_failure(
+        &mut self,
+        underlying: OptionsUnderlying,
+        error: Arc<str>,
+        now: UnixMs,
+        instruments: bool,
+    ) {
+        let failures = if instruments {
+            &mut self.derive_instrument_failures
+        } else {
+            &mut self.derive_trade_failures
+        };
+        let attempts = failures
+            .get(&underlying)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let delay = FAILURE_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << attempts.saturating_sub(1).min(10))
+            .min(FAILURE_BACKOFF_MAX_MS);
+        failures.insert(
             underlying,
             FailureState {
                 attempts,
@@ -844,6 +1163,10 @@ fn proxy_cache_key(underlying: OptionsUnderlying) -> String {
     format!("source=gexmonitor|underlying={}", underlying.as_str())
 }
 
+fn derive_cache_key(underlying: OptionsUnderlying) -> String {
+    format!("source=derive|underlying={}", underlying.as_str())
+}
+
 fn normalize_proxy_points(points: &mut Vec<GexProxyHistoryPoint>, now: UnixMs) {
     const RETENTION_WITH_MARGIN_MS: i64 = 24 * 60 * 60 * 1_000 + 10 * 60 * 1_000;
     const MAX_PROXY_RECORDS: usize = 320;
@@ -921,6 +1244,33 @@ pub async fn execute_proxy_fetch(
         .await
         .map_err(|error| Arc::from(error.to_string()));
     (underlying, result)
+}
+
+pub async fn execute_derive_instruments_fetch(
+    client: DeriveOptionsClient,
+    underlying: OptionsUnderlying,
+) -> DeriveInstrumentsFetchResult {
+    DeriveInstrumentsFetchResult {
+        underlying,
+        result: client
+            .fetch_instruments(underlying)
+            .await
+            .map_err(|error| Arc::from(error.to_string())),
+    }
+}
+
+pub async fn execute_derive_trades_fetch(
+    client: DeriveOptionsClient,
+    request: DeriveTradeFetchRequest,
+    instruments: Arc<[DeriveOptionInstrument]>,
+) -> DeriveTradesFetchResult {
+    DeriveTradesFetchResult {
+        underlying: request.underlying,
+        result: client
+            .fetch_trade_history(request.underlying, request.from, request.to, &instruments)
+            .await
+            .map_err(|error| Arc::from(error.to_string())),
+    }
 }
 
 fn error_text(error: DeribitError) -> Arc<str> {
@@ -1385,5 +1735,104 @@ mod tests {
             value.append_history(key, revision + 1, Arc::new(snapshot), now);
         }
         assert_eq!(value.derived_history[&key].len(), 5_760);
+    }
+
+    #[test]
+    fn derive_scheduling_is_offline_safe_overlapping_and_reconnect_forced() {
+        let now = UnixMs::new(1_800_000_000_000);
+        let mut value = coordinator();
+        value.set_consumers([OptionsUnderlying::Btc]);
+        assert!(value.due_derive_instrument_fetches(now, false).is_empty());
+        assert!(value.due_derive_trade_fetches(now, false).is_empty());
+        assert_eq!(
+            value.due_derive_instrument_fetches(now, true),
+            [OptionsUnderlying::Btc]
+        );
+        let contract = instrument();
+        value.complete_derive_instruments(
+            DeriveInstrumentsFetchResult {
+                underlying: OptionsUnderlying::Btc,
+                result: Ok(vec![DeriveOptionInstrument {
+                    instrument_name: contract.instrument_name,
+                    key: exchange::options::OptionContractMatchKey::new(
+                        contract.underlying,
+                        contract.expiration_timestamp,
+                        contract.strike,
+                        contract.right,
+                    )
+                    .expect("key"),
+                    expiration_timestamp: contract.expiration_timestamp,
+                }]),
+            },
+            now,
+        );
+        let request = value
+            .due_derive_trade_fetches(now, true)
+            .into_iter()
+            .next()
+            .expect("initial backfill");
+        assert_eq!(request.from, now.saturating_sub(DERIVE_INITIAL_BACKFILL_MS));
+        value.complete_derive_trades(
+            DeriveTradesFetchResult {
+                underlying: OptionsUnderlying::Btc,
+                result: Ok(Vec::new()),
+            },
+            now,
+        );
+        assert!(
+            value
+                .due_derive_trade_fetches(now.saturating_add(DERIVE_TRADE_REFRESH_MS - 1), true)
+                .is_empty()
+        );
+        value.reconnect();
+        assert_eq!(
+            value
+                .due_derive_instrument_fetches(now.saturating_add(1), true)
+                .len(),
+            1
+        );
+        assert_eq!(
+            value
+                .due_derive_trade_fetches(now.saturating_add(1), true)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn derive_backoff_and_errors_are_independent_from_deribit() {
+        let now = UnixMs::new(1_800_000_000_000);
+        let key = OptionsChainKey::deribit(OptionsUnderlying::Btc);
+        let mut value = coordinator();
+        value.set_consumers([OptionsUnderlying::Btc]);
+        value.complete(
+            GexFetchResult::Snapshot {
+                key,
+                result: Ok(snapshot(now)),
+            },
+            now,
+        );
+        let _ = value.due_derive_instrument_fetches(now, true);
+        value.complete_derive_instruments(
+            DeriveInstrumentsFetchResult {
+                underlying: OptionsUnderlying::Btc,
+                result: Err("derive unavailable".into()),
+            },
+            now,
+        );
+        assert!(
+            value
+                .due_derive_instrument_fetches(now.saturating_add(1), true)
+                .is_empty()
+        );
+        assert_eq!(
+            value.freshness(OptionsUnderlying::Btc, now),
+            GexFreshness::Fresh
+        );
+        assert!(value.last_error(OptionsUnderlying::Btc).is_none());
+        assert_eq!(
+            value.derive_freshness(OptionsUnderlying::Btc, now),
+            GexFreshness::Error
+        );
     }
 }

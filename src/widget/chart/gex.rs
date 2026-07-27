@@ -724,6 +724,29 @@ fn header_view<'a>(
     if cfg.show_header_freshness {
         push("●", status.into());
     }
+    if let Some(flow) = chart.derive_flow() {
+        let window = &flow.thirty_minutes;
+        push(
+            "Derive Maker Flow 30m",
+            format!("{} · {:+.0}%", window.direction, window.imbalance * 100.0),
+        );
+        push(
+            "Derive",
+            format!(
+                "{} trades · {:.0}% matched · Quality: {}",
+                window.trade_count,
+                window.matched_deribit_gex_share * 100.0,
+                window.quality
+            ),
+        );
+        push(
+            "OI proxy agreement",
+            data::chart::gex::oi_proxy_agreement(snapshot, Some(flow)).to_string(),
+        );
+    } else {
+        push("Derive Maker Flow 30m", "Unavailable".into());
+        push("OI proxy agreement", "Insufficient".into());
+    }
     if cfg.show_header_snapshot || abnormal {
         push(
             "At",
