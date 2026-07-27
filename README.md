@@ -41,7 +41,7 @@ See [Derive Maker Flow and GEX architecture](./docs/derive-maker-flow.md) for ma
 
 <div align="center">
   <img
-    src="https://github.com/user-attachments/assets/baddc444-e079-48e5-82b2-4f97094eba07"
+    src="https://github.com/user-attachments/assets/8ebf2bc1-1a4b-48cc-a108-348a6ef58825"
     alt="Flowsurface screenshot"
     style="max-width: 100%; height: auto;"
   />
