@@ -2,7 +2,7 @@ use exchange::{
     TickerInfo, UnixMs,
     options::{
         OptionRight, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
-        RawOptionContractSnapshot,
+        RawOptionContractSnapshot, gex_monitor::GexProxyHistoryPoint,
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -582,6 +582,61 @@ pub struct GexZoneFrame {
     pub bucket_start: UnixMs,
     pub source_spot: f64,
     pub zones: Arc<[GexZone]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GexProxyZoneRole {
+    PositivePrimary,
+    PositiveSecondary,
+    NegativePrimary,
+    NegativeSecondary,
+}
+
+impl GexProxyZoneRole {
+    pub const ALL: [Self; 4] = [
+        Self::PositivePrimary,
+        Self::PositiveSecondary,
+        Self::NegativePrimary,
+        Self::NegativeSecondary,
+    ];
+
+    pub const fn weight(self) -> f32 {
+        match self {
+            Self::PositivePrimary | Self::NegativePrimary => 1.0,
+            Self::PositiveSecondary | Self::NegativeSecondary => 0.62,
+        }
+    }
+
+    fn level(self, point: &GexProxyHistoryPoint) -> Option<f64> {
+        match self {
+            Self::PositivePrimary => point.positive_level_1,
+            Self::PositiveSecondary => point.positive_level_2,
+            Self::NegativePrimary => point.negative_level_1,
+            Self::NegativeSecondary => point.negative_level_2,
+        }
+        .filter(|level| level.is_finite() && *level > 0.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GexProxyZone {
+    pub role: GexProxyZoneRole,
+    pub center_price: f64,
+    pub lower_price: f64,
+    pub upper_price: f64,
+    pub strength: f32,
+    pub wall_confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GexProxyZoneFrame {
+    pub bucket_start: UnixMs,
+    pub bucket_end: UnixMs,
+    pub observed_at: UnixMs,
+    pub source_spot: f64,
+    pub total_gex: f64,
+    pub flip_level: Option<f64>,
+    pub zones: Arc<[GexProxyZone]>,
 }
 
 impl GexZone {
@@ -1782,6 +1837,147 @@ pub fn gex_bucket_start(timestamp: UnixMs, bucket_ms: u64) -> UnixMs {
     UnixMs::new(timestamp.as_u64() / bucket_ms * bucket_ms)
 }
 
+fn gex_proxy_zones_for_point(point: &GexProxyHistoryPoint, p95: f64) -> Arc<[GexProxyZone]> {
+    if !point.source_spot.is_finite() || point.source_spot <= 0.0 {
+        return Arc::from([]);
+    }
+    let levels = GexProxyZoneRole::ALL
+        .into_iter()
+        .filter_map(|role| role.level(point).map(|level| (role, level)))
+        .collect::<Vec<_>>();
+    let normalized = if p95.is_finite() && p95 > f64::EPSILON {
+        ((point.total_gex.abs() / p95).asinh() / 1.0_f64.asinh()).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    levels
+        .iter()
+        .enumerate()
+        .map(|(index, (role, level))| {
+            let nearest = levels
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, (_, candidate))| {
+                    (candidate_index != index).then_some((candidate - level).abs())
+                })
+                .min_by(f64::total_cmp);
+            let half_width = nearest.map_or(point.source_spot * 0.001, |distance| {
+                (distance * 0.12).clamp(point.source_spot * 0.0005, point.source_spot * 0.0025)
+            });
+            let wall_confirmed = match role {
+                GexProxyZoneRole::PositivePrimary => point
+                    .call_wall
+                    .is_some_and(|wall| wall.is_finite() && (wall - level).abs() <= half_width),
+                GexProxyZoneRole::NegativePrimary => point
+                    .put_wall
+                    .is_some_and(|wall| wall.is_finite() && (wall - level).abs() <= half_width),
+                GexProxyZoneRole::PositiveSecondary | GexProxyZoneRole::NegativeSecondary => false,
+            };
+            let strength = (normalized * role.weight() + if wall_confirmed { 0.12 } else { 0.0 })
+                .clamp(0.0, 1.0);
+            GexProxyZone {
+                role: *role,
+                center_price: *level,
+                lower_price: level - half_width,
+                upper_price: level + half_width,
+                strength,
+                wall_confirmed,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub fn build_gex_proxy_zone_frames(
+    history: &[Arc<GexProxyHistoryPoint>],
+    deribit_history: &[Arc<GexSnapshot>],
+    chart_interval_ms: u64,
+    latest_candle_time: UnixMs,
+) -> Vec<GexProxyZoneFrame> {
+    const SOURCE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+    let chart_interval_ms = chart_interval_ms.max(1);
+    let chart_end = latest_candle_time.saturating_add(chart_interval_ms);
+    let covered_buckets = deribit_history
+        .iter()
+        .map(|snapshot| gex_bucket_start(snapshot.observed_at, chart_interval_ms))
+        .collect::<FxHashSet<_>>();
+    let p95 = gex_percentile_95(history.iter().map(|point| point.total_gex)).unwrap_or(0.0);
+    let mut points = history
+        .iter()
+        .filter_map(|point| {
+            let observed_at = u64::try_from(point.observed_at).ok()?;
+            (observed_at < chart_end.as_u64()).then_some((UnixMs::new(observed_at), point.clone()))
+        })
+        .collect::<Vec<_>>();
+    points.sort_by_key(|(observed_at, _)| *observed_at);
+    points.dedup_by_key(|(observed_at, _)| *observed_at);
+
+    if chart_interval_ms >= SOURCE_INTERVAL_MS {
+        let mut grouped = BTreeMap::<UnixMs, Arc<GexProxyHistoryPoint>>::new();
+        for (observed_at, point) in points {
+            grouped.insert(gex_bucket_start(observed_at, chart_interval_ms), point);
+        }
+        return grouped
+            .into_iter()
+            .filter(|(bucket_start, _)| !covered_buckets.contains(bucket_start))
+            .filter_map(|(bucket_start, point)| {
+                let bucket_end = bucket_start
+                    .saturating_add(chart_interval_ms)
+                    .min(chart_end);
+                let zones = gex_proxy_zones_for_point(&point, p95);
+                let flip_level = point
+                    .flip_level
+                    .filter(|level| level.is_finite() && *level > 0.0);
+                (bucket_end > bucket_start && (!zones.is_empty() || flip_level.is_some())).then(
+                    || GexProxyZoneFrame {
+                        bucket_start,
+                        bucket_end,
+                        observed_at: UnixMs::new(point.observed_at as u64),
+                        source_spot: point.source_spot,
+                        total_gex: point.total_gex,
+                        flip_level,
+                        zones,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    let mut frames = Vec::new();
+    for (index, (observed_at, point)) in points.iter().enumerate() {
+        let source_end = observed_at
+            .saturating_add(SOURCE_INTERVAL_MS)
+            .min(points.get(index + 1).map_or(chart_end, |(next, _)| *next))
+            .min(chart_end);
+        let zones = gex_proxy_zones_for_point(point, p95);
+        let flip_level = point
+            .flip_level
+            .filter(|level| level.is_finite() && *level > 0.0);
+        if zones.is_empty() && flip_level.is_none() {
+            continue;
+        }
+        let mut bucket = gex_bucket_start(*observed_at, chart_interval_ms);
+        while bucket < source_end {
+            let bucket_end = bucket.saturating_add(chart_interval_ms);
+            let frame_start = (*observed_at).max(bucket);
+            let frame_end = source_end.min(bucket_end);
+            if frame_end > frame_start && !covered_buckets.contains(&bucket) {
+                frames.push(GexProxyZoneFrame {
+                    bucket_start: frame_start,
+                    bucket_end: frame_end,
+                    observed_at: *observed_at,
+                    source_spot: point.source_spot,
+                    total_gex: point.total_gex,
+                    flip_level,
+                    zones: zones.clone(),
+                });
+            }
+            bucket = bucket_end;
+        }
+    }
+    frames
+}
+
 pub fn dominant_expiry(values: &[GexExpiryStrike], strike: f64) -> Option<(UnixMs, f64)> {
     let matching = values
         .iter()
@@ -2292,6 +2488,166 @@ mod tests {
             scenario_curve: Arc::from([]),
             scale_p95: 1.0,
         })
+    }
+
+    fn proxy_point(
+        observed_at: i64,
+        total_gex: f64,
+        levels: [Option<f64>; 4],
+    ) -> Arc<GexProxyHistoryPoint> {
+        Arc::new(GexProxyHistoryPoint {
+            observed_at,
+            source_spot: 100_000.0,
+            total_gex,
+            flip_level: Some(100_000.0),
+            call_wall: Some(101_000.0),
+            put_wall: Some(99_000.0),
+            positive_level_1: levels[0],
+            positive_level_2: levels[1],
+            negative_level_1: levels[2],
+            negative_level_2: levels[3],
+        })
+    }
+
+    #[test]
+    fn proxy_levels_map_to_four_synthetic_roles_without_invented_density() {
+        let point = proxy_point(
+            0,
+            10.0,
+            [
+                Some(101_000.0),
+                Some(102_000.0),
+                Some(99_000.0),
+                Some(98_000.0),
+            ],
+        );
+        let frames = build_gex_proxy_zone_frames(&[point], &[], 5 * 60_000, UnixMs::new(0));
+        let zones = &frames[0].zones;
+        assert_eq!(zones.len(), 4);
+        assert_eq!(
+            zones.iter().map(|zone| zone.role).collect::<Vec<_>>(),
+            GexProxyZoneRole::ALL
+        );
+        assert!(zones.iter().all(
+            |zone| zone.lower_price < zone.center_price && zone.center_price < zone.upper_price
+        ));
+    }
+
+    #[test]
+    fn proxy_half_width_uses_nearest_level_and_strict_minimum_maximum() {
+        let nearest = proxy_point(0, 1.0, [Some(100_000.0), Some(101_000.0), None, None]);
+        let nearest_zones = gex_proxy_zones_for_point(&nearest, 1.0);
+        assert!(
+            (nearest_zones[0].upper_price - nearest_zones[0].center_price - 120.0).abs() < 1e-9
+        );
+
+        let minimum = proxy_point(0, 1.0, [Some(100_000.0), Some(100_100.0), None, None]);
+        let minimum_zones = gex_proxy_zones_for_point(&minimum, 1.0);
+        assert!((minimum_zones[0].upper_price - minimum_zones[0].center_price - 50.0).abs() < 1e-9);
+
+        let maximum = proxy_point(0, 1.0, [Some(90_000.0), Some(110_000.0), None, None]);
+        let maximum_zones = gex_proxy_zones_for_point(&maximum, 1.0);
+        assert!(
+            (maximum_zones[0].upper_price - maximum_zones[0].center_price - 250.0).abs() < 1e-9
+        );
+
+        let single = proxy_point(0, 1.0, [Some(100_000.0), None, None, None]);
+        let single_zone = gex_proxy_zones_for_point(&single, 1.0);
+        assert!((single_zone[0].upper_price - single_zone[0].center_price - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn proxy_wall_confirmation_and_p95_asinh_strength_are_bounded() {
+        let history = (1..=19)
+            .map(|value| {
+                proxy_point(
+                    i64::from(value) * 5 * 60_000,
+                    f64::from(value),
+                    [Some(101_000.0), Some(102_000.0), Some(99_000.0), None],
+                )
+            })
+            .chain([proxy_point(
+                20 * 5 * 60_000,
+                1_000_000.0,
+                [Some(101_000.0), Some(102_000.0), Some(99_000.0), None],
+            )])
+            .collect::<Vec<_>>();
+        let p95 = gex_percentile_95(history.iter().map(|point| point.total_gex)).unwrap();
+        assert_eq!(p95, 19.0);
+        let zones = gex_proxy_zones_for_point(&history[18], p95);
+        let positive = zones
+            .iter()
+            .find(|zone| zone.role == GexProxyZoneRole::PositivePrimary)
+            .unwrap();
+        let secondary = zones
+            .iter()
+            .find(|zone| zone.role == GexProxyZoneRole::PositiveSecondary)
+            .unwrap();
+        assert!(positive.wall_confirmed);
+        assert_eq!(positive.strength, 1.0);
+        assert!((secondary.strength - 0.62).abs() < 1e-6);
+        assert!(
+            zones
+                .iter()
+                .all(|zone| (0.0..=1.0).contains(&zone.strength))
+        );
+    }
+
+    #[test]
+    fn proxy_timeframes_cover_source_interval_and_full_large_bucket() {
+        let point = proxy_point(0, 1.0, [Some(101_000.0), None, None, None]);
+        let one_minute = build_gex_proxy_zone_frames(
+            std::slice::from_ref(&point),
+            &[],
+            60_000,
+            UnixMs::new(4 * 60_000),
+        );
+        assert_eq!(one_minute.len(), 5);
+        assert_eq!(one_minute.first().unwrap().bucket_start, UnixMs::new(0));
+        assert_eq!(
+            one_minute.last().unwrap().bucket_end,
+            UnixMs::new(5 * 60_000)
+        );
+        assert!(
+            one_minute
+                .windows(2)
+                .all(|pair| pair[0].bucket_end == pair[1].bucket_start)
+        );
+
+        let point = proxy_point(7 * 60_000, 1.0, [Some(101_000.0), None, None, None]);
+        let fifteen =
+            build_gex_proxy_zone_frames(&[point], &[], 15 * 60_000, UnixMs::new(15 * 60_000));
+        assert_eq!(fifteen.len(), 1);
+        assert_eq!(fifteen[0].bucket_start, UnixMs::new(0));
+        assert_eq!(fifteen[0].bucket_end, UnixMs::new(15 * 60_000));
+    }
+
+    #[test]
+    fn proxy_bucket_precedence_excludes_only_actual_deribit_coverage() {
+        let history = vec![
+            proxy_point(0, 1.0, [Some(101_000.0), None, None, None]),
+            proxy_point(5 * 60_000, 1.0, [Some(101_000.0), None, None, None]),
+            proxy_point(10 * 60_000, 1.0, [Some(101_000.0), None, None, None]),
+        ];
+        let deribit = vec![zone_snapshot(5 * 60_000 + 1, &[])];
+        let frames =
+            build_gex_proxy_zone_frames(&history, &deribit, 5 * 60_000, UnixMs::new(10 * 60_000));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.bucket_start.as_u64())
+                .collect::<Vec<_>>(),
+            vec![0, 10 * 60_000]
+        );
+        let covered = deribit
+            .iter()
+            .map(|snapshot| gex_bucket_start(snapshot.observed_at, 5 * 60_000))
+            .collect::<FxHashSet<_>>();
+        assert!(
+            frames
+                .iter()
+                .all(|frame| !covered.contains(&frame.bucket_start))
+        );
     }
 
     #[test]
