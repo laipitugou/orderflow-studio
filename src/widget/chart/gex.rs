@@ -1,7 +1,7 @@
 use crate::{chart::gex, style};
 use data::chart::gex::{
     GammaLiquidityRegime, GammaVegaRegime, GexFreshness, GexSignModel, GexStrike,
-    IntrinsicStressLevel,
+    IntrinsicStressLevel, OiProxyAgreement,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
@@ -396,7 +396,73 @@ fn analytics_view<'a>(
     if cfg.show_gamma_liquidity_panel {
         sections.push(liquidity_card(chart, &expiry, density));
     }
+    sections.push(agreement_card(chart, snapshot, &expiry, density));
     cards_layout(sections, width)
+}
+
+fn agreement_card<'a>(
+    chart: &gex::GexChart,
+    snapshot: &data::chart::gex::GexSnapshot,
+    expiry: &str,
+    density: GexLayoutDensity,
+) -> Element<'a, gex::Message> {
+    let flow = chart.derive_flow();
+    let agreement = data::chart::gex::oi_proxy_agreement(snapshot, flow);
+    let window = flow.map(|flow| &flow.oi_proxy_comparison_30m);
+    let deribit_bias = snapshot
+        .net_gex_1pct
+        .filter(|_| snapshot.absolute_gex_1pct > 0.0)
+        .map(|net| (net / snapshot.absolute_gex_1pct).clamp(-1.0, 1.0));
+    let alignment = match (agreement, deribit_bias, window) {
+        (OiProxyAgreement::Agree | OiProxyAgreement::Diverge, Some(deribit), Some(derive)) => {
+            Some((deribit * derive.imbalance).clamp(-1.0, 1.0))
+        }
+        _ => None,
+    };
+    let semantic = match agreement {
+        OiProxyAgreement::Agree => Semantic::Success,
+        OiProxyAgreement::Diverge => Semantic::Danger,
+        OiProxyAgreement::Insufficient => Semantic::Secondary,
+    };
+    let primary = match (deribit_bias, window) {
+        (Some(deribit), Some(derive)) => format!(
+            "OI {:+.0}% · Flow {:+.0}%",
+            deribit * 100.0,
+            derive.imbalance * 100.0
+        ),
+        _ => "Waiting for aligned flow".into(),
+    };
+    let secondary = window.map_or_else(
+        || format!("{expiry} · no Derive comparison data"),
+        |window| {
+            format!(
+                "{} trades · {:.0}% matched · {} · {expiry}",
+                window.trade_count,
+                window.matched_deribit_gex_share * 100.0,
+                window.quality
+            )
+        },
+    );
+    analytics_section(
+        "OI proxy agreement · 30m",
+        GaugeVisual {
+            asset: include_bytes!("../../../assets/gex/oi-proxy-agreement-gauge.svg"),
+            normalized: alignment.map(|score| ((score + 1.0) * 0.5) as f32),
+            muted: alignment.is_none(),
+        },
+        agreement.to_string(),
+        semantic,
+        primary,
+        secondary,
+        format!(
+            "Compares Deribit OI Proxy direction with observed settled Derive maker flow over 30 minutes.\n\
+             Both sides use the same expiry and contract filters: {expiry}. The main Derive Maker Flow remains independent and includes all non-expired exact matches.\n\
+             Gauge score = Deribit Net/Absolute GEX × Derive signed/gross flow; negative means divergence, positive means agreement.\n\
+             Agree/Diverge requires Medium or High Derive quality and a non-balanced Deribit proxy. This is directional confirmation, not validation of true dealer GEX."
+        ),
+        None,
+        density,
+    )
 }
 
 fn liquidity_card<'a>(
@@ -739,13 +805,8 @@ fn header_view<'a>(
                 window.quality
             ),
         );
-        push(
-            "OI proxy agreement",
-            data::chart::gex::oi_proxy_agreement(snapshot, Some(flow)).to_string(),
-        );
     } else {
         push("Derive Maker Flow 30m", "Unavailable".into());
-        push("OI proxy agreement", "Insufficient".into());
     }
     if cfg.show_header_snapshot || abnormal {
         push(

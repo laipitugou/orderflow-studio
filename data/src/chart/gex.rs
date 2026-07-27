@@ -544,11 +544,12 @@ pub struct GexSnapshot {
     pub scale_p95: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ObservedGammaDirection {
     LongGamma,
     ShortGamma,
     Balanced,
+    #[default]
     Unavailable,
 }
 
@@ -563,8 +564,9 @@ impl std::fmt::Display for ObservedGammaDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FlowQuality {
+    #[default]
     Low,
     Medium,
     High,
@@ -590,7 +592,7 @@ impl std::fmt::Display for OiProxyAgreement {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct MakerGammaFlowWindow {
     pub lookback_minutes: u16,
     pub signed_gamma_flow_1pct: f64,
@@ -608,6 +610,8 @@ pub struct DeriveMakerGammaFlow {
     pub five_minutes: MakerGammaFlowWindow,
     pub thirty_minutes: MakerGammaFlowWindow,
     pub two_hours: MakerGammaFlowWindow,
+    #[serde(default)]
+    pub oi_proxy_comparison_30m: MakerGammaFlowWindow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,7 +628,7 @@ pub fn oi_proxy_agreement(
     let Some(flow) = flow else {
         return OiProxyAgreement::Insufficient;
     };
-    let window = &flow.thirty_minutes;
+    let window = &flow.oi_proxy_comparison_30m;
     if window.quality == FlowQuality::Low
         || snapshot.absolute_gex_1pct <= 0.0
         || !snapshot.absolute_gex_1pct.is_finite()
@@ -1457,11 +1461,54 @@ pub fn calculate_derive_maker_gamma_flow(
             observed_at,
         )
     };
+    let comparison_selected = select_contracts(
+        chain,
+        config.expiry_filter,
+        config.min_open_interest,
+        observed_at,
+    );
+    let mut comparison_contracts: FxHashMap<
+        OptionContractMatchKey,
+        Vec<&RawOptionContractSnapshot>,
+    > = FxHashMap::default();
+    let mut comparison_absolute_gex = 0.0;
+    for contract in comparison_selected {
+        let Some(key) = OptionContractMatchKey::new(
+            chain.underlying,
+            contract.instrument.expiration_timestamp,
+            contract.instrument.strike,
+            contract.instrument.right,
+        ) else {
+            continue;
+        };
+        let Some((gex, _)) = current_contract_gex(
+            contract,
+            chain.source_spot,
+            observed_at,
+            config.gamma_source,
+        ) else {
+            continue;
+        };
+        if gex < config.min_absolute_gex {
+            continue;
+        }
+        comparison_absolute_gex += gex;
+        comparison_contracts.entry(key).or_default().push(contract);
+    }
     DeriveMakerGammaFlow {
         observed_at,
         five_minutes: calculate(5),
         thirty_minutes: calculate(30),
         two_hours: calculate(120),
+        oi_proxy_comparison_30m: calculate_flow_window(
+            30,
+            trades,
+            &comparison_contracts,
+            chain.source_spot,
+            comparison_absolute_gex,
+            config.gamma_source,
+            observed_at,
+        ),
     }
 }
 
@@ -3488,6 +3535,16 @@ mod tests {
             flow.five_minutes.direction,
             ObservedGammaDirection::LongGamma
         );
+        assert_eq!(flow.oi_proxy_comparison_30m.trade_count, 0);
+        assert_eq!(
+            flow.oi_proxy_comparison_30m.direction,
+            ObservedGammaDirection::Unavailable
+        );
+        let snapshot = calculate_gex_at(&source, &restrictive, NOW);
+        assert_eq!(
+            oi_proxy_agreement(&snapshot, Some(&flow)),
+            OiProxyAgreement::Insufficient
+        );
     }
 
     #[test]
@@ -3529,12 +3586,12 @@ mod tests {
         );
 
         let mut opposite = flow.clone();
-        opposite.thirty_minutes.direction = ObservedGammaDirection::ShortGamma;
+        opposite.oi_proxy_comparison_30m.direction = ObservedGammaDirection::ShortGamma;
         assert_eq!(
             oi_proxy_agreement(&before, Some(&opposite)),
             OiProxyAgreement::Diverge
         );
-        opposite.thirty_minutes.quality = FlowQuality::Low;
+        opposite.oi_proxy_comparison_30m.quality = FlowQuality::Low;
         assert_eq!(
             oi_proxy_agreement(&before, Some(&opposite)),
             OiProxyAgreement::Insufficient
