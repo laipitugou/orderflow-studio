@@ -20,9 +20,10 @@ The `develop` branch currently adds the following features and behavior on top o
 -   **[Binance iceberg detector](./docs/binance-iceberg-detector.md):** optional markers for possible passive iceberg/replenishment activity on Binance USDⓈ-M perpetuals, using sequence-validated L2 depth, raw trades, adaptive baselines, deterministic scoring, and gap/reconnect invalidation.
 -   **Session volume profile:** volume or delta profiles with configurable session interval, side, width, value area, row size, POC, VAH/VAL, session VWAP, and session high/low.
 -   **Cumulative volume delta:** optional candlestick rendering in addition to the line view, with daily or continuous reset behavior.
--   **GEX options chart:** BTC and ETH gamma-exposure profiles sourced from Deribit, with call/put walls, gamma flip, intrinsic-pressure, gamma-versus-vega, and liquidity-impact analytics.
+-   **GEX options chart:** BTC and ETH gamma-exposure profiles sourced from Deribit, with call/put walls, gamma flip, intrinsic-pressure, gamma-versus-vega, liquidity-impact analytics, strike-weighted historical zones, and rolling expiry filters from the next expiry through all expiries.
+-   **Derive observed maker flow:** settled maker option trades from Derive are matched exactly to Deribit contracts and shown as an independent directional confirmation, with 5-minute, 30-minute, and 2-hour gamma-flow windows, coverage quality, and an expiry-aligned OI-proxy agreement gauge.
 -   **Persistent market-data cache:** local `redb` storage for klines, open interest, trades, and derived bubble summaries, including gap detection, deduplication, invalidation, and shared data requirements across panes.
--   **Connection recovery:** automatic historical gap backfill after WebSocket disconnects, deferred recovery until the real offline range is known, reconnect-backoff reset, request generations, stale/orphaned request cancellation, timeouts, bounded retries, no-progress protection, and raw-trade/history limits.
+-   **Connection recovery:** automatic historical gap backfill after WebSocket disconnects, deferred recovery until the real offline range is known, reconnect-backoff reset, request generations, stale/orphaned request cancellation, timeouts, bounded retries, no-progress protection, raw-trade/history limits, and upstream rejection of Binance non-execution trade markers before chart and order-flow consumers.
 -   **Fetch visibility and feedback:** loading indicators, data-coverage state, richer fetch/stream/window diagnostics, and a filterable in-app debug terminal with multiple log levels.
 -   **Saved-state resilience:** schema migration, sanitization, atomic writes, rolling backups, recovery from corrupt or incompatible state, preservation of overlay indicators, and correction of off-screen window positions.
 -   **Windows stability:** a single-native-window mode that disables unsupported pop-outs to avoid the winit multi-window redraw freeze; macOS and Linux keep native multi-window behavior.
@@ -35,6 +36,8 @@ Removed or replaced relative to `upstream/main`:
 -   The separate `lint.yml` and `format.yml` workflows were replaced by the combined `develop-ci.yml` quality gate.
 
 See the complete source comparison: [`upstream/main...origin/develop`](https://github.com/flowsurface-rs/flowsurface/compare/main...Niketion:develop).
+
+See [Derive Maker Flow and GEX architecture](./docs/derive-maker-flow.md) for matching rules, formulas, quality and agreement classification, refresh/cache behavior, strike-weighted zone rendering, and Binance raw-trade data-quality handling.
 
 <div align="center">
   <img
