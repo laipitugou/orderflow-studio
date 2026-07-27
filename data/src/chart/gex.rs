@@ -669,6 +669,15 @@ pub enum GexZoneState {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GexZoneBand {
+    pub strike: f64,
+    pub lower_price: f64,
+    pub upper_price: f64,
+    pub normalized_strength: f32,
+    pub net_gex_1pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct GexZone {
     pub id: u64,
     pub observed_at: UnixMs,
@@ -686,6 +695,8 @@ pub struct GexZone {
     pub state: GexZoneState,
     #[serde(default)]
     pub missing_buckets: u8,
+    #[serde(default)]
+    pub bands: Arc<[GexZoneBand]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -767,6 +778,17 @@ impl GexZone {
             && (0.0..=1.0).contains(&self.normalized_strength)
             && self.persistence_score.is_finite()
             && (0.0..=1.0).contains(&self.persistence_score)
+            && self.bands.iter().all(|band| {
+                band.strike.is_finite()
+                    && band.lower_price.is_finite()
+                    && band.upper_price.is_finite()
+                    && band.lower_price > 0.0
+                    && band.lower_price <= band.strike
+                    && band.strike <= band.upper_price
+                    && band.normalized_strength.is_finite()
+                    && (0.0..=1.0).contains(&band.normalized_strength)
+                    && band.net_gex_1pct.is_finite()
+            })
     }
 }
 
@@ -1820,16 +1842,6 @@ fn zone_from_cluster(
     cluster: &[ZoneStrike<'_>],
     fallback_gap: f64,
 ) -> GexZone {
-    let local_gap = median(
-        &cluster
-            .iter()
-            .map(|value| value.local_gap)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(fallback_gap)
-    .max(f64::EPSILON);
-    let first = cluster.first().expect("non-empty GEX cluster");
-    let last = cluster.last().expect("non-empty GEX cluster");
     let peak = cluster
         .iter()
         .max_by(|a, b| {
@@ -1844,19 +1856,37 @@ fn zone_from_cluster(
                 .then_with(|| b.strike.strike.total_cmp(&a.strike.strike))
         })
         .expect("non-empty GEX cluster");
-    let (lower_price, upper_price) = if cluster.len() == 1 {
-        let half_width = (0.08 * local_gap).clamp(
-            snapshot.source_spot * 0.00025,
-            snapshot.source_spot * 0.0008,
-        );
-        (
-            first.strike.strike - half_width,
-            first.strike.strike + half_width,
-        )
-    } else {
-        let padding = (0.20 * local_gap).min(snapshot.source_spot * 0.001);
-        (first.strike.strike - padding, last.strike.strike + padding)
-    };
+    let bands = cluster
+        .iter()
+        .map(|value| {
+            let local_gap = if value.local_gap.is_finite() && value.local_gap > 0.0 {
+                value.local_gap
+            } else {
+                fallback_gap
+            };
+            let half_width = (0.18 * local_gap).clamp(
+                snapshot.source_spot * 0.00025,
+                snapshot.source_spot * 0.0015,
+            );
+            GexZoneBand {
+                strike: value.strike.strike,
+                lower_price: value.strike.strike - half_width,
+                upper_price: value.strike.strike + half_width,
+                normalized_strength: value.strength,
+                net_gex_1pct: value.strike.net_gex_1pct,
+            }
+        })
+        .collect::<Vec<_>>();
+    let lower_price = bands
+        .iter()
+        .map(|band| band.lower_price)
+        .min_by(f64::total_cmp)
+        .expect("non-empty GEX cluster bands");
+    let upper_price = bands
+        .iter()
+        .map(|band| band.upper_price)
+        .max_by(f64::total_cmp)
+        .expect("non-empty GEX cluster bands");
     let net_gex_1pct = cluster.iter().map(|value| value.strike.net_gex_1pct).sum();
     let absolute_gex_1pct = cluster
         .iter()
@@ -1909,6 +1939,7 @@ fn zone_from_cluster(
         gamma_provenance,
         state: GexZoneState::Active,
         missing_buckets: 0,
+        bands: bands.into(),
     }
 }
 
@@ -2990,8 +3021,34 @@ mod tests {
 
         let cluster = zone_snapshot(300_001, &[(69_000.0, 8.0), (70_000.0, 10.0)]);
         let zone = extract_gex_zones(&cluster, 0.12, 6, 6).remove(0);
-        assert!(69_000.0 - zone.lower_price <= 100.0);
-        assert!(zone.upper_price - 70_000.0 <= 100.0);
+        assert_eq!(zone.lower_price, zone.bands[0].lower_price);
+        assert_eq!(zone.upper_price, zone.bands[1].upper_price);
+        assert!(zone.bands[0].upper_price < zone.bands[1].lower_price);
+    }
+
+    #[test]
+    fn zone_cluster_builds_distinct_strike_weighted_bands() {
+        let snapshot = zone_snapshot(
+            300_001,
+            &[(65_000.0, 3.0), (66_000.0, 6.0), (67_000.0, 10.0)],
+        );
+        let zone = extract_gex_zones(&snapshot, 0.12, 6, 6).remove(0);
+
+        assert_eq!(zone.bands.len(), 3);
+        assert!(
+            zone.bands
+                .windows(2)
+                .all(|pair| pair[0].upper_price < pair[1].lower_price)
+        );
+        let weak = zone
+            .bands
+            .iter()
+            .find(|band| band.strike == 65_000.0)
+            .expect("65k band");
+        let expected_weak = ((3.0_f64 / 10.0).asinh() / 1.0_f64.asinh()) as f32;
+        assert!((weak.normalized_strength - expected_weak).abs() < 1.0e-6);
+        assert!(weak.normalized_strength < zone.normalized_strength);
+        assert_eq!(zone.peak_price, 67_000.0);
     }
 
     #[test]
