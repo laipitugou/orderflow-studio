@@ -41,15 +41,51 @@ use std::{cell::RefCell, sync::Arc, time::Instant};
 const MAX_RAW_TRADES: usize = 50_000;
 const MAX_LIVE_TRADE_BUCKETS: usize = 4_096;
 
-fn deduplicate_incoming_trades(existing: &[Trade], incoming: &[Trade]) -> Vec<Trade> {
-    let invalid_price_count = incoming
+fn deduplicate_incoming_trades(
+    existing: &[Trade],
+    incoming: &[Trade],
+    source: &'static str,
+    ticker_info: Option<TickerInfo>,
+) -> Vec<Trade> {
+    let invalid_prices = incoming
         .iter()
         .filter(|trade| trade.price.units <= 0)
-        .count();
+        .collect::<Vec<_>>();
+    let invalid_price_count = invalid_prices.len();
     if invalid_price_count > 0 {
+        // Keep a small sample in the warning so a venue/parser problem can be traced without
+        // dumping the full batch or any account-related data into the log.
+        let samples = invalid_prices
+            .iter()
+            .take(3)
+            .map(|trade| {
+                format!(
+                    "id={} timestamp_ms={} side={} price={} price_units={} qty={}",
+                    trade.id.map_or_else(|| "none".into(), |id| id.to_string()),
+                    trade.time.as_u64(),
+                    if trade.is_sell { "sell" } else { "buy" },
+                    trade.price.to_f64(),
+                    trade.price.units,
+                    trade.qty.to_f64()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (ticker, exchange, market) = ticker_info.map_or_else(
+            || ("unknown".into(), "unknown".into(), "unknown".into()),
+            |info| {
+                (
+                    info.ticker.to_string(),
+                    format!("{:?}", info.exchange()),
+                    format!("{:?}", info.market_type()),
+                )
+            },
+        );
         log::warn!(
-            "TRADE InvalidPriceDiscarded | count={invalid_price_count} batch_len={} reason=non_positive_price",
-            incoming.len()
+            "TRADE InvalidPriceDiscarded | source={source} exchange={exchange} ticker={ticker} market={market} count={invalid_price_count} batch_len={} batch_first_ms={} batch_last_ms={} samples=[{samples}] reason=non_positive_execution_price action=discarded_before_chart_aggregation",
+            incoming.len(),
+            incoming.first().map_or(0, |trade| trade.time.as_u64()),
+            incoming.last().map_or(0, |trade| trade.time.as_u64())
         );
     }
 
@@ -278,7 +314,8 @@ impl KlineChart {
         let mut visual_config = visual_config.unwrap_or_default();
         visual_config.migrate_legacy_indicator_configs();
         let kind = kind.clone();
-        let raw_trades = deduplicate_incoming_trades(&[], &raw_trades);
+        let raw_trades =
+            deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
 
         match basis {
             Basis::Time(interval) => {
@@ -1670,7 +1707,12 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
-        let buffer = deduplicate_incoming_trades(&self.raw_trades, buffer);
+        let buffer = deduplicate_incoming_trades(
+            &self.raw_trades,
+            buffer,
+            "live_stream",
+            Some(self.chart.ticker_info),
+        );
         if self.chart.ticker_info.exchange() == exchange::adapter::Exchange::BinanceLinear
             && let PlotData::TimeBased(timeseries) = &self.data_source
         {
@@ -1751,7 +1793,12 @@ impl KlineChart {
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let received_size = raw_trades.len();
-        let raw_trades = deduplicate_incoming_trades(&self.raw_trades, &raw_trades);
+        let raw_trades = deduplicate_incoming_trades(
+            &self.raw_trades,
+            &raw_trades,
+            "historical_fetch",
+            Some(self.chart.ticker_info),
+        );
         let (raw_trades, live_overlap_discarded) = match &self.data_source {
             PlotData::TimeBased(timeseries) => exclude_historical_overlap_with_live(
                 raw_trades,
@@ -6479,7 +6526,7 @@ mod tests {
     #[test]
     fn retained_trade_ids_prevent_bubble_reaggregation() {
         let trade = test_trade(42, 61_000, 10.0);
-        assert!(deduplicate_incoming_trades(&[trade], &[trade]).is_empty());
+        assert!(deduplicate_incoming_trades(&[trade], &[trade], "test", None).is_empty());
     }
 
     #[test]
@@ -6488,7 +6535,7 @@ mod tests {
         let mut zero = test_trade(2, 61_001, 1.0);
         zero.price = Price::from_f64(0.0);
 
-        let filtered = deduplicate_incoming_trades(&[], &[zero, valid]);
+        let filtered = deduplicate_incoming_trades(&[], &[zero, valid], "test", None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, valid.id);
         assert_eq!(filtered[0].price, valid.price);
@@ -6539,8 +6586,12 @@ mod tests {
         // The candle bucket still contains trade 42, but raw_trades no longer
         // does after retention pruning. Re-fetching an overlapping range must
         // not let trade 42 be aggregated into the bucket a second time.
-        let redelivered =
-            deduplicate_incoming_trades(&[retained_newer_trade], &[previously_aggregated]);
+        let redelivered = deduplicate_incoming_trades(
+            &[retained_newer_trade],
+            &[previously_aggregated],
+            "test",
+            None,
+        );
         for trade in redelivered {
             candle.add_trade(&trade, price_step);
         }
