@@ -4,6 +4,7 @@
 //! do not participate in normal trade, depth, or kline streaming.
 
 pub mod deribit;
+pub mod gex_monitor;
 
 use crate::{Ticker, UnixMs};
 use serde::{Deserialize, Serialize};

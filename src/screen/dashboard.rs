@@ -352,11 +352,17 @@ impl Dashboard {
                                 Vec::new(),
                                 data::chart::gex::GexFreshness::Loading,
                                 None,
+                                Vec::new(),
+                                data::chart::gex::GexFreshness::Loading,
+                                None,
                             );
                             return;
                         }
                         let Some(underlying) = market_underlying else {
                             chart.set_gex_overlay_data(
+                                None,
+                                Vec::new(),
+                                data::chart::gex::GexFreshness::Loading,
                                 None,
                                 Vec::new(),
                                 data::chart::gex::GexFreshness::Loading,
@@ -381,7 +387,18 @@ impl Dashboard {
                             .or_else(|| history.last().cloned());
                         let freshness = coordinator.freshness(underlying, now);
                         let error = coordinator.last_error(underlying).map(Arc::from);
-                        chart.set_gex_overlay_data(snapshot, history, freshness, error);
+                        let proxy_history = coordinator.proxy_history(underlying, now);
+                        let proxy_freshness = coordinator.proxy_freshness(underlying, now);
+                        let proxy_error = coordinator.proxy_error(underlying).map(Arc::from);
+                        chart.set_gex_overlay_data(
+                            snapshot,
+                            history,
+                            freshness,
+                            error,
+                            proxy_history,
+                            proxy_freshness,
+                            proxy_error,
+                        );
                     }
                     _ => {}
                 }

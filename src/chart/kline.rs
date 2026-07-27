@@ -238,6 +238,9 @@ pub struct KlineChart {
     gex_history: Vec<Arc<data::chart::gex::GexSnapshot>>,
     gex_freshness: data::chart::gex::GexFreshness,
     gex_error: Option<Arc<str>>,
+    gex_proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
+    gex_proxy_freshness: data::chart::gex::GexFreshness,
+    gex_proxy_error: Option<Arc<str>>,
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
@@ -364,6 +367,9 @@ impl KlineChart {
                     gex_history: Vec::new(),
                     gex_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_error: None,
+                    gex_proxy_history: Vec::new(),
+                    gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
+                    gex_proxy_error: None,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -435,6 +441,9 @@ impl KlineChart {
                     gex_history: Vec::new(),
                     gex_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_error: None,
+                    gex_proxy_history: Vec::new(),
+                    gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
+                    gex_proxy_error: None,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -1412,6 +1421,9 @@ impl KlineChart {
         history: Vec<Arc<data::chart::gex::GexSnapshot>>,
         freshness: data::chart::gex::GexFreshness,
         error: Option<Arc<str>>,
+        proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
+        proxy_freshness: data::chart::gex::GexFreshness,
+        proxy_error: Option<Arc<str>>,
     ) {
         let unchanged = self.gex_snapshot.as_ref().map(|value| value.observed_at)
             == snapshot.as_ref().map(|value| value.observed_at)
@@ -1420,6 +1432,12 @@ impl KlineChart {
                 == history.last().map(|value| value.observed_at)
             && self.gex_freshness == freshness
             && self.gex_error == error;
+        let unchanged = unchanged
+            && self.gex_proxy_history.len() == proxy_history.len()
+            && self.gex_proxy_history.last().map(|value| value.observed_at)
+                == proxy_history.last().map(|value| value.observed_at)
+            && self.gex_proxy_freshness == proxy_freshness
+            && self.gex_proxy_error == proxy_error;
         if unchanged {
             return;
         }
@@ -1427,6 +1445,9 @@ impl KlineChart {
         self.gex_history = history;
         self.gex_freshness = freshness;
         self.gex_error = error;
+        self.gex_proxy_history = proxy_history;
+        self.gex_proxy_freshness = proxy_freshness;
+        self.gex_proxy_error = proxy_error;
         self.chart.cache.clear_all();
     }
 
@@ -1451,6 +1472,10 @@ impl KlineChart {
                 .volume_bubbles
                 .use_raw_trades_when_available,
         ))
+    }
+
+    pub fn gex_proxy_available(&self) -> bool {
+        !self.gex_proxy_history.is_empty()
     }
 
     pub fn set_visual_config(&mut self, mut visual_config: Config) {
@@ -2454,14 +2479,14 @@ impl canvas::Program<Message> for KlineChart {
                     };
                     let (visible_high, visible_low) = chart.price_range(&region);
                     if self.indicator_enabled(KlineIndicator::GexLevels)
-                        && let Some(snapshot) = &self.gex_snapshot
+                        && (self.gex_snapshot.is_some() || !self.gex_proxy_history.is_empty())
                     {
                         draw_gex_overlay_background(
                             frame,
                             price_to_y,
                             interval_to_x,
-                            snapshot,
                             &self.gex_history,
+                            &self.gex_proxy_history,
                             self.gex_freshness,
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
@@ -2631,6 +2656,7 @@ impl canvas::Program<Message> for KlineChart {
                         frame,
                         chart,
                         &self.gex_history,
+                        &self.gex_proxy_history,
                         self.gex_freshness,
                         &self.gex_render_cache,
                         &self.visual_config.gex_levels(),
@@ -2690,6 +2716,7 @@ fn draw_gex_hover_tooltip(
     frame: &mut canvas::Frame,
     chart: &ViewState,
     history: &[Arc<data::chart::gex::GexSnapshot>],
+    proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
     freshness: data::chart::gex::GexFreshness,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
@@ -2697,6 +2724,18 @@ fn draw_gex_hover_tooltip(
     bounds: Size,
     palette: &Extended,
 ) -> bool {
+    if draw_gex_proxy_tooltip(
+        frame,
+        chart,
+        proxy_history,
+        history,
+        config,
+        cursor,
+        bounds,
+        palette,
+    ) {
+        return true;
+    }
     draw_gex_zone_tooltip(
         frame,
         chart,
@@ -2708,6 +2747,109 @@ fn draw_gex_hover_tooltip(
         bounds,
         palette,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gex_proxy_tooltip(
+    frame: &mut canvas::Frame,
+    chart: &ViewState,
+    proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
+    deribit_history: &[Arc<data::chart::gex::GexSnapshot>],
+    config: &data::chart::gex::GexLevelsConfig,
+    cursor: Point,
+    bounds: Size,
+    palette: &Extended,
+) -> bool {
+    let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+    let world = Point::new(
+        (cursor.x - center.x) / chart.scaling - chart.translation.x,
+        (cursor.y - center.y) / chart.scaling - chart.translation.y,
+    );
+    let interval_ms = match chart.basis {
+        Basis::Time(interval) => interval.to_milliseconds(),
+        Basis::Tick(_) => 60_000,
+    };
+    let time = chart.x_to_interval(world.x);
+    let segments =
+        build_gex_proxy_segments(proxy_history, deribit_history, interval_ms, chart.latest_x);
+    let Some(segment) = segments
+        .iter()
+        .find(|segment| time >= segment.start && time < segment.end)
+    else {
+        return false;
+    };
+    let candidates = [
+        ("Positive Proxy P1", segment.point.positive_level_1),
+        ("Positive Proxy P2", segment.point.positive_level_2),
+        ("Negative Proxy N1", segment.point.negative_level_1),
+        ("Negative Proxy N2", segment.point.negative_level_2),
+        (
+            "Gamma Flip Proxy",
+            config
+                .show_gamma_flip_marker
+                .then_some(segment.point.flip_level)
+                .flatten(),
+        ),
+        (
+            "Call Wall Proxy",
+            config
+                .show_call_wall_marker
+                .then_some(segment.point.call_wall)
+                .flatten(),
+        ),
+        (
+            "Put Wall Proxy",
+            config
+                .show_put_wall_marker
+                .then_some(segment.point.put_wall)
+                .flatten(),
+        ),
+    ];
+    let Some((role, level, _)) = candidates
+        .into_iter()
+        .filter_map(|(role, level)| {
+            let level = level?;
+            let distance =
+                (chart.price_to_y(Price::from_f64(level)) - world.y).abs() * chart.scaling;
+            (distance <= 5.0).then_some((role, level, distance))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+    else {
+        return false;
+    };
+    let observed = u64::try_from(segment.point.observed_at)
+        .ok()
+        .map(UnixMs::new)
+        .and_then(|value| value.format_utc("%Y-%m-%d %H:%M:%S"))
+        .unwrap_or_else(|| segment.point.observed_at.to_string());
+    let lines = [
+        role.to_owned(),
+        format!("Level: ${level:.2}"),
+        format!("Provider spot: ${:.2}", segment.point.source_spot),
+        format!("Provider Total GEX: {:+.2}", segment.point.total_gex),
+        format!("Observed: {observed} UTC"),
+        "Source: GEX Monitor · aggregate proxy".to_owned(),
+    ];
+    let width = 330.0;
+    let height = 12.0 + lines.len() as f32 * 16.0;
+    let x = (cursor.x + 14.0).min((bounds.width - width - 4.0).max(4.0));
+    let y = (cursor.y + 14.0).min((bounds.height - height - 4.0).max(4.0));
+    frame.fill(
+        &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+        palette.background.base.color.scale_alpha(0.94),
+    );
+    for (line, text) in lines.iter().enumerate() {
+        draw_cluster_text(
+            frame,
+            text,
+            Point::new(x + 8.0, y + 10.0 + line as f32 * 16.0),
+            11.0,
+            palette.background.base.text,
+            Alignment::Start,
+            Alignment::Start,
+        );
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2837,8 +2979,8 @@ fn draw_gex_overlay_background(
     frame: &mut canvas::Frame,
     price_to_y: impl Fn(Price) -> f32 + Copy,
     time_to_x: impl Fn(u64) -> f32 + Copy,
-    _snapshot: &data::chart::gex::GexSnapshot,
     history: &[Arc<data::chart::gex::GexSnapshot>],
+    proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
     freshness: data::chart::gex::GexFreshness,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
@@ -2851,6 +2993,18 @@ fn draw_gex_overlay_background(
     visible_high: f64,
     palette: &Extended,
 ) {
+    draw_gex_proxy_history(
+        frame,
+        price_to_y,
+        time_to_x,
+        proxy_history,
+        history,
+        config,
+        visible_region,
+        chart_scaling,
+        chart_interval_ms,
+        latest_candle_time,
+    );
     draw_gex_zone_background(
         frame,
         price_to_y,
@@ -2867,6 +3021,168 @@ fn draw_gex_overlay_background(
         visible_high,
         palette,
     );
+}
+
+#[derive(Debug, Clone)]
+struct GexProxySegment {
+    start: u64,
+    end: u64,
+    point: Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>,
+}
+
+fn build_gex_proxy_segments(
+    proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
+    deribit_history: &[Arc<data::chart::gex::GexSnapshot>],
+    chart_interval_ms: u64,
+    latest_candle_time: u64,
+) -> Vec<GexProxySegment> {
+    const SOURCE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+    let handoff = deribit_history
+        .iter()
+        .map(|snapshot| snapshot.observed_at.as_u64())
+        .min()
+        .unwrap_or(u64::MAX);
+    let limit = handoff.min(latest_candle_time.saturating_add(chart_interval_ms));
+    let eligible = proxy_history
+        .iter()
+        .filter_map(|point| {
+            let observed_at = u64::try_from(point.observed_at).ok()?;
+            (observed_at < limit).then_some((observed_at, point.clone()))
+        })
+        .collect::<Vec<_>>();
+    if chart_interval_ms <= SOURCE_INTERVAL_MS {
+        return eligible
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (start, point))| {
+                let next = eligible.get(index + 1).map_or(u64::MAX, |(next, _)| *next);
+                let end = start
+                    .saturating_add(SOURCE_INTERVAL_MS)
+                    .min(next)
+                    .min(limit);
+                (end > *start).then_some(GexProxySegment {
+                    start: *start,
+                    end,
+                    point: point.clone(),
+                })
+            })
+            .collect();
+    }
+
+    let mut grouped = Vec::<(u64, u64, Arc<_>)>::new();
+    for (observed_at, point) in eligible {
+        let bucket = observed_at / chart_interval_ms * chart_interval_ms;
+        if let Some(last) = grouped.last_mut()
+            && last.0 == bucket
+        {
+            *last = (bucket, observed_at, point);
+        } else {
+            grouped.push((bucket, observed_at, point));
+        }
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(bucket, observed_at, point)| {
+            let end = bucket
+                .saturating_add(chart_interval_ms)
+                .min(observed_at.saturating_add(SOURCE_INTERVAL_MS))
+                .min(limit);
+            (end > bucket).then_some(GexProxySegment {
+                start: bucket,
+                end,
+                point,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gex_proxy_history(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32 + Copy,
+    time_to_x: impl Fn(u64) -> f32 + Copy,
+    proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
+    deribit_history: &[Arc<data::chart::gex::GexSnapshot>],
+    config: &data::chart::gex::GexLevelsConfig,
+    region: Rectangle,
+    scaling: f32,
+    chart_interval_ms: u64,
+    latest_candle_time: u64,
+) {
+    if !config.show_historical_zones || proxy_history.is_empty() {
+        return;
+    }
+    let segments = build_gex_proxy_segments(
+        proxy_history,
+        deribit_history,
+        chart_interval_ms.max(1),
+        latest_candle_time,
+    );
+    let Some(p95) =
+        data::chart::gex::gex_percentile_95(segments.iter().map(|segment| segment.point.total_gex))
+    else {
+        return;
+    };
+    let roles = [
+        (0, Color::from_rgb8(0x16, 0xd8, 0xc5), 1.0),
+        (1, Color::from_rgb8(0x16, 0xd8, 0xc5), 0.68),
+        (2, Color::from_rgb8(0xff, 0x31, 0x5d), 1.0),
+        (3, Color::from_rgb8(0xff, 0x31, 0x5d), 0.68),
+        (4, Color::from_rgb8(0xb7, 0xbf, 0xcc), 0.58),
+        (5, Color::from_rgb8(0x16, 0xd8, 0xc5), 0.52),
+        (6, Color::from_rgb8(0xff, 0x31, 0x5d), 0.52),
+    ];
+    let width = gex_screen_width_to_world(1.0, scaling);
+    for (role, color, role_alpha) in roles {
+        let mut previous: Option<(&GexProxySegment, f32)> = None;
+        for segment in &segments {
+            let price = match role {
+                0 => segment.point.positive_level_1,
+                1 => segment.point.positive_level_2,
+                2 => segment.point.negative_level_1,
+                3 => segment.point.negative_level_2,
+                4 if config.show_gamma_flip_marker => segment.point.flip_level,
+                5 if config.show_call_wall_marker => segment.point.call_wall,
+                6 if config.show_put_wall_marker => segment.point.put_wall,
+                _ => None,
+            };
+            let Some(price) = price else {
+                previous = None;
+                continue;
+            };
+            let y = price_to_y(Price::from_f64(price));
+            let x0 = time_to_x(segment.start).max(region.x);
+            let x1 = time_to_x(segment.end).min(region.x + region.width);
+            if x1 > x0 && gex_level_is_visible(y, region) {
+                let normalized = (segment.point.total_gex.abs() / p95).clamp(0.0, 1.0);
+                let strength = normalized.sqrt() as f32;
+                let alpha = role_alpha * (0.18 + 0.16 * strength);
+                frame.stroke(
+                    &Path::line(Point::new(x0, y), Point::new(x1, y)),
+                    Stroke::default()
+                        .with_color(color.scale_alpha(alpha))
+                        .with_width(width),
+                );
+                if let Some((previous_segment, previous_y)) = previous
+                    && previous_segment.end == segment.start
+                    && (previous_y - y).abs() > f32::EPSILON
+                {
+                    frame.stroke(
+                        &Path::line(
+                            Point::new(time_to_x(segment.start), previous_y),
+                            Point::new(time_to_x(segment.start), y),
+                        ),
+                        Stroke::default()
+                            .with_color(color.scale_alpha(alpha))
+                            .with_width(width),
+                    );
+                }
+                previous = Some((segment, y));
+            } else {
+                previous = None;
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6297,6 +6613,112 @@ mod tests {
         assert_eq!(points[0], Point::new(42.0, 10.0));
         assert_eq!(points[1], Point::new(42.0, 30.0));
         assert_eq!(points[0].x, points[1].x);
+    }
+
+    fn proxy_test_point(
+        observed_at: i64,
+    ) -> Arc<exchange::options::gex_monitor::GexProxyHistoryPoint> {
+        Arc::new(exchange::options::gex_monitor::GexProxyHistoryPoint {
+            observed_at,
+            source_spot: 100.0,
+            total_gex: 1.0,
+            flip_level: Some(100.0),
+            call_wall: Some(110.0),
+            put_wall: Some(90.0),
+            positive_level_1: Some(105.0),
+            positive_level_2: None,
+            negative_level_1: Some(95.0),
+            negative_level_2: None,
+        })
+    }
+
+    fn deribit_test_snapshot(observed_at: u64) -> Arc<data::chart::gex::GexSnapshot> {
+        use data::chart::gex::*;
+        Arc::new(GexSnapshot {
+            provider: exchange::options::OptionsProvider::Deribit,
+            underlying: exchange::options::OptionsUnderlying::Btc,
+            model: GexSignModel::CallPutOiProxy,
+            expiry_filter: GexExpiryFilter::SevenDays,
+            gamma_source: GexGammaSource::BlackScholesDerived,
+            gamma_provenance: GexGammaProvenance::Derived,
+            source_spot: 100.0,
+            observed_at: UnixMs::new(observed_at),
+            calculated_at: UnixMs::new(observed_at),
+            net_gex_1pct: Some(1.0),
+            absolute_gex_1pct: 1.0,
+            call_wall: Some(110.0),
+            put_wall: Some(90.0),
+            gamma_flip: Some(100.0),
+            intrinsic_stress: IntrinsicStressMetrics::default(),
+            gamma_vega: GammaVegaMetrics::default(),
+            strikes: Arc::from([]),
+            expiry_strikes: Arc::from([]),
+            scenario_curve: Arc::from([GexScenarioPoint {
+                price: 100.0,
+                net_gex_1pct: 1.0,
+                absolute_gex_1pct: 1.0,
+            }]),
+            scale_p95: 1.0,
+        })
+    }
+
+    #[test]
+    fn proxy_grouping_respects_one_five_and_larger_timeframes_and_gaps() {
+        let points = vec![
+            proxy_test_point(0),
+            proxy_test_point(5 * 60_000),
+            proxy_test_point(10 * 60_000),
+        ];
+        let one = build_gex_proxy_segments(&points, &[], 60_000, 20 * 60_000);
+        assert_eq!((one[0].start, one[0].end), (0, 5 * 60_000));
+        let five = build_gex_proxy_segments(&points, &[], 5 * 60_000, 20 * 60_000);
+        assert_eq!(five.len(), 3);
+        let fifteen = build_gex_proxy_segments(&points, &[], 15 * 60_000, 20 * 60_000);
+        assert_eq!(fifteen.len(), 1);
+        assert_eq!((fifteen[0].start, fifteen[0].end), (0, 15 * 60_000));
+
+        let gapped = build_gex_proxy_segments(
+            &[proxy_test_point(0), proxy_test_point(10 * 60_000)],
+            &[],
+            60_000,
+            20 * 60_000,
+        );
+        assert_eq!(gapped[0].end, 5 * 60_000);
+        assert_eq!(gapped[1].start, 10 * 60_000);
+        assert_ne!(gapped[0].end, gapped[1].start);
+    }
+
+    #[test]
+    fn proxy_stops_at_first_deribit_timestamp_and_never_fills_internal_gaps() {
+        let points = vec![
+            proxy_test_point(0),
+            proxy_test_point(5 * 60_000),
+            proxy_test_point(10 * 60_000),
+            proxy_test_point(20 * 60_000),
+        ];
+        let deribit = vec![
+            deribit_test_snapshot(7 * 60_000),
+            deribit_test_snapshot(20 * 60_000),
+        ];
+        let segments = build_gex_proxy_segments(&points, &deribit, 60_000, 30 * 60_000);
+        assert!(segments.iter().all(|segment| segment.end <= 7 * 60_000));
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.point.observed_at < 7 * 60_000)
+        );
+        assert!(!segments.iter().any(|segment| segment.start >= 7 * 60_000));
+    }
+
+    #[test]
+    fn proxy_never_projects_beyond_last_chart_bucket() {
+        let segments = build_gex_proxy_segments(
+            &[proxy_test_point(10 * 60_000)],
+            &[],
+            5 * 60_000,
+            10 * 60_000,
+        );
+        assert_eq!(segments[0].end, 15 * 60_000);
     }
 
     #[test]

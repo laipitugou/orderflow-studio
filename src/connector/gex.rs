@@ -7,6 +7,7 @@ use exchange::{
     options::{
         OptionInstrument, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
         deribit::{DeribitError, DeribitOptionsClient},
+        gex_monitor::{GexMonitorClient, GexProxyHistoryPoint, GexProxyHistoryResponse},
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -66,6 +67,7 @@ pub const INSTRUMENT_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MARKET_SNAPSHOT_TTL_MS: u64 = 15 * 1_000;
 pub const FRESH_THRESHOLD_MS: u64 = 45 * 1_000;
 pub const EXPIRED_THRESHOLD_MS: u64 = 5 * 60 * 1_000;
+pub const PROXY_REFRESH_MS: u64 = 5 * 60 * 1_000;
 const FAILURE_BACKOFF_BASE_MS: u64 = 5_000;
 const FAILURE_BACKOFF_MAX_MS: u64 = 2 * 60 * 1_000;
 const CACHE_SCHEMA: u32 = 1;
@@ -179,6 +181,13 @@ pub struct GexDataCoordinator {
     subscribers: FxHashMap<OptionsChainKey, usize>,
     force_refresh: FxHashSet<OptionsChainKey>,
     last_freshness: FxHashMap<OptionsChainKey, GexFreshness>,
+    proxy_history: FxHashMap<OptionsUnderlying, Vec<Arc<GexProxyHistoryPoint>>>,
+    proxy_loaded: FxHashSet<OptionsUnderlying>,
+    proxy_in_flight: FxHashSet<OptionsUnderlying>,
+    proxy_failures: FxHashMap<OptionsUnderlying, FailureState>,
+    proxy_force_refresh: FxHashSet<OptionsUnderlying>,
+    proxy_refreshed_at: FxHashMap<OptionsUnderlying, UnixMs>,
+    proxy_stale: FxHashSet<OptionsUnderlying>,
     next_revision: u64,
     cache_path: PathBuf,
     persist_heatmap: bool,
@@ -205,12 +214,22 @@ impl GexDataCoordinator {
             subscribers: FxHashMap::default(),
             force_refresh: FxHashSet::default(),
             last_freshness: FxHashMap::default(),
+            proxy_history: FxHashMap::default(),
+            proxy_loaded: FxHashSet::default(),
+            proxy_in_flight: FxHashSet::default(),
+            proxy_failures: FxHashMap::default(),
+            proxy_force_refresh: FxHashSet::default(),
+            proxy_refreshed_at: FxHashMap::default(),
+            proxy_stale: FxHashSet::default(),
             next_revision: 1,
             cache_path,
             persist_heatmap,
             history_provider: LocalGexHistoryProvider,
         };
         coordinator.load_persistent();
+        for underlying in OptionsUnderlying::ALL {
+            coordinator.ensure_proxy_loaded(underlying);
+        }
         coordinator
     }
 
@@ -227,6 +246,7 @@ impl GexDataCoordinator {
         for (&key, &count) in &next {
             if count > 0 && self.subscribers.get(&key).copied().unwrap_or(0) == 0 {
                 self.force_refresh.insert(key);
+                self.proxy_force_refresh.insert(key.underlying);
             }
         }
         self.subscribers = next;
@@ -244,6 +264,192 @@ impl GexDataCoordinator {
             self.subscribers
                 .iter()
                 .filter_map(|(&key, &count)| (count > 0).then_some(key)),
+        );
+        self.proxy_force_refresh.extend(
+            self.subscribers
+                .iter()
+                .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying)),
+        );
+    }
+
+    pub fn due_proxy_fetches(&mut self, now: UnixMs, online: bool) -> Vec<OptionsUnderlying> {
+        if !online {
+            return Vec::new();
+        }
+        let underlyings = self
+            .subscribers
+            .iter()
+            .filter_map(|(&key, &count)| (count > 0).then_some(key.underlying))
+            .collect::<FxHashSet<_>>();
+        let mut due = Vec::new();
+        for underlying in underlyings {
+            self.ensure_proxy_loaded(underlying);
+            if self
+                .proxy_failures
+                .get(&underlying)
+                .is_some_and(|failure| now < failure.retry_after)
+                && !self.proxy_force_refresh.contains(&underlying)
+            {
+                continue;
+            }
+            let expired = self
+                .proxy_refreshed_at
+                .get(&underlying)
+                .is_none_or(|last| now.saturating_diff(*last) >= PROXY_REFRESH_MS);
+            if (expired || self.proxy_force_refresh.contains(&underlying))
+                && self.proxy_in_flight.insert(underlying)
+            {
+                due.push(underlying);
+            }
+        }
+        due
+    }
+
+    pub fn complete_proxy(
+        &mut self,
+        underlying: OptionsUnderlying,
+        result: Result<GexProxyHistoryResponse, Arc<str>>,
+        now: UnixMs,
+    ) {
+        self.proxy_in_flight.remove(&underlying);
+        self.proxy_force_refresh.remove(&underlying);
+        match result {
+            Ok(response)
+                if response.stale
+                    && self
+                        .proxy_history
+                        .get(&underlying)
+                        .is_some_and(|v| !v.is_empty()) =>
+            {
+                self.proxy_stale.insert(underlying);
+                self.proxy_refreshed_at.insert(underlying, now);
+                self.proxy_failures.remove(&underlying);
+            }
+            Ok(response) => {
+                let mut points = self
+                    .proxy_history
+                    .remove(&underlying)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|point| (*point).clone())
+                    .chain(response.points)
+                    .collect::<Vec<_>>();
+                normalize_proxy_points(&mut points, now);
+                self.proxy_history
+                    .insert(underlying, points.iter().cloned().map(Arc::new).collect());
+                self.proxy_refreshed_at.insert(underlying, now);
+                self.proxy_failures.remove(&underlying);
+                if response.stale {
+                    self.proxy_stale.insert(underlying);
+                } else {
+                    self.proxy_stale.remove(&underlying);
+                }
+                if self.persist_heatmap
+                    && let Some(cache) = crate::connector::persistent_cache::market_cache()
+                {
+                    cache.store_gex_proxy_history(
+                        &proxy_cache_key(underlying),
+                        &points,
+                        i64::try_from(now.as_u64()).unwrap_or(i64::MAX),
+                    );
+                }
+            }
+            Err(error) => self.record_proxy_failure(underlying, error, now),
+        }
+    }
+
+    pub fn proxy_history(
+        &mut self,
+        underlying: OptionsUnderlying,
+        now: UnixMs,
+    ) -> Vec<Arc<GexProxyHistoryPoint>> {
+        self.ensure_proxy_loaded(underlying);
+        let cutoff = i64::try_from(now.as_u64())
+            .unwrap_or(i64::MAX)
+            .saturating_sub(24 * 60 * 60 * 1_000);
+        self.proxy_history
+            .get(&underlying)
+            .into_iter()
+            .flatten()
+            .filter(|point| point.observed_at >= cutoff)
+            .cloned()
+            .collect()
+    }
+
+    pub fn proxy_freshness(&self, underlying: OptionsUnderlying, now: UnixMs) -> GexFreshness {
+        if self.proxy_failures.contains_key(&underlying) {
+            GexFreshness::Error
+        } else if self.proxy_in_flight.contains(&underlying)
+            && self
+                .proxy_history
+                .get(&underlying)
+                .is_none_or(Vec::is_empty)
+        {
+            GexFreshness::Loading
+        } else if self.proxy_stale.contains(&underlying) {
+            GexFreshness::Stale
+        } else if let Some(last) = self.proxy_refreshed_at.get(&underlying) {
+            if now.saturating_diff(*last) <= PROXY_REFRESH_MS {
+                GexFreshness::Fresh
+            } else {
+                GexFreshness::Stale
+            }
+        } else if self
+            .proxy_history
+            .get(&underlying)
+            .is_some_and(|v| !v.is_empty())
+        {
+            GexFreshness::Stale
+        } else {
+            GexFreshness::Loading
+        }
+    }
+
+    pub fn proxy_error(&self, underlying: OptionsUnderlying) -> Option<&str> {
+        self.proxy_failures
+            .get(&underlying)
+            .map(|failure| failure.last_error.as_ref())
+    }
+
+    fn ensure_proxy_loaded(&mut self, underlying: OptionsUnderlying) {
+        if !self.persist_heatmap || !self.proxy_loaded.insert(underlying) {
+            return;
+        }
+        let Some(cache) = crate::connector::persistent_cache::market_cache() else {
+            return;
+        };
+        let points = cache.read_gex_proxy_history(&proxy_cache_key(underlying));
+        if !points.is_empty() {
+            self.proxy_history
+                .insert(underlying, points.into_iter().map(Arc::new).collect());
+            self.proxy_stale.insert(underlying);
+        }
+    }
+
+    fn record_proxy_failure(
+        &mut self,
+        underlying: OptionsUnderlying,
+        error: Arc<str>,
+        now: UnixMs,
+    ) {
+        log::debug!(
+            "GEX Monitor FetchFailed underlying={underlying} error={error} provider=GEXMonitor"
+        );
+        let attempts = self
+            .proxy_failures
+            .get(&underlying)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let exponent = attempts.saturating_sub(1).min(10);
+        let delay = FAILURE_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << exponent)
+            .min(FAILURE_BACKOFF_MAX_MS);
+        self.proxy_failures.insert(
+            underlying,
+            FailureState {
+                attempts,
+                retry_after: now.saturating_add(delay),
+                last_error: error,
+            },
         );
     }
 
@@ -634,6 +840,24 @@ pub fn series_cache_key(key: DerivedGexSeriesKey) -> String {
     )
 }
 
+fn proxy_cache_key(underlying: OptionsUnderlying) -> String {
+    format!("source=gexmonitor|underlying={}", underlying.as_str())
+}
+
+fn normalize_proxy_points(points: &mut Vec<GexProxyHistoryPoint>, now: UnixMs) {
+    const RETENTION_WITH_MARGIN_MS: i64 = 24 * 60 * 60 * 1_000 + 10 * 60 * 1_000;
+    const MAX_PROXY_RECORDS: usize = 320;
+    let cutoff = i64::try_from(now.as_u64())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(RETENTION_WITH_MARGIN_MS);
+    points.retain(|point| point.is_semantically_valid() && point.observed_at >= cutoff);
+    points.sort_by_key(|point| point.observed_at);
+    points.dedup_by_key(|point| point.observed_at);
+    if points.len() > MAX_PROXY_RECORDS {
+        points.drain(..points.len() - MAX_PROXY_RECORDS);
+    }
+}
+
 fn legacy_series_cache_key(key: DerivedGexSeriesKey) -> String {
     format!(
         "gex|provider={:?}|underlying={:?}|model={:?}|expiry={:?}|min_oi={:016x}|min_gex={:016x}",
@@ -686,6 +910,17 @@ pub async fn execute_fetch(
                 .map_err(error_text),
         },
     }
+}
+
+pub async fn execute_proxy_fetch(
+    client: GexMonitorClient,
+    underlying: OptionsUnderlying,
+) -> (OptionsUnderlying, Result<GexProxyHistoryResponse, Arc<str>>) {
+    let result = client
+        .fetch_history(underlying)
+        .await
+        .map_err(|error| Arc::from(error.to_string()));
+    (underlying, result)
 }
 
 fn error_text(error: DeribitError) -> Arc<str> {
@@ -778,6 +1013,18 @@ mod tests {
         let due = value.due_fetches(now, true);
         assert_eq!(due.len(), 2);
         assert_ne!(due[0].key(), due[1].key());
+    }
+
+    #[test]
+    fn unsupported_market_never_creates_a_proxy_request() {
+        let ticker = exchange::Ticker::new("SOLUSDT", exchange::adapter::Exchange::BinanceLinear);
+        let mut value = coordinator();
+        value.set_consumers(exchange::options::resolve_options_underlying(ticker));
+        assert!(
+            value
+                .due_proxy_fetches(UnixMs::new(1_800_000_000_000), true)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -935,6 +1182,121 @@ mod tests {
             [GexFetchKind::Instruments(_)]
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn proxy_point(observed_at: i64, total_gex: f64) -> GexProxyHistoryPoint {
+        GexProxyHistoryPoint {
+            observed_at,
+            source_spot: 100_000.0,
+            total_gex,
+            flip_level: Some(100_000.0),
+            call_wall: Some(102_000.0),
+            put_wall: Some(98_000.0),
+            positive_level_1: Some(101_000.0),
+            positive_level_2: None,
+            negative_level_1: Some(99_000.0),
+            negative_level_2: None,
+        }
+    }
+
+    #[test]
+    fn proxy_scheduler_is_independent_offline_bounded_and_reconnectable() {
+        let now = UnixMs::new(1_800_000_000_000);
+        let mut value = coordinator();
+        assert!(value.due_proxy_fetches(now, true).is_empty());
+        value.set_consumers([OptionsUnderlying::Btc]);
+        assert!(value.due_proxy_fetches(now, false).is_empty());
+        assert_eq!(value.due_proxy_fetches(now, true), [OptionsUnderlying::Btc]);
+        assert!(value.due_proxy_fetches(now, true).is_empty());
+        value.complete_proxy(
+            OptionsUnderlying::Btc,
+            Ok(GexProxyHistoryResponse {
+                points: vec![proxy_point(now.as_u64() as i64, 1.0)],
+                stale: false,
+            }),
+            now,
+        );
+        assert!(
+            value
+                .due_proxy_fetches(now.saturating_add(PROXY_REFRESH_MS - 1), true)
+                .is_empty()
+        );
+        assert_eq!(
+            value.due_proxy_fetches(now.saturating_add(PROXY_REFRESH_MS), true),
+            [OptionsUnderlying::Btc]
+        );
+        value.complete_proxy(
+            OptionsUnderlying::Btc,
+            Ok(GexProxyHistoryResponse {
+                points: vec![proxy_point(now.as_u64() as i64, 1.0)],
+                stale: false,
+            }),
+            now.saturating_add(PROXY_REFRESH_MS),
+        );
+        value.reconnect();
+        assert_eq!(
+            value.due_proxy_fetches(now.saturating_add(PROXY_REFRESH_MS + 1), true),
+            [OptionsUnderlying::Btc]
+        );
+    }
+
+    #[test]
+    fn proxy_error_does_not_change_deribit_freshness_or_error() {
+        let now = UnixMs::new(1_800_000_000_000);
+        let key = OptionsChainKey::deribit(OptionsUnderlying::Btc);
+        let mut value = coordinator();
+        value.set_consumers([OptionsUnderlying::Btc]);
+        value.complete(
+            GexFetchResult::Snapshot {
+                key,
+                result: Ok(snapshot(now)),
+            },
+            now,
+        );
+        let _ = value.due_proxy_fetches(now, true);
+        value.complete_proxy(
+            OptionsUnderlying::Btc,
+            Err("remote unavailable".into()),
+            now,
+        );
+        assert_eq!(
+            value.freshness(OptionsUnderlying::Btc, now),
+            GexFreshness::Fresh
+        );
+        assert!(value.last_error(OptionsUnderlying::Btc).is_none());
+        assert_eq!(
+            value.proxy_freshness(OptionsUnderlying::Btc, now),
+            GexFreshness::Error
+        );
+    }
+
+    #[test]
+    fn stale_proxy_response_never_replaces_valid_cache() {
+        let now = UnixMs::new(1_800_000_000_000);
+        let mut value = coordinator();
+        value.complete_proxy(
+            OptionsUnderlying::Btc,
+            Ok(GexProxyHistoryResponse {
+                points: vec![proxy_point(now.as_u64() as i64, 10.0)],
+                stale: false,
+            }),
+            now,
+        );
+        value.complete_proxy(
+            OptionsUnderlying::Btc,
+            Ok(GexProxyHistoryResponse {
+                points: vec![proxy_point(now.as_u64() as i64 + 1, 999.0)],
+                stale: true,
+            }),
+            now.saturating_add(1),
+        );
+        let history = value.proxy_history(OptionsUnderlying::Btc, now.saturating_add(1));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].total_gex, 10.0);
+        assert_eq!(
+            value.proxy_freshness(OptionsUnderlying::Btc, now),
+            GexFreshness::Stale
+        );
     }
 
     fn heatmap_snapshot(observed_at: UnixMs, model: GexSignModel) -> Arc<GexSnapshot> {

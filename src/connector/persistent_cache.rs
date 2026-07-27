@@ -14,7 +14,7 @@ use data::chart::{
 };
 use exchange::{
     Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
-    options::{OptionsProvider, OptionsUnderlying},
+    options::{OptionsProvider, OptionsUnderlying, gex_monitor::GexProxyHistoryPoint},
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
@@ -42,6 +42,8 @@ const OI_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("open_intere
 // V1 stored candle/price bins. V2 stores temporal/spatial smart clusters and must never decode V1.
 const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_summaries_v2");
 const GEX_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("gex_history_v1");
+const GEX_PROXY_HISTORY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("gex_proxy_history_v1");
 
 static CACHE: OnceLock<Option<MarketDataCache>> = OnceLock::new();
 
@@ -369,6 +371,26 @@ pub fn market_cache() -> Option<&'static MarketDataCache> {
             }
         })
         .as_ref()
+}
+
+fn normalize_gex_proxy_history(
+    records: Vec<GexProxyHistoryPoint>,
+    now_ms: i64,
+) -> Vec<GexProxyHistoryPoint> {
+    const RETENTION_WITH_MARGIN_MS: i64 = 24 * 60 * 60 * 1_000 + 10 * 60 * 1_000;
+    const MAX_PROXY_RECORDS: usize = 320;
+    let cutoff = now_ms.saturating_sub(RETENTION_WITH_MARGIN_MS);
+    let mut by_time = BTreeMap::new();
+    for record in records {
+        if record.is_semantically_valid() && record.observed_at >= cutoff {
+            by_time.insert(record.observed_at, record);
+        }
+    }
+    let mut normalized = by_time.into_values().collect::<Vec<_>>();
+    if normalized.len() > MAX_PROXY_RECORDS {
+        normalized.drain(..normalized.len() - MAX_PROXY_RECORDS);
+    }
+    normalized
 }
 
 impl MarketDataCache {
@@ -740,6 +762,55 @@ impl MarketDataCache {
         let _ = write.commit();
     }
 
+    pub fn read_gex_proxy_history(&self, dataset_key: &str) -> Vec<GexProxyHistoryPoint> {
+        let Some(bucket) = self
+            .read_value(GEX_PROXY_HISTORY_TABLE, dataset_key)
+            .ok()
+            .flatten()
+            .and_then(|blob| decode_checked::<StoredBucket<GexProxyHistoryPoint>>(&blob).ok())
+            .filter(|bucket| bucket.schema == CACHE_SCHEMA && bucket.dataset_key == dataset_key)
+        else {
+            return Vec::new();
+        };
+        normalize_gex_proxy_history(
+            bucket.records,
+            i64::try_from(UnixMs::now().as_u64()).unwrap_or(i64::MAX),
+        )
+    }
+
+    pub fn store_gex_proxy_history(
+        &self,
+        dataset_key: &str,
+        records: &[GexProxyHistoryPoint],
+        now_ms: i64,
+    ) {
+        let records = normalize_gex_proxy_history(records.to_vec(), now_ms);
+        if records.is_empty() {
+            return;
+        }
+        let bucket = StoredBucket {
+            schema: CACHE_SCHEMA,
+            dataset_key: dataset_key.to_owned(),
+            bucket_start: 0,
+            records,
+        };
+        let Ok(encoded) = encode_checked(&bucket) else {
+            return;
+        };
+        let Ok(write) = self.db.begin_write() else {
+            return;
+        };
+        {
+            let Ok(mut table) = write.open_table(GEX_PROXY_HISTORY_TABLE) else {
+                return;
+            };
+            if table.insert(dataset_key, encoded.as_slice()).is_err() {
+                return;
+            }
+        }
+        let _ = write.commit();
+    }
+
     /// Removes every persisted market-data record while keeping the database
     /// open and its schema metadata intact.
     pub fn clear_all(&self) -> Result<(), String> {
@@ -752,6 +823,7 @@ impl MarketDataCache {
             OI_TABLE,
             BUBBLE_TABLE,
             GEX_HISTORY_TABLE,
+            GEX_PROXY_HISTORY_TABLE,
         ] {
             let mut table = write
                 .open_table(definition)
@@ -1177,6 +1249,9 @@ fn open_initialized_database(path: &Path) -> Result<Database, String> {
             .map_err(|error| error.to_string())?;
         let _ = write
             .open_table(GEX_HISTORY_TABLE)
+            .map_err(|error| error.to_string())?;
+        let _ = write
+            .open_table(GEX_PROXY_HISTORY_TABLE)
             .map_err(|error| error.to_string())?;
     }
     write.commit().map_err(|error| error.to_string())?;
@@ -1699,6 +1774,67 @@ mod tests {
                 .read_gex_history("canonical-series", first.observed_at, second.observed_at)
                 .len(),
             2
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn proxy_point(observed_at: i64) -> GexProxyHistoryPoint {
+        GexProxyHistoryPoint {
+            observed_at,
+            source_spot: 100_000.0,
+            total_gex: observed_at as f64,
+            flip_level: Some(99_000.0),
+            call_wall: Some(102_000.0),
+            put_wall: Some(98_000.0),
+            positive_level_1: Some(101_000.0),
+            positive_level_2: None,
+            negative_level_1: Some(99_000.0),
+            negative_level_2: None,
+        }
+    }
+
+    #[test]
+    fn gex_proxy_history_roundtrips_retains_24h_and_caps_records() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-gex-proxy-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let now = i64::try_from(UnixMs::now().as_u64()).unwrap();
+        let mut records = (0..400)
+            .map(|index| proxy_point(now - (399 - index) * 60_000))
+            .collect::<Vec<_>>();
+        records.push(records[300].clone());
+        records.push(proxy_point(now - 25 * 60 * 60 * 1_000));
+        cache.store_gex_proxy_history("source=gexmonitor|underlying=BTC", &records, now);
+        drop(cache);
+
+        let reopened = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let restored = reopened.read_gex_proxy_history("source=gexmonitor|underlying=BTC");
+        assert_eq!(restored.len(), 320);
+        assert!(
+            restored
+                .windows(2)
+                .all(|pair| pair[0].observed_at < pair[1].observed_at)
+        );
+        assert!(
+            restored
+                .iter()
+                .all(|point| point.observed_at >= now - (24 * 60 + 10) * 60_000)
+        );
+        reopened.clear_all().unwrap();
+        assert!(
+            reopened
+                .read_gex_proxy_history("source=gexmonitor|underlying=BTC")
+                .is_empty()
         );
         drop(reopened);
         std::fs::remove_file(path).unwrap();

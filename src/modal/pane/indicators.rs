@@ -745,6 +745,15 @@ pub fn view_kline<'a>(
     if selected.contains(&KlineIndicator::GexLevels) {
         use data::chart::gex::{GexExpiryFilter, GexGammaSource, GexLevelColor, GexLevelsConfig};
         let levels = cfg.gex_levels();
+        let proxy_available = matches!(
+            &state.content,
+            pane::Content::Kline { chart: Some(chart), .. } if chart.gex_proxy_available()
+        );
+        let provider_status = if proxy_available {
+            "24h proxy history: GEX Monitor · Live profile: Deribit"
+        } else {
+            "Live profile: Deribit · Local history only"
+        };
         let update = move |next: GexLevelsConfig| config_message(pane, cfg.with_gex_levels(next));
         let toggle =
             |label: &'static str, current: bool, change: fn(&mut GexLevelsConfig, bool)| {
@@ -945,8 +954,7 @@ pub fn view_kline<'a>(
             toggle("Show tooltip", levels.show_hover_tooltip, |c, v| c
                 .show_hover_tooltip =
                 v),
-            text("Local history only · remote GEX backfill unavailable")
-                .size(crate::style::text_size::SMALL),
+            text(provider_status).size(crate::style::text_size::SMALL),
         ]
         .spacing(6);
         sections = sections.push(indicator_card("GEX Overlay", settings));

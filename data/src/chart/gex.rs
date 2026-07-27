@@ -238,7 +238,7 @@ impl Default for GexLevelsConfig {
             minimum_zone_strength: 0.12,
             max_positive_zones: 6,
             max_negative_zones: 6,
-            history_minutes: 240,
+            history_minutes: 1440,
             persistent_lookback_minutes: 15,
             fade_buckets: 3,
             show_historical_zones: true,
@@ -256,6 +256,9 @@ impl Default for GexLevelsConfig {
 impl GexLevelsConfig {
     pub fn migrate_legacy_defaults(&mut self) {
         self.overlay_mode = GexOverlayMode::GexZoneOverlay;
+        if self.history_minutes == 240 {
+            self.history_minutes = 1440;
+        }
         self.minimum_zone_strength = self.minimum_zone_strength.clamp(0.01, 1.0);
         self.max_positive_zones = self.max_positive_zones.clamp(1, 6);
         self.max_negative_zones = self.max_negative_zones.clamp(1, 6);
@@ -2209,9 +2212,20 @@ mod tests {
         assert_eq!(config.current_profile_width_percent, 5.0);
         assert_eq!(config.positive_color, GexLevelColor::Cyan);
         assert_eq!(config.negative_color, GexLevelColor::Magenta);
+        assert_eq!(config.history_minutes, 1440);
         let encoded = serde_json::to_string(&config).expect("serialize");
         let decoded: GexLevelsConfig = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn previous_default_history_window_migrates_to_twenty_four_hours() {
+        let mut config = GexLevelsConfig {
+            history_minutes: 240,
+            ..GexLevelsConfig::default()
+        };
+        config.migrate_legacy_defaults();
+        assert_eq!(config.history_minutes, 1440);
     }
 
     #[test]

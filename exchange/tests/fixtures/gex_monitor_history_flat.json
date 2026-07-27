@@ -1,0 +1,41 @@
+{
+  "availability": "ready",
+  "stale": false,
+  "data": {
+    "resolution": "5m",
+    "availability": "ready",
+    "coverage_start": "2026-07-27T08:00:00Z",
+    "coverage_end": "2026-07-27T08:05:00Z",
+    "data": [
+    {
+      "timestamp": "2026-07-27T16:05:00+08:00",
+      "spot_price": 118000.0,
+      "total_gex": -12.5,
+      "flip_point": 117000.0,
+      "call_wall": 120000.0,
+      "put_wall": 115000.0,
+      "p1": 119000.0,
+      "p2": 121000.0,
+      "n1": 116000.0,
+      "n2": 114000.0,
+      "a1": 0.0,
+      "a2": 0.0,
+      "vol_trigger": 0.0,
+      "max_pain": 0.0
+    },
+    {
+      "timestamp": "2026-07-27T08:00:00Z",
+      "spot_price": 117900.0,
+      "total_gex": 10.0,
+      "flip_level": 116900.0,
+      "p1": 118500.0,
+      "n1": 116500.0
+    },
+    {
+      "timestamp": "2026-07-27T08:00:00Z",
+      "spot_price": 117900.0,
+      "total_gex": 10.0
+    }
+    ]
+  }
+}

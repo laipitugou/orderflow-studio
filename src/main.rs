@@ -139,6 +139,7 @@ struct Flowsurface {
     debug_terminal_compact_mode: bool,
     gex_coordinator: connector::gex::GexDataCoordinator,
     deribit_options_client: Option<exchange::options::deribit::DeribitOptionsClient>,
+    gex_monitor_client: Option<exchange::options::gex_monitor::GexMonitorClient>,
     startup_loading: StartupLoading,
     startup_main_window_target: StartupMainWindowTarget,
     closing_startup_window: Option<window::Id>,
@@ -269,6 +270,12 @@ enum Message {
     },
     Tick(std::time::Instant),
     GexFetchCompleted(connector::gex::GexFetchResult),
+    GexProxyFetchCompleted(
+        (
+            exchange::options::OptionsUnderlying,
+            Result<exchange::options::gex_monitor::GexProxyHistoryResponse, Arc<str>>,
+        ),
+    ),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),
     RestartRequested(Option<HashMap<window::Id, WindowSpec>>),
@@ -703,6 +710,13 @@ impl Flowsurface {
                     error
                 })
                 .ok();
+        let gex_monitor_client =
+            exchange::options::gex_monitor::GexMonitorClient::new(saved_state.proxy_cfg.as_ref())
+                .map_err(|error| {
+                    log::error!("GEX Monitor client initialization failed: {error}");
+                    error
+                })
+                .ok();
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state, handles.clone());
 
@@ -758,6 +772,7 @@ impl Flowsurface {
             debug_terminal_compact_mode: true,
             gex_coordinator: connector::gex::GexDataCoordinator::default(),
             deribit_options_client,
+            gex_monitor_client,
             startup_loading: StartupLoading::new(),
             startup_main_window_target,
             closing_startup_window: None,
@@ -1128,6 +1143,20 @@ impl Flowsurface {
                 } else {
                     Vec::new()
                 };
+                let proxy_tasks = if let Some(client) = self.gex_monitor_client.clone() {
+                    self.gex_coordinator
+                        .due_proxy_fetches(gex_now, true)
+                        .into_iter()
+                        .map(|underlying| {
+                            Task::perform(
+                                connector::gex::execute_proxy_fetch(client.clone(), underlying),
+                                Message::GexProxyFetchCompleted,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
 
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
@@ -1144,12 +1173,20 @@ impl Flowsurface {
                     [connectivity_task, chart_tick, startup_task]
                         .into_iter()
                         .chain(gex_tasks)
+                        .chain(proxy_tasks)
                         .collect::<Vec<_>>(),
                 );
             }
             Message::GexFetchCompleted(completion) => {
                 let now = exchange::UnixMs::now();
                 self.gex_coordinator.complete(completion, now);
+                self.sync_gex_dashboard(now);
+                self.dirty_flag.mark_dirty();
+                return Task::none();
+            }
+            Message::GexProxyFetchCompleted((underlying, result)) => {
+                let now = exchange::UnixMs::now();
+                self.gex_coordinator.complete_proxy(underlying, result, now);
                 self.sync_gex_dashboard(now);
                 self.dirty_flag.mark_dirty();
                 return Task::none();
