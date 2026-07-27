@@ -2450,6 +2450,23 @@ impl State {
     pub fn unique_id(&self) -> uuid::Uuid {
         self.id
     }
+
+    pub fn apply_synced_settings(
+        &mut self,
+        studies: &Option<data::chart::Study>,
+        clusters: &Option<data::chart::kline::ClusterKind>,
+    ) {
+        if let Some(studies) = studies {
+            self.content.update_studies(studies.clone());
+        }
+        if let Some(cluster_kind) = clusters
+            && let Content::Kline { chart, kind, .. } = &mut self.content
+            && let Some(c) = chart
+        {
+            c.set_cluster_kind(*cluster_kind);
+            *kind = c.kind.clone();
+        }
+    }
 }
 
 impl Default for State {
@@ -2876,6 +2893,16 @@ impl Content {
             | Content::Starter
             | Content::Comparison(_) => None,
             Content::Gex { .. } => None,
+        }
+    }
+
+    pub fn clusters(&self) -> Option<data::chart::kline::ClusterKind> {
+        match self {
+            Content::Kline {
+                kind: data::chart::KlineChartKind::Footprint { clusters, .. },
+                ..
+            } => Some(*clusters),
+            _ => None,
         }
     }
 
