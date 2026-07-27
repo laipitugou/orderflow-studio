@@ -134,6 +134,8 @@ impl GexSignModel {
 pub enum GexExpiryFilter {
     NextExpiry,
     OneDay,
+    TwoDays,
+    ThreeDays,
     #[default]
     SevenDays,
     ThirtyDays,
@@ -141,9 +143,11 @@ pub enum GexExpiryFilter {
 }
 
 impl GexExpiryFilter {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::NextExpiry,
         Self::OneDay,
+        Self::TwoDays,
+        Self::ThreeDays,
         Self::SevenDays,
         Self::ThirtyDays,
         Self::All,
@@ -155,6 +159,8 @@ impl std::fmt::Display for GexExpiryFilter {
         match self {
             Self::NextExpiry => f.write_str("Next expiry"),
             Self::OneDay => f.write_str("Next 1 day"),
+            Self::TwoDays => f.write_str("Next 2 days"),
+            Self::ThreeDays => f.write_str("Next 3 days"),
             Self::SevenDays => f.write_str("Next 7 days"),
             Self::ThirtyDays => f.write_str("Next 30 days"),
             Self::All => f.write_str("All expiries"),
@@ -1185,6 +1191,8 @@ fn select_contracts(
         .min();
     let max_expiry = match filter {
         GexExpiryFilter::OneDay => Some(now.saturating_add(MILLIS_PER_DAY)),
+        GexExpiryFilter::TwoDays => Some(now.saturating_add(2 * MILLIS_PER_DAY)),
+        GexExpiryFilter::ThreeDays => Some(now.saturating_add(3 * MILLIS_PER_DAY)),
         GexExpiryFilter::SevenDays => Some(now.saturating_add(7 * MILLIS_PER_DAY)),
         GexExpiryFilter::ThirtyDays => Some(now.saturating_add(30 * MILLIS_PER_DAY)),
         GexExpiryFilter::NextExpiry | GexExpiryFilter::All => None,
@@ -2562,6 +2570,8 @@ mod tests {
     fn expiry_filters_use_real_timestamps() {
         let source = chain(vec![
             contract(90.0, OptionRight::Put, 1, 1.0, 1.0),
+            contract(95.0, OptionRight::Put, 2, 1.0, 1.0),
+            contract(97.0, OptionRight::Put, 3, 1.0, 1.0),
             contract(100.0, OptionRight::Call, 7, 1.0, 1.0),
             contract(110.0, OptionRight::Call, 30, 1.0, 1.0),
         ]);
@@ -2574,12 +2584,20 @@ mod tests {
             1
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::TwoDays, 0.0, NOW).len(),
             2
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::ThirtyDays, 0.0, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::ThreeDays, 0.0, NOW).len(),
             3
+        );
+        assert_eq!(
+            select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW).len(),
+            4
+        );
+        assert_eq!(
+            select_contracts(&source, GexExpiryFilter::ThirtyDays, 0.0, NOW).len(),
+            5
         );
     }
 
