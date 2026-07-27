@@ -110,6 +110,11 @@ struct SonicTrade {
     qty: f64,
     #[serde(rename = "m")]
     is_sell: bool,
+    /// Undocumented fields observed on Binance USDⓈ-M `@trade` non-execution markers.
+    #[serde(rename = "X")]
+    execution_type: Option<String>,
+    #[serde(rename = "st")]
+    stream_status: Option<u8>,
 }
 
 impl SonicTrade {
@@ -522,6 +527,10 @@ impl WsAdapter for TradeAdapter {
                     || price.units <= 0
                     || quantity.is_zero()
                 {
+                    let is_non_execution_marker = de_trade.price == 0.0
+                        && de_trade.qty == 0.0
+                        && de_trade.execution_type.as_deref() == Some("NA")
+                        && de_trade.stream_status == Some(1);
                     let reason = if !de_trade.price.is_finite() || !de_trade.qty.is_finite() {
                         "non_finite_raw_value"
                     } else if de_trade.price <= 0.0 || de_trade.qty <= 0.0 {
@@ -532,20 +541,32 @@ impl WsAdapter for TradeAdapter {
                         "zero_normalized_quantity"
                     };
                     let public_payload = String::from_utf8_lossy(payload);
-                    log::warn!(
-                        "BINANCE InvalidTradeDiscarded | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} side={} raw_price={} raw_qty={} normalized_price={} normalized_price_units={} normalized_qty={} min_tick={:?} reason={reason} action=discarded_before_trade_buffer payload={public_payload:?}",
-                        self.market,
-                        ticker,
-                        de_trade.event_time,
-                        de_trade.time,
-                        if de_trade.is_sell { "sell" } else { "buy" },
-                        de_trade.price,
-                        de_trade.qty,
-                        price.to_f64(),
-                        price.units,
-                        quantity.to_f64(),
-                        ticker_info.min_ticksize,
-                    );
+                    if is_non_execution_marker {
+                        log::debug!(
+                            "BINANCE NonExecutionMarkerIgnored | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} execution_type=NA stream_status=1 action=discarded_before_trade_buffer",
+                            self.market,
+                            ticker,
+                            de_trade.event_time,
+                            de_trade.time,
+                        );
+                    } else {
+                        log::warn!(
+                            "BINANCE InvalidTradeDiscarded | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} side={} raw_price={} raw_qty={} normalized_price={} normalized_price_units={} normalized_qty={} min_tick={:?} execution_type={:?} stream_status={:?} reason={reason} action=discarded_before_trade_buffer payload={public_payload:?}",
+                            self.market,
+                            ticker,
+                            de_trade.event_time,
+                            de_trade.time,
+                            if de_trade.is_sell { "sell" } else { "buy" },
+                            de_trade.price,
+                            de_trade.qty,
+                            price.to_f64(),
+                            price.units,
+                            quantity.to_f64(),
+                            ticker_info.min_ticksize,
+                            de_trade.execution_type,
+                            de_trade.stream_status,
+                        );
+                    }
                     return Ok(Vec::new());
                 }
 
@@ -1244,11 +1265,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_raw_trade_is_rejected_before_all_consumers() {
+    async fn non_execution_marker_is_rejected_before_all_consumers() {
         let mut adapter = trade_adapter(ticker_info());
-        let invalid = br#"{"stream":"btcusdt@trade","data":{"E":1720000000002,"t":987654322,"T":1720000000001,"p":"0","q":"0","m":false}}"#;
+        let marker = br#"{"stream":"btcusdt@trade","data":{"E":1720000000002,"t":987654322,"T":1720000000001,"p":"0","q":"0","X":"NA","m":false,"st":1}}"#;
 
-        assert!(adapter.on_text(invalid).await.unwrap().is_empty());
+        assert!(adapter.on_text(marker).await.unwrap().is_empty());
         assert!(adapter.orderflow_trades.is_empty());
         assert!(adapter.on_tick().await.is_empty());
     }
