@@ -1,8 +1,10 @@
 use exchange::{
     TickerInfo, UnixMs,
     options::{
-        OptionRight, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
-        RawOptionContractSnapshot, gex_monitor::GexProxyHistoryPoint,
+        OptionContractMatchKey, OptionRight, OptionsProvider, OptionsUnderlying,
+        RawOptionChainSnapshot, RawOptionContractSnapshot,
+        derive::{DeriveMakerSide, DeriveMakerTrade},
+        gex_monitor::GexProxyHistoryPoint,
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -132,6 +134,8 @@ impl GexSignModel {
 pub enum GexExpiryFilter {
     NextExpiry,
     OneDay,
+    TwoDays,
+    ThreeDays,
     #[default]
     SevenDays,
     ThirtyDays,
@@ -139,9 +143,11 @@ pub enum GexExpiryFilter {
 }
 
 impl GexExpiryFilter {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::NextExpiry,
         Self::OneDay,
+        Self::TwoDays,
+        Self::ThreeDays,
         Self::SevenDays,
         Self::ThirtyDays,
         Self::All,
@@ -153,6 +159,8 @@ impl std::fmt::Display for GexExpiryFilter {
         match self {
             Self::NextExpiry => f.write_str("Next expiry"),
             Self::OneDay => f.write_str("Next 1 day"),
+            Self::TwoDays => f.write_str("Next 2 days"),
+            Self::ThreeDays => f.write_str("Next 3 days"),
             Self::SevenDays => f.write_str("Next 7 days"),
             Self::ThirtyDays => f.write_str("Next 30 days"),
             Self::All => f.write_str("All expiries"),
@@ -542,6 +550,119 @@ pub struct GexSnapshot {
     pub scale_p95: f64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ObservedGammaDirection {
+    LongGamma,
+    ShortGamma,
+    Balanced,
+    #[default]
+    Unavailable,
+}
+
+impl std::fmt::Display for ObservedGammaDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LongGamma => "Long Γ",
+            Self::ShortGamma => "Short Γ",
+            Self::Balanced => "Balanced",
+            Self::Unavailable => "Unavailable",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum FlowQuality {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+impl std::fmt::Display for FlowQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        })
+    }
+}
+
+impl std::fmt::Display for OiProxyAgreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Agree => "Agree",
+            Self::Diverge => "Diverge",
+            Self::Insufficient => "Insufficient",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct MakerGammaFlowWindow {
+    pub lookback_minutes: u16,
+    pub signed_gamma_flow_1pct: f64,
+    pub gross_gamma_flow_1pct: f64,
+    pub imbalance: f64,
+    pub matched_deribit_gex_share: f64,
+    pub trade_count: usize,
+    pub direction: ObservedGammaDirection,
+    pub quality: FlowQuality,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct DeriveMakerGammaFlow {
+    pub observed_at: UnixMs,
+    pub five_minutes: MakerGammaFlowWindow,
+    pub thirty_minutes: MakerGammaFlowWindow,
+    pub two_hours: MakerGammaFlowWindow,
+    #[serde(default)]
+    pub oi_proxy_comparison_30m: MakerGammaFlowWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OiProxyAgreement {
+    Agree,
+    Diverge,
+    Insufficient,
+}
+
+pub fn oi_proxy_agreement(
+    snapshot: &GexSnapshot,
+    flow: Option<&DeriveMakerGammaFlow>,
+) -> OiProxyAgreement {
+    let Some(flow) = flow else {
+        return OiProxyAgreement::Insufficient;
+    };
+    let window = &flow.oi_proxy_comparison_30m;
+    if window.quality == FlowQuality::Low
+        || snapshot.absolute_gex_1pct <= 0.0
+        || !snapshot.absolute_gex_1pct.is_finite()
+    {
+        return OiProxyAgreement::Insufficient;
+    }
+    let Some(net) = snapshot.net_gex_1pct.filter(|value| value.is_finite()) else {
+        return OiProxyAgreement::Insufficient;
+    };
+    if net.abs() / snapshot.absolute_gex_1pct < 0.10
+        || matches!(
+            window.direction,
+            ObservedGammaDirection::Balanced | ObservedGammaDirection::Unavailable
+        )
+    {
+        return OiProxyAgreement::Insufficient;
+    }
+    let same_sign = matches!(
+        (net.is_sign_positive(), window.direction),
+        (true, ObservedGammaDirection::LongGamma) | (false, ObservedGammaDirection::ShortGamma)
+    );
+    if same_sign {
+        OiProxyAgreement::Agree
+    } else {
+        OiProxyAgreement::Diverge
+    }
+}
+
 pub type GexHeatmapSnapshot = GexSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -555,6 +676,15 @@ pub enum GexZoneState {
     #[default]
     Active,
     Fading,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GexZoneBand {
+    pub strike: f64,
+    pub lower_price: f64,
+    pub upper_price: f64,
+    pub normalized_strength: f32,
+    pub net_gex_1pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -575,6 +705,8 @@ pub struct GexZone {
     pub state: GexZoneState,
     #[serde(default)]
     pub missing_buckets: u8,
+    #[serde(default)]
+    pub bands: Arc<[GexZoneBand]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -656,6 +788,17 @@ impl GexZone {
             && (0.0..=1.0).contains(&self.normalized_strength)
             && self.persistence_score.is_finite()
             && (0.0..=1.0).contains(&self.persistence_score)
+            && self.bands.iter().all(|band| {
+                band.strike.is_finite()
+                    && band.lower_price.is_finite()
+                    && band.upper_price.is_finite()
+                    && band.lower_price > 0.0
+                    && band.lower_price <= band.strike
+                    && band.strike <= band.upper_price
+                    && band.normalized_strength.is_finite()
+                    && (0.0..=1.0).contains(&band.normalized_strength)
+                    && band.net_gex_1pct.is_finite()
+            })
     }
 }
 
@@ -1048,6 +1191,8 @@ fn select_contracts(
         .min();
     let max_expiry = match filter {
         GexExpiryFilter::OneDay => Some(now.saturating_add(MILLIS_PER_DAY)),
+        GexExpiryFilter::TwoDays => Some(now.saturating_add(2 * MILLIS_PER_DAY)),
+        GexExpiryFilter::ThreeDays => Some(now.saturating_add(3 * MILLIS_PER_DAY)),
         GexExpiryFilter::SevenDays => Some(now.saturating_add(7 * MILLIS_PER_DAY)),
         GexExpiryFilter::ThirtyDays => Some(now.saturating_add(30 * MILLIS_PER_DAY)),
         GexExpiryFilter::NextExpiry | GexExpiryFilter::All => None,
@@ -1265,6 +1410,244 @@ fn current_contract_gex(
         }
     }
     contract_gex(contract, spot, calculated_at).map(|gex| (gex, GexGammaProvenance::Derived))
+}
+
+/// Absolute gamma exposure of one contract for a one-percent spot move.
+pub fn absolute_gamma_per_contract_1pct(gamma: f64, contract_size: f64, spot: f64) -> Option<f64> {
+    if ![gamma, contract_size, spot]
+        .iter()
+        .all(|value| value.is_finite())
+        || contract_size <= 0.0
+        || spot <= 0.0
+    {
+        return None;
+    }
+    let value = gamma.abs() * contract_size * spot * spot * 0.01;
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+pub fn calculate_derive_maker_gamma_flow(
+    chain: &RawOptionChainSnapshot,
+    trades: &[DeriveMakerTrade],
+    config: &Config,
+    observed_at: UnixMs,
+) -> DeriveMakerGammaFlow {
+    // Observed Derive flow is venue-independent evidence and must not disappear when the
+    // Deribit visualization changes its expiry or minimum-OI filters. Matching still remains
+    // exact, but it is performed against the complete non-expired Deribit chain.
+    let selected = select_contracts(chain, GexExpiryFilter::All, 0.0, observed_at);
+    let mut contracts: FxHashMap<OptionContractMatchKey, Vec<&RawOptionContractSnapshot>> =
+        FxHashMap::default();
+    let mut total_absolute_gex = 0.0;
+    for contract in selected {
+        let Some(key) = OptionContractMatchKey::new(
+            chain.underlying,
+            contract.instrument.expiration_timestamp,
+            contract.instrument.strike,
+            contract.instrument.right,
+        ) else {
+            continue;
+        };
+        if let Some((gex, _)) = current_contract_gex(
+            contract,
+            chain.source_spot,
+            observed_at,
+            config.gamma_source,
+        ) {
+            total_absolute_gex += gex;
+        }
+        contracts.entry(key).or_default().push(contract);
+    }
+    let calculate = |minutes| {
+        calculate_flow_window(
+            minutes,
+            trades,
+            &contracts,
+            chain.source_spot,
+            total_absolute_gex,
+            config.gamma_source,
+            observed_at,
+        )
+    };
+    let comparison_selected = select_contracts(
+        chain,
+        config.expiry_filter,
+        config.min_open_interest,
+        observed_at,
+    );
+    let mut comparison_contracts: FxHashMap<
+        OptionContractMatchKey,
+        Vec<&RawOptionContractSnapshot>,
+    > = FxHashMap::default();
+    let mut comparison_absolute_gex = 0.0;
+    for contract in comparison_selected {
+        let Some(key) = OptionContractMatchKey::new(
+            chain.underlying,
+            contract.instrument.expiration_timestamp,
+            contract.instrument.strike,
+            contract.instrument.right,
+        ) else {
+            continue;
+        };
+        let Some((gex, _)) = current_contract_gex(
+            contract,
+            chain.source_spot,
+            observed_at,
+            config.gamma_source,
+        ) else {
+            continue;
+        };
+        if gex < config.min_absolute_gex {
+            continue;
+        }
+        comparison_absolute_gex += gex;
+        comparison_contracts.entry(key).or_default().push(contract);
+    }
+    DeriveMakerGammaFlow {
+        observed_at,
+        five_minutes: calculate(5),
+        thirty_minutes: calculate(30),
+        two_hours: calculate(120),
+        oi_proxy_comparison_30m: calculate_flow_window(
+            30,
+            trades,
+            &comparison_contracts,
+            chain.source_spot,
+            comparison_absolute_gex,
+            config.gamma_source,
+            observed_at,
+        ),
+    }
+}
+
+fn calculate_flow_window(
+    lookback_minutes: u16,
+    trades: &[DeriveMakerTrade],
+    contracts: &FxHashMap<OptionContractMatchKey, Vec<&RawOptionContractSnapshot>>,
+    spot: f64,
+    total_absolute_gex: f64,
+    gamma_source: GexGammaSource,
+    observed_at: UnixMs,
+) -> MakerGammaFlowWindow {
+    const MAX_EXPIRY_DIFFERENCE_MS: u64 = 12 * 60 * 60 * 1_000;
+    let cutoff = observed_at.saturating_sub(u64::from(lookback_minutes) * 60 * 1_000);
+    let mut signed = 0.0;
+    let mut gross = 0.0;
+    let mut trade_count = 0usize;
+    let mut matched_contracts = FxHashSet::default();
+    for trade in trades
+        .iter()
+        .filter(|trade| trade.timestamp >= cutoff && trade.timestamp <= observed_at)
+    {
+        let Some(candidates) = contracts.get(&trade.key) else {
+            continue;
+        };
+        let Some(contract) = candidates
+            .iter()
+            .copied()
+            .filter(|contract| {
+                contract
+                    .instrument
+                    .expiration_timestamp
+                    .as_u64()
+                    .abs_diff(trade.expiration_timestamp.as_u64())
+                    <= MAX_EXPIRY_DIFFERENCE_MS
+            })
+            .min_by_key(|contract| {
+                contract
+                    .instrument
+                    .expiration_timestamp
+                    .as_u64()
+                    .abs_diff(trade.expiration_timestamp.as_u64())
+            })
+        else {
+            continue;
+        };
+        let gamma = current_contract_gamma(contract, spot, observed_at, gamma_source);
+        let Some(per_contract) = gamma.and_then(|gamma| {
+            absolute_gamma_per_contract_1pct(gamma, contract.instrument.contract_size, spot)
+        }) else {
+            continue;
+        };
+        let trade_gamma = per_contract * trade.amount;
+        if !trade_gamma.is_finite() {
+            continue;
+        }
+        signed += match trade.side {
+            DeriveMakerSide::Buy => trade_gamma,
+            DeriveMakerSide::Sell => -trade_gamma,
+        };
+        gross += trade_gamma.abs();
+        trade_count += 1;
+        matched_contracts.insert(contract.instrument.instrument_name.as_str());
+    }
+    let matched_gex = contracts
+        .values()
+        .flatten()
+        .filter(|contract| matched_contracts.contains(contract.instrument.instrument_name.as_str()))
+        .filter_map(|contract| {
+            current_contract_gex(contract, spot, observed_at, gamma_source).map(|value| value.0)
+        })
+        .sum::<f64>();
+    let matched_share = if total_absolute_gex > 0.0 {
+        (matched_gex / total_absolute_gex).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let imbalance = if gross > 0.0 { signed / gross } else { 0.0 };
+    let direction = if gross == 0.0 {
+        ObservedGammaDirection::Unavailable
+    } else if imbalance >= 0.20 {
+        ObservedGammaDirection::LongGamma
+    } else if imbalance <= -0.20 {
+        ObservedGammaDirection::ShortGamma
+    } else {
+        ObservedGammaDirection::Balanced
+    };
+    let quality = if trade_count >= 5 && matched_share >= 0.10 && imbalance.abs() >= 0.35 {
+        FlowQuality::High
+    } else if trade_count >= 3 && matched_share >= 0.03 && imbalance.abs() >= 0.20 {
+        FlowQuality::Medium
+    } else {
+        FlowQuality::Low
+    };
+    MakerGammaFlowWindow {
+        lookback_minutes,
+        signed_gamma_flow_1pct: signed,
+        gross_gamma_flow_1pct: gross,
+        imbalance,
+        matched_deribit_gex_share: matched_share,
+        trade_count,
+        direction,
+        quality,
+    }
+}
+
+fn current_contract_gamma(
+    contract: &RawOptionContractSnapshot,
+    spot: f64,
+    observed_at: UnixMs,
+    source: GexGammaSource,
+) -> Option<f64> {
+    if source == GexGammaSource::ProviderNativePreferred
+        && let (Some(gamma), Some(gamma_at)) = (
+            contract.market.native_gamma,
+            contract.market.native_gamma_observed_at,
+        )
+        && gamma.is_finite()
+        && observed_at.saturating_diff(gamma_at) <= NATIVE_GAMMA_MAX_AGE_MS
+    {
+        return Some(gamma.abs());
+    }
+    let years = years_to_expiry(contract.instrument.expiration_timestamp, observed_at)?;
+    let volatility = iv_percent_to_decimal(contract.market.mark_iv_percent)?;
+    black_scholes_gamma(
+        spot,
+        contract.instrument.strike,
+        years,
+        contract.market.interest_rate,
+        volatility,
+    )
 }
 
 fn gamma_provenance(native: usize, derived: usize) -> GexGammaProvenance {
@@ -1512,16 +1895,6 @@ fn zone_from_cluster(
     cluster: &[ZoneStrike<'_>],
     fallback_gap: f64,
 ) -> GexZone {
-    let local_gap = median(
-        &cluster
-            .iter()
-            .map(|value| value.local_gap)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(fallback_gap)
-    .max(f64::EPSILON);
-    let first = cluster.first().expect("non-empty GEX cluster");
-    let last = cluster.last().expect("non-empty GEX cluster");
     let peak = cluster
         .iter()
         .max_by(|a, b| {
@@ -1536,19 +1909,37 @@ fn zone_from_cluster(
                 .then_with(|| b.strike.strike.total_cmp(&a.strike.strike))
         })
         .expect("non-empty GEX cluster");
-    let (lower_price, upper_price) = if cluster.len() == 1 {
-        let half_width = (0.08 * local_gap).clamp(
-            snapshot.source_spot * 0.00025,
-            snapshot.source_spot * 0.0008,
-        );
-        (
-            first.strike.strike - half_width,
-            first.strike.strike + half_width,
-        )
-    } else {
-        let padding = (0.20 * local_gap).min(snapshot.source_spot * 0.001);
-        (first.strike.strike - padding, last.strike.strike + padding)
-    };
+    let bands = cluster
+        .iter()
+        .map(|value| {
+            let local_gap = if value.local_gap.is_finite() && value.local_gap > 0.0 {
+                value.local_gap
+            } else {
+                fallback_gap
+            };
+            let half_width = (0.18 * local_gap).clamp(
+                snapshot.source_spot * 0.00025,
+                snapshot.source_spot * 0.0015,
+            );
+            GexZoneBand {
+                strike: value.strike.strike,
+                lower_price: value.strike.strike - half_width,
+                upper_price: value.strike.strike + half_width,
+                normalized_strength: value.strength,
+                net_gex_1pct: value.strike.net_gex_1pct,
+            }
+        })
+        .collect::<Vec<_>>();
+    let lower_price = bands
+        .iter()
+        .map(|band| band.lower_price)
+        .min_by(f64::total_cmp)
+        .expect("non-empty GEX cluster bands");
+    let upper_price = bands
+        .iter()
+        .map(|band| band.upper_price)
+        .max_by(f64::total_cmp)
+        .expect("non-empty GEX cluster bands");
     let net_gex_1pct = cluster.iter().map(|value| value.strike.net_gex_1pct).sum();
     let absolute_gex_1pct = cluster
         .iter()
@@ -1601,6 +1992,7 @@ fn zone_from_cluster(
         gamma_provenance,
         state: GexZoneState::Active,
         missing_buckets: 0,
+        bands: bands.into(),
     }
 }
 
@@ -2002,7 +2394,10 @@ pub fn dominant_expiry(values: &[GexExpiryStrike], strike: f64) -> Option<(UnixM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::options::{OptionInstrument, OptionMarketPoint};
+    use exchange::options::{
+        OptionInstrument, OptionMarketPoint,
+        derive::{DeriveMakerSide, DeriveMakerTrade},
+    };
 
     const NOW: UnixMs = UnixMs::new(1_700_000_000_000);
 
@@ -2175,6 +2570,8 @@ mod tests {
     fn expiry_filters_use_real_timestamps() {
         let source = chain(vec![
             contract(90.0, OptionRight::Put, 1, 1.0, 1.0),
+            contract(95.0, OptionRight::Put, 2, 1.0, 1.0),
+            contract(97.0, OptionRight::Put, 3, 1.0, 1.0),
             contract(100.0, OptionRight::Call, 7, 1.0, 1.0),
             contract(110.0, OptionRight::Call, 30, 1.0, 1.0),
         ]);
@@ -2187,12 +2584,20 @@ mod tests {
             1
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::TwoDays, 0.0, NOW).len(),
             2
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::ThirtyDays, 0.0, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::ThreeDays, 0.0, NOW).len(),
             3
+        );
+        assert_eq!(
+            select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW).len(),
+            4
+        );
+        assert_eq!(
+            select_contracts(&source, GexExpiryFilter::ThirtyDays, 0.0, NOW).len(),
+            5
         );
     }
 
@@ -2679,8 +3084,34 @@ mod tests {
 
         let cluster = zone_snapshot(300_001, &[(69_000.0, 8.0), (70_000.0, 10.0)]);
         let zone = extract_gex_zones(&cluster, 0.12, 6, 6).remove(0);
-        assert!(69_000.0 - zone.lower_price <= 100.0);
-        assert!(zone.upper_price - 70_000.0 <= 100.0);
+        assert_eq!(zone.lower_price, zone.bands[0].lower_price);
+        assert_eq!(zone.upper_price, zone.bands[1].upper_price);
+        assert!(zone.bands[0].upper_price < zone.bands[1].lower_price);
+    }
+
+    #[test]
+    fn zone_cluster_builds_distinct_strike_weighted_bands() {
+        let snapshot = zone_snapshot(
+            300_001,
+            &[(65_000.0, 3.0), (66_000.0, 6.0), (67_000.0, 10.0)],
+        );
+        let zone = extract_gex_zones(&snapshot, 0.12, 6, 6).remove(0);
+
+        assert_eq!(zone.bands.len(), 3);
+        assert!(
+            zone.bands
+                .windows(2)
+                .all(|pair| pair[0].upper_price < pair[1].lower_price)
+        );
+        let weak = zone
+            .bands
+            .iter()
+            .find(|band| band.strike == 65_000.0)
+            .expect("65k band");
+        let expected_weak = ((3.0_f64 / 10.0).asinh() / 1.0_f64.asinh()) as f32;
+        assert!((weak.normalized_strength - expected_weak).abs() < 1.0e-6);
+        assert!(weak.normalized_strength < zone.normalized_strength);
+        assert_eq!(zone.peak_price, 67_000.0);
     }
 
     #[test]
@@ -2930,6 +3361,258 @@ mod tests {
                 .scenario_curve
                 .iter()
                 .all(|point| point.absolute_gex_1pct >= 0.0)
+        );
+    }
+
+    fn maker_trade(
+        id: &str,
+        contract: &RawOptionContractSnapshot,
+        timestamp: UnixMs,
+        side: DeriveMakerSide,
+    ) -> DeriveMakerTrade {
+        DeriveMakerTrade {
+            trade_id: id.to_owned(),
+            key: OptionContractMatchKey::new(
+                contract.instrument.underlying,
+                contract.instrument.expiration_timestamp,
+                contract.instrument.strike,
+                contract.instrument.right,
+            )
+            .expect("match key"),
+            expiration_timestamp: contract.instrument.expiration_timestamp,
+            timestamp,
+            side,
+            amount: 1.0,
+            mark_price: 1.0,
+            index_price: 100.0,
+        }
+    }
+
+    #[test]
+    fn derive_flow_matches_exact_contracts_and_deduplicates_matched_share() {
+        let mut call = contract(100.0, OptionRight::Call, 7, 10.0, 1.0);
+        call.market.native_gamma = Some(0.01);
+        call.market.native_gamma_observed_at = Some(NOW);
+        let mut put = contract(100.0, OptionRight::Put, 7, 10.0, 1.0);
+        put.market.native_gamma = Some(0.01);
+        put.market.native_gamma_observed_at = Some(NOW);
+        let source = chain(vec![call.clone(), put.clone()]);
+        let trades = (0..5)
+            .map(|index| {
+                maker_trade(
+                    &format!("buy-{index}"),
+                    &call,
+                    NOW.saturating_sub(60_000 + index * 1_000),
+                    DeriveMakerSide::Buy,
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = calculate_derive_maker_gamma_flow(&source, &trades, &Config::default(), NOW);
+        assert_eq!(flow.five_minutes.trade_count, 5);
+        assert_eq!(
+            flow.thirty_minutes.direction,
+            ObservedGammaDirection::LongGamma
+        );
+        assert_eq!(flow.thirty_minutes.quality, FlowQuality::High);
+        assert!((flow.thirty_minutes.imbalance - 1.0).abs() < f64::EPSILON);
+        assert!((flow.thirty_minutes.matched_deribit_gex_share - 0.5).abs() < 1.0e-12);
+
+        let mut nearest = maker_trade(
+            "nearest-is-forbidden",
+            &call,
+            NOW.saturating_sub(1_000),
+            DeriveMakerSide::Buy,
+        );
+        nearest.key.strike_cents += 1;
+        let mut beyond_expiry = maker_trade(
+            "expiry-too-far",
+            &call,
+            NOW.saturating_sub(1_000),
+            DeriveMakerSide::Buy,
+        );
+        beyond_expiry.expiration_timestamp = call
+            .instrument
+            .expiration_timestamp
+            .saturating_sub(13 * 60 * 60 * 1_000);
+        let unmatched = calculate_derive_maker_gamma_flow(
+            &source,
+            &[nearest, beyond_expiry],
+            &Config::default(),
+            NOW,
+        );
+        assert_eq!(unmatched.thirty_minutes.trade_count, 0);
+        assert_eq!(
+            unmatched.thirty_minutes.direction,
+            ObservedGammaDirection::Unavailable
+        );
+    }
+
+    #[test]
+    fn maker_side_sign_is_identical_for_calls_and_puts_and_windows_are_bounded() {
+        let call = contract(100.0, OptionRight::Call, 7, 10.0, 1.0);
+        let put = contract(100.0, OptionRight::Put, 7, 10.0, 1.0);
+        let source = chain(vec![call.clone(), put.clone()]);
+        for contract in [&call, &put] {
+            let buy = calculate_derive_maker_gamma_flow(
+                &source,
+                &[maker_trade(
+                    "buy",
+                    contract,
+                    NOW.saturating_sub(1_000),
+                    DeriveMakerSide::Buy,
+                )],
+                &Config::default(),
+                NOW,
+            );
+            assert!(buy.five_minutes.signed_gamma_flow_1pct > 0.0);
+            let sell = calculate_derive_maker_gamma_flow(
+                &source,
+                &[maker_trade(
+                    "sell",
+                    contract,
+                    NOW.saturating_sub(1_000),
+                    DeriveMakerSide::Sell,
+                )],
+                &Config::default(),
+                NOW,
+            );
+            assert!(sell.five_minutes.signed_gamma_flow_1pct < 0.0);
+        }
+        let trades = [
+            maker_trade(
+                "recent",
+                &call,
+                NOW.saturating_sub(4 * 60_000),
+                DeriveMakerSide::Buy,
+            ),
+            maker_trade(
+                "mid",
+                &call,
+                NOW.saturating_sub(20 * 60_000),
+                DeriveMakerSide::Buy,
+            ),
+            maker_trade(
+                "old",
+                &call,
+                NOW.saturating_sub(90 * 60_000),
+                DeriveMakerSide::Sell,
+            ),
+        ];
+        let flow = calculate_derive_maker_gamma_flow(&source, &trades, &Config::default(), NOW);
+        assert_eq!(flow.five_minutes.trade_count, 1);
+        assert_eq!(flow.thirty_minutes.trade_count, 2);
+        assert_eq!(flow.two_hours.trade_count, 3);
+
+        let classified = [
+            maker_trade("m1", &call, NOW.saturating_sub(1_000), DeriveMakerSide::Buy),
+            maker_trade("m2", &call, NOW.saturating_sub(2_000), DeriveMakerSide::Buy),
+            maker_trade("m3", &call, NOW.saturating_sub(3_000), DeriveMakerSide::Buy),
+            maker_trade(
+                "m4",
+                &call,
+                NOW.saturating_sub(4_000),
+                DeriveMakerSide::Sell,
+            ),
+        ];
+        let medium =
+            calculate_derive_maker_gamma_flow(&source, &classified, &Config::default(), NOW);
+        assert_eq!(
+            medium.thirty_minutes.direction,
+            ObservedGammaDirection::LongGamma
+        );
+        assert_eq!(medium.thirty_minutes.quality, FlowQuality::Medium);
+        let balanced =
+            calculate_derive_maker_gamma_flow(&source, &classified[2..], &Config::default(), NOW);
+        assert_eq!(
+            balanced.thirty_minutes.direction,
+            ObservedGammaDirection::Balanced
+        );
+        assert_eq!(balanced.thirty_minutes.quality, FlowQuality::Low);
+    }
+
+    #[test]
+    fn derive_flow_is_independent_from_deribit_visual_filters() {
+        let contract = contract(100.0, OptionRight::Call, 14, 10.0, 1.0);
+        let source = chain(vec![contract.clone()]);
+        let trade = maker_trade(
+            "outside-visible-expiry",
+            &contract,
+            NOW.saturating_sub(1_000),
+            DeriveMakerSide::Buy,
+        );
+        let restrictive = Config {
+            expiry_filter: GexExpiryFilter::OneDay,
+            min_open_interest: f64::MAX,
+            ..Config::default()
+        };
+
+        let flow = calculate_derive_maker_gamma_flow(&source, &[trade], &restrictive, NOW);
+
+        assert_eq!(flow.five_minutes.trade_count, 1);
+        assert_eq!(
+            flow.five_minutes.direction,
+            ObservedGammaDirection::LongGamma
+        );
+        assert_eq!(flow.oi_proxy_comparison_30m.trade_count, 0);
+        assert_eq!(
+            flow.oi_proxy_comparison_30m.direction,
+            ObservedGammaDirection::Unavailable
+        );
+        let snapshot = calculate_gex_at(&source, &restrictive, NOW);
+        assert_eq!(
+            oi_proxy_agreement(&snapshot, Some(&flow)),
+            OiProxyAgreement::Insufficient
+        );
+    }
+
+    #[test]
+    fn agreement_and_derive_calculation_leave_deribit_structure_unchanged() {
+        let call = contract(90.0, OptionRight::Call, 7, 20.0, 1.0);
+        let put = contract(110.0, OptionRight::Put, 7, 5.0, 1.0);
+        let source = chain(vec![call.clone(), put]);
+        let config = Config::default();
+        let before = calculate_gex_at(&source, &config, NOW);
+        let zones_before = build_gex_zone_frames(
+            &[Arc::new(before.clone())],
+            300_000,
+            &GexLevelsConfig::default(),
+        );
+        let trades = (0..5)
+            .map(|index| {
+                maker_trade(
+                    &format!("agreement-{index}"),
+                    &call,
+                    NOW.saturating_sub(index * 1_000),
+                    DeriveMakerSide::Buy,
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = calculate_derive_maker_gamma_flow(&source, &trades, &config, NOW);
+        let after = calculate_gex_at(&source, &config, NOW);
+        assert_eq!(before, after);
+        assert_eq!(
+            zones_before,
+            build_gex_zone_frames(
+                &[Arc::new(after.clone())],
+                300_000,
+                &GexLevelsConfig::default(),
+            )
+        );
+        assert_eq!(
+            oi_proxy_agreement(&before, Some(&flow)),
+            OiProxyAgreement::Agree
+        );
+
+        let mut opposite = flow.clone();
+        opposite.oi_proxy_comparison_30m.direction = ObservedGammaDirection::ShortGamma;
+        assert_eq!(
+            oi_proxy_agreement(&before, Some(&opposite)),
+            OiProxyAgreement::Diverge
+        );
+        opposite.oi_proxy_comparison_30m.quality = FlowQuality::Low;
+        assert_eq!(
+            oi_proxy_agreement(&before, Some(&opposite)),
+            OiProxyAgreement::Insufficient
         );
     }
 }

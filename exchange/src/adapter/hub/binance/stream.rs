@@ -110,6 +110,11 @@ struct SonicTrade {
     qty: f64,
     #[serde(rename = "m")]
     is_sell: bool,
+    /// Undocumented fields observed on Binance USDⓈ-M `@trade` non-execution markers.
+    #[serde(rename = "X")]
+    execution_type: Option<String>,
+    #[serde(rename = "st")]
+    stream_status: Option<u8>,
 }
 
 impl SonicTrade {
@@ -513,13 +518,64 @@ impl WsAdapter for TradeAdapter {
                 };
                 let price =
                     Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize);
+                let quantity = qty_norm.normalize_qty(de_trade.qty, de_trade.price);
+
+                if !de_trade.price.is_finite()
+                    || de_trade.price <= 0.0
+                    || !de_trade.qty.is_finite()
+                    || de_trade.qty <= 0.0
+                    || price.units <= 0
+                    || quantity.is_zero()
+                {
+                    let is_non_execution_marker = de_trade.price == 0.0
+                        && de_trade.qty == 0.0
+                        && de_trade.execution_type.as_deref() == Some("NA")
+                        && de_trade.stream_status == Some(1);
+                    let reason = if !de_trade.price.is_finite() || !de_trade.qty.is_finite() {
+                        "non_finite_raw_value"
+                    } else if de_trade.price <= 0.0 || de_trade.qty <= 0.0 {
+                        "non_positive_raw_value"
+                    } else if price.units <= 0 {
+                        "non_positive_normalized_price"
+                    } else {
+                        "zero_normalized_quantity"
+                    };
+                    let public_payload = String::from_utf8_lossy(payload);
+                    if is_non_execution_marker {
+                        log::debug!(
+                            "BINANCE NonExecutionMarkerIgnored | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} execution_type=NA stream_status=1 action=discarded_before_trade_buffer",
+                            self.market,
+                            ticker,
+                            de_trade.event_time,
+                            de_trade.time,
+                        );
+                    } else {
+                        log::warn!(
+                            "BINANCE InvalidTradeDiscarded | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} side={} raw_price={} raw_qty={} normalized_price={} normalized_price_units={} normalized_qty={} min_tick={:?} execution_type={:?} stream_status={:?} reason={reason} action=discarded_before_trade_buffer payload={public_payload:?}",
+                            self.market,
+                            ticker,
+                            de_trade.event_time,
+                            de_trade.time,
+                            if de_trade.is_sell { "sell" } else { "buy" },
+                            de_trade.price,
+                            de_trade.qty,
+                            price.to_f64(),
+                            price.units,
+                            quantity.to_f64(),
+                            ticker_info.min_ticksize,
+                            de_trade.execution_type,
+                            de_trade.stream_status,
+                        );
+                    }
+                    return Ok(Vec::new());
+                }
 
                 let trade = Trade {
                     id: Some(trade_id),
                     time: de_trade.time.into(),
                     is_sell: de_trade.is_sell,
                     price,
-                    qty: qty_norm.normalize_qty(de_trade.qty, de_trade.price),
+                    qty: quantity,
                 };
 
                 if stream_kind == TradeStreamKind::Raw
@@ -1132,6 +1188,30 @@ mod tests {
         )
     }
 
+    fn trade_adapter(ticker_info: TickerInfo) -> TradeAdapter {
+        let ticker_info_map = [(
+            ticker_info.ticker,
+            (
+                ticker_info,
+                QtyNormalization::with_raw_qty_unit(
+                    false,
+                    ticker_info,
+                    raw_qty_unit_from_market_type(MarketKind::LinearPerps),
+                ),
+            ),
+        )]
+        .into_iter()
+        .collect();
+        TradeAdapter {
+            market: MarketKind::LinearPerps,
+            buffer: TradeBuffer::new(ticker_info_map),
+            orderflow_trades: Vec::new(),
+            logged_first_raw_batch: false,
+            stream: "btcusdt@trade".to_string(),
+            proxy_cfg: None,
+        }
+    }
+
     #[test]
     fn parses_raw_trade_id_times_and_maker_semantics() {
         let payload = include_bytes!("../../../../tests/fixtures/binance_raw_trade.json");
@@ -1159,27 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn raw_trade_feeds_legacy_and_detector_batches() {
         let ticker_info = ticker_info();
-        let ticker_info_map = [(
-            ticker_info.ticker,
-            (
-                ticker_info,
-                QtyNormalization::with_raw_qty_unit(
-                    false,
-                    ticker_info,
-                    raw_qty_unit_from_market_type(MarketKind::LinearPerps),
-                ),
-            ),
-        )]
-        .into_iter()
-        .collect();
-        let mut adapter = TradeAdapter {
-            market: MarketKind::LinearPerps,
-            buffer: TradeBuffer::new(ticker_info_map),
-            orderflow_trades: Vec::new(),
-            logged_first_raw_batch: false,
-            stream: "btcusdt@trade".to_string(),
-            proxy_cfg: None,
-        };
+        let mut adapter = trade_adapter(ticker_info);
         let raw = include_bytes!("../../../../tests/fixtures/binance_raw_trade.json");
         let StreamData::Trade(raw_ticker, _, raw_kind) =
             feed_de(raw, MarketKind::LinearPerps).unwrap()
@@ -1202,6 +1262,16 @@ mod tests {
         assert_eq!(trades[0].id, Some(987_654_321));
         assert_eq!(raw_trades.len(), 1);
         assert_eq!(raw_trades[0].trade_id, 987_654_321);
+    }
+
+    #[tokio::test]
+    async fn non_execution_marker_is_rejected_before_all_consumers() {
+        let mut adapter = trade_adapter(ticker_info());
+        let marker = br#"{"stream":"btcusdt@trade","data":{"E":1720000000002,"t":987654322,"T":1720000000001,"p":"0","q":"0","X":"NA","m":false,"st":1}}"#;
+
+        assert!(adapter.on_text(marker).await.unwrap().is_empty());
+        assert!(adapter.orderflow_trades.is_empty());
+        assert!(adapter.on_tick().await.is_empty());
     }
 
     #[test]

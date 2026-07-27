@@ -41,15 +41,51 @@ use std::{cell::RefCell, sync::Arc, time::Instant};
 const MAX_RAW_TRADES: usize = 50_000;
 const MAX_LIVE_TRADE_BUCKETS: usize = 4_096;
 
-fn deduplicate_incoming_trades(existing: &[Trade], incoming: &[Trade]) -> Vec<Trade> {
-    let invalid_price_count = incoming
+fn deduplicate_incoming_trades(
+    existing: &[Trade],
+    incoming: &[Trade],
+    source: &'static str,
+    ticker_info: Option<TickerInfo>,
+) -> Vec<Trade> {
+    let invalid_prices = incoming
         .iter()
         .filter(|trade| trade.price.units <= 0)
-        .count();
+        .collect::<Vec<_>>();
+    let invalid_price_count = invalid_prices.len();
     if invalid_price_count > 0 {
+        // Keep a small sample in the warning so a venue/parser problem can be traced without
+        // dumping the full batch or any account-related data into the log.
+        let samples = invalid_prices
+            .iter()
+            .take(3)
+            .map(|trade| {
+                format!(
+                    "id={} timestamp_ms={} side={} price={} price_units={} qty={}",
+                    trade.id.map_or_else(|| "none".into(), |id| id.to_string()),
+                    trade.time.as_u64(),
+                    if trade.is_sell { "sell" } else { "buy" },
+                    trade.price.to_f64(),
+                    trade.price.units,
+                    trade.qty.to_f64()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (ticker, exchange, market) = ticker_info.map_or_else(
+            || ("unknown".into(), "unknown".into(), "unknown".into()),
+            |info| {
+                (
+                    info.ticker.to_string(),
+                    format!("{:?}", info.exchange()),
+                    format!("{:?}", info.market_type()),
+                )
+            },
+        );
         log::warn!(
-            "TRADE InvalidPriceDiscarded | count={invalid_price_count} batch_len={} reason=non_positive_price",
-            incoming.len()
+            "TRADE InvalidPriceDiscarded | source={source} exchange={exchange} ticker={ticker} market={market} count={invalid_price_count} batch_len={} batch_first_ms={} batch_last_ms={} samples=[{samples}] reason=non_positive_execution_price action=discarded_before_chart_aggregation",
+            incoming.len(),
+            incoming.first().map_or(0, |trade| trade.time.as_u64()),
+            incoming.last().map_or(0, |trade| trade.time.as_u64())
         );
     }
 
@@ -241,6 +277,8 @@ pub struct KlineChart {
     gex_proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
     gex_proxy_freshness: data::chart::gex::GexFreshness,
     gex_proxy_error: Option<Arc<str>>,
+    derive_flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>,
+    derive_freshness: data::chart::gex::GexFreshness,
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
@@ -276,7 +314,8 @@ impl KlineChart {
         let mut visual_config = visual_config.unwrap_or_default();
         visual_config.migrate_legacy_indicator_configs();
         let kind = kind.clone();
-        let raw_trades = deduplicate_incoming_trades(&[], &raw_trades);
+        let raw_trades =
+            deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
 
         match basis {
             Basis::Time(interval) => {
@@ -372,6 +411,8 @@ impl KlineChart {
                     gex_proxy_history: Vec::new(),
                     gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_proxy_error: None,
+                    derive_flow: None,
+                    derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -446,6 +487,8 @@ impl KlineChart {
                     gex_proxy_history: Vec::new(),
                     gex_proxy_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_proxy_error: None,
+                    derive_flow: None,
+                    derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
@@ -1426,6 +1469,8 @@ impl KlineChart {
         proxy_history: Vec<Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>>,
         proxy_freshness: data::chart::gex::GexFreshness,
         proxy_error: Option<Arc<str>>,
+        derive_flow: Option<Arc<data::chart::gex::DeriveMakerGammaFlow>>,
+        derive_freshness: data::chart::gex::GexFreshness,
     ) {
         let unchanged = self.gex_snapshot.as_ref().map(|value| value.observed_at)
             == snapshot.as_ref().map(|value| value.observed_at)
@@ -1440,6 +1485,10 @@ impl KlineChart {
                 == proxy_history.last().map(|value| value.observed_at)
             && self.gex_proxy_freshness == proxy_freshness
             && self.gex_proxy_error == proxy_error;
+        let unchanged = unchanged
+            && self.derive_flow.as_ref().map(|flow| flow.observed_at)
+                == derive_flow.as_ref().map(|flow| flow.observed_at)
+            && self.derive_freshness == derive_freshness;
         if unchanged {
             return;
         }
@@ -1450,6 +1499,8 @@ impl KlineChart {
         self.gex_proxy_history = proxy_history;
         self.gex_proxy_freshness = proxy_freshness;
         self.gex_proxy_error = proxy_error;
+        self.derive_flow = derive_flow;
+        self.derive_freshness = derive_freshness;
         self.chart.cache.clear_all();
     }
 
@@ -1656,7 +1707,12 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
-        let buffer = deduplicate_incoming_trades(&self.raw_trades, buffer);
+        let buffer = deduplicate_incoming_trades(
+            &self.raw_trades,
+            buffer,
+            "live_stream",
+            Some(self.chart.ticker_info),
+        );
         if self.chart.ticker_info.exchange() == exchange::adapter::Exchange::BinanceLinear
             && let PlotData::TimeBased(timeseries) = &self.data_source
         {
@@ -1737,7 +1793,12 @@ impl KlineChart {
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let received_size = raw_trades.len();
-        let raw_trades = deduplicate_incoming_trades(&self.raw_trades, &raw_trades);
+        let raw_trades = deduplicate_incoming_trades(
+            &self.raw_trades,
+            &raw_trades,
+            "historical_fetch",
+            Some(self.chart.ticker_info),
+        );
         let (raw_trades, live_overlap_discarded) = match &self.data_source {
             PlotData::TimeBased(timeseries) => exclude_historical_overlap_with_live(
                 raw_trades,
@@ -2612,6 +2673,7 @@ impl canvas::Program<Message> for KlineChart {
                             snapshot,
                             &self.gex_history,
                             self.gex_freshness,
+                            self.derive_flow.as_deref(),
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
                             chart.tick_size,
@@ -2672,6 +2734,7 @@ impl canvas::Program<Message> for KlineChart {
                         &self.gex_history,
                         &self.gex_proxy_history,
                         self.gex_freshness,
+                        self.derive_flow.as_deref(),
                         &self.gex_render_cache,
                         &self.visual_config.gex_levels(),
                         cursor_position,
@@ -2732,6 +2795,7 @@ fn draw_gex_hover_tooltip(
     history: &[Arc<data::chart::gex::GexSnapshot>],
     proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
     freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2755,6 +2819,7 @@ fn draw_gex_hover_tooltip(
         chart,
         history,
         freshness,
+        derive_flow,
         render_cache,
         config,
         cursor,
@@ -2838,6 +2903,7 @@ fn draw_gex_zone_tooltip(
     chart: &ViewState,
     history: &[Arc<data::chart::gex::GexSnapshot>],
     freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2856,8 +2922,7 @@ fn draw_gex_zone_tooltip(
         Basis::Time(interval) => interval.to_milliseconds(),
         Basis::Tick(_) => 60_000,
     };
-    let region = chart.visible_region(bounds);
-    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache, region);
+    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache);
     let bucket =
         data::chart::gex::gex_bucket_start(UnixMs::new(chart.x_to_interval(world.x)), bucket_ms);
     let frame_index = frames.partition_point(|value| value.bucket_start < bucket);
@@ -2903,12 +2968,7 @@ fn draw_gex_zone_tooltip(
             format!("Gamma: {}", strike.gamma_provenance),
         ]);
     } else {
-        let Some(zone) = zone_frame
-            .zones
-            .iter()
-            .filter(|zone| hovered_price >= zone.lower_price && hovered_price <= zone.upper_price)
-            .max_by(|a, b| zone_alpha(a).total_cmp(&zone_alpha(b)))
-        else {
+        let Some((zone, band)) = gex_zone_band_hit_test(zone_frame, hovered_price) else {
             return false;
         };
         let label = match zone.sign {
@@ -2917,10 +2977,15 @@ fn draw_gex_zone_tooltip(
         };
         lines.extend([
             label.to_owned(),
-            format!("Range: ${:.0} – ${:.0}", zone.lower_price, zone.upper_price),
-            format!("Peak: ${:.0}", zone.peak_price),
-            format!("Net GEX: {:+.2}", zone.net_gex_1pct),
-            format!("Strength: {:.0}%", zone.normalized_strength * 100.0),
+            format!("Local strike: ${:.0}", band.strike),
+            format!(
+                "Local range: ${:.0} – ${:.0}",
+                band.lower_price, band.upper_price
+            ),
+            format!("Local strength: {:.0}%", band.normalized_strength * 100.0),
+            format!("Local Net GEX: {:+.2}", band.net_gex_1pct),
+            format!("Zone peak: ${:.0}", zone.peak_price),
+            format!("Peak strength: {:.0}%", zone.normalized_strength * 100.0),
             format!("Persistence: {:.0}%", zone.persistence_score * 100.0),
             format!(
                 "Dominant expiry: {}",
@@ -2932,6 +2997,21 @@ fn draw_gex_zone_tooltip(
             format!("Last update: {} UTC", zone.observed_at.as_u64()),
             format!("Freshness: {freshness:?}"),
         ]);
+    }
+    if let Some(flow) = derive_flow {
+        let window = &flow.thirty_minutes;
+        if window.direction != data::chart::gex::ObservedGammaDirection::Unavailable {
+            lines.extend([
+                format!("Derive observed maker flow: {}", window.direction),
+                format!("30m imbalance: {:+.0}%", window.imbalance * 100.0),
+                format!(
+                    "Matched share: {:.0}%",
+                    window.matched_deribit_gex_share * 100.0
+                ),
+                format!("Trades: {}", window.trade_count),
+                "Source: Derive · observed settled maker flow".to_owned(),
+            ]);
+        }
     }
     let width = 300.0;
     let height = 12.0 + lines.len() as f32 * 16.0;
@@ -3360,6 +3440,7 @@ fn draw_gex_overlay_foreground(
     snapshot: &data::chart::gex::GexSnapshot,
     history: &[Arc<data::chart::gex::GexSnapshot>],
     _freshness: data::chart::gex::GexFreshness,
+    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     tick_size: PriceStep,
@@ -3405,6 +3486,25 @@ fn draw_gex_overlay_foreground(
         chart_scaling,
         palette,
     );
+    if let Some(flow) = derive_flow {
+        let window = &flow.thirty_minutes;
+        let imbalance = window.imbalance.abs() * 100.0;
+        draw_cluster_text(
+            frame,
+            &format!(
+                "Derive flow 30m: {} · {:.0}% · {}",
+                window.direction, imbalance, window.quality
+            ),
+            Point::new(
+                visible_region.x + gex_screen_width_to_world(8.0, chart_scaling),
+                visible_region.y + gex_screen_width_to_world(14.0, chart_scaling),
+            ),
+            gex_screen_width_to_world(10.0, chart_scaling),
+            palette.background.base.text,
+            Alignment::Start,
+            Alignment::Center,
+        );
+    }
 }
 
 fn cached_gex_zone_frames(
@@ -3412,17 +3512,12 @@ fn cached_gex_zone_frames(
     bucket_ms: u64,
     config: &data::chart::gex::GexLevelsConfig,
     render_cache: &RefCell<GexRenderCache>,
-    viewport: Rectangle,
 ) -> Arc<[data::chart::gex::GexZoneFrame]> {
     let key = history
         .last()
         .map_or(0, |snapshot| snapshot.observed_at.as_u64())
         ^ (history.len() as u64).rotate_left(7)
         ^ bucket_ms.rotate_left(17)
-        ^ u64::from(viewport.x.to_bits()).rotate_left(23)
-        ^ u64::from(viewport.y.to_bits()).rotate_left(29)
-        ^ u64::from(viewport.width.to_bits()).rotate_left(37)
-        ^ u64::from(viewport.height.to_bits()).rotate_left(43)
         ^ u64::from(config.minimum_zone_strength.to_bits()).rotate_left(49)
         ^ u64::from(config.max_positive_zones).rotate_left(53)
         ^ u64::from(config.max_negative_zones).rotate_left(57)
@@ -3441,16 +3536,36 @@ fn cached_gex_zone_frames(
     cache.zone_frames.clone()
 }
 
-fn zone_alpha(zone: &data::chart::gex::GexZone) -> f32 {
-    let fade = if zone.state == data::chart::gex::GexZoneState::Fading {
+fn gex_zone_fade(zone: &data::chart::gex::GexZone) -> f32 {
+    if zone.state == data::chart::gex::GexZoneState::Fading {
         0.65f32.powi(i32::from(zone.missing_buckets))
     } else {
         1.0
-    };
-    fade * zone
-        .normalized_strength
-        .max(zone.persistence_score)
-        .clamp(0.0, 1.0)
+    }
+}
+
+fn gex_band_effective_strength(
+    zone: &data::chart::gex::GexZone,
+    band: &data::chart::gex::GexZoneBand,
+) -> f32 {
+    band.normalized_strength.clamp(0.0, 1.0).powf(1.35)
+        * (0.70 + 0.30 * zone.persistence_score.clamp(0.0, 1.0))
+        * gex_zone_fade(zone)
+}
+
+fn gex_zone_band_hit_test(
+    frame: &data::chart::gex::GexZoneFrame,
+    price: f64,
+) -> Option<(&data::chart::gex::GexZone, &data::chart::gex::GexZoneBand)> {
+    frame
+        .zones
+        .iter()
+        .flat_map(|zone| zone.bands.iter().map(move |band| (zone, band)))
+        .filter(|(_, band)| price >= band.lower_price && price <= band.upper_price)
+        .max_by(|(zone_a, band_a), (zone_b, band_b)| {
+            gex_band_effective_strength(zone_a, band_a)
+                .total_cmp(&gex_band_effective_strength(zone_b, band_b))
+        })
 }
 
 fn zone_color(
@@ -3487,10 +3602,6 @@ fn gex_projection_bounds(
     let start = last_candle_x.min(plot_right);
     let end = (start + visible_width * 0.20).min(plot_right);
     (end > start).then_some((start, end))
-}
-
-fn gex_stepped_transition(x: f32, from_y: f32, to_y: f32) -> [Point; 2] {
-    [Point::new(x, from_y), Point::new(x, to_y)]
 }
 
 fn resolve_gex_color(role: data::chart::gex::GexLevelColor, palette: &Extended) -> Color {
@@ -3557,14 +3668,13 @@ fn draw_gex_zone_background(
     if history.is_empty() {
         return;
     }
-    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache, region);
+    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache);
     let profile_gutter = if config.show_current_profile && region.width * scaling >= 320.0 {
         region.width * gex_profile_width_percent(config.current_profile_width_percent) / 100.0
     } else {
         0.0
     };
     let plot_right = region.x + region.width - profile_gutter;
-    let glow = gex_screen_width_to_world(13.0, scaling);
     let border_width = gex_screen_width_to_world(1.0, scaling);
 
     for zone_frame in frames.iter() {
@@ -3582,64 +3692,39 @@ fn draw_gex_zone_background(
             .iter()
             .filter(|zone| zone.upper_price >= visible_low && zone.lower_price <= visible_high)
         {
-            let top = price_to_y(Price::from_f64(zone.upper_price)).max(region.y);
-            let bottom =
-                price_to_y(Price::from_f64(zone.lower_price)).min(region.y + region.height);
-            if bottom <= top {
-                continue;
-            }
-            let strength = zone_alpha(zone);
             let color = zone_color(zone, config, palette);
-            frame.fill(
-                &Path::rectangle(
-                    Point::new(x0, (top - glow).max(region.y)),
-                    Size::new(x1 - x0, (bottom - top + glow * 2.0).min(region.height)),
-                ),
-                color.scale_alpha(0.05 + 0.07 * strength),
-            );
-            frame.fill(
-                &Path::rectangle(Point::new(x0, top), Size::new(x1 - x0, bottom - top)),
-                color.scale_alpha(0.15 + 0.27 * strength),
-            );
-            for y in [top, bottom] {
-                frame.stroke(
-                    &Path::line(Point::new(x0, y), Point::new(x1, y)),
-                    Stroke::default()
-                        .with_color(color.scale_alpha(0.45 + 0.35 * strength))
-                        .with_width(border_width),
-                );
-            }
-        }
-    }
-
-    for pair in frames.windows(2).filter(|pair| {
-        config.show_historical_zones
-            && pair[1].bucket_start.saturating_diff(pair[0].bucket_start) == bucket_ms
-    }) {
-        let boundary_x = time_to_x(pair[1].bucket_start.as_u64());
-        if boundary_x < region.x || boundary_x > plot_right {
-            continue;
-        }
-        for previous in pair[0].zones.iter() {
-            let Some(next) = pair[1].zones.iter().find(|zone| zone.id == previous.id) else {
-                continue;
-            };
-            let color = zone_color(next, config, palette);
-            for (from, to) in [
-                (previous.upper_price, next.upper_price),
-                (previous.lower_price, next.lower_price),
-            ] {
-                let from_y = price_to_y(Price::from_f64(from));
-                let to_y = price_to_y(Price::from_f64(to));
-                if (from_y - to_y).abs() > f32::EPSILON {
-                    let transition = gex_stepped_transition(boundary_x, from_y, to_y);
-                    frame.stroke(
-                        &Path::line(transition[0], transition[1]),
-                        Stroke::default()
-                            .with_color(color.scale_alpha(0.65))
-                            .with_width(border_width),
-                    );
+            for band in zone
+                .bands
+                .iter()
+                .filter(|band| band.upper_price >= visible_low && band.lower_price <= visible_high)
+            {
+                let top = price_to_y(Price::from_f64(band.upper_price)).max(region.y);
+                let bottom =
+                    price_to_y(Price::from_f64(band.lower_price)).min(region.y + region.height);
+                if bottom <= top {
+                    continue;
                 }
+                let effective_strength = gex_band_effective_strength(zone, band);
+                let body_alpha = 0.02 + 0.23 * effective_strength;
+                frame.fill(
+                    &Path::rectangle(Point::new(x0, top), Size::new(x1 - x0, bottom - top)),
+                    color.scale_alpha(body_alpha),
+                );
+                let is_peak = band.strike == zone.peak_price;
+                let center_y = price_to_y(Price::from_f64(band.strike));
+                frame.stroke(
+                    &Path::line(Point::new(x0, center_y), Point::new(x1, center_y)),
+                    Stroke::default()
+                        .with_color(
+                            color.scale_alpha(
+                                (0.16
+                                    + 0.54 * effective_strength
+                                    + if is_peak { 0.18 } else { 0.0 })
+                                .clamp(0.0, 1.0),
+                            ),
+                        )
+                        .with_width(border_width * if is_peak { 1.6 } else { 0.85 }),
+                );
             }
         }
     }
@@ -3654,37 +3739,39 @@ fn draw_gex_zone_background(
         )
     {
         for zone in last.zones.iter() {
-            let top = price_to_y(Price::from_f64(zone.upper_price)).max(region.y);
-            let bottom =
-                price_to_y(Price::from_f64(zone.lower_price)).min(region.y + region.height);
-            if bottom <= top {
-                continue;
-            }
-            let strength = zone_alpha(zone);
             let color = zone_color(zone, config, palette);
-            frame.fill(
-                &Path::rectangle(
-                    Point::new(projection_start, top),
-                    Size::new(projection_end - projection_start, bottom - top),
-                ),
-                color.scale_alpha(
-                    (0.12 + 0.18 * strength)
-                        * if zone.state == data::chart::gex::GexZoneState::Fading {
-                            0.65
-                        } else {
-                            1.0
-                        },
-                ),
-            );
-            for y in [top, bottom] {
+            for band in zone.bands.iter() {
+                let top = price_to_y(Price::from_f64(band.upper_price)).max(region.y);
+                let bottom =
+                    price_to_y(Price::from_f64(band.lower_price)).min(region.y + region.height);
+                if bottom <= top {
+                    continue;
+                }
+                let effective_strength = gex_band_effective_strength(zone, band);
+                frame.fill(
+                    &Path::rectangle(
+                        Point::new(projection_start, top),
+                        Size::new(projection_end - projection_start, bottom - top),
+                    ),
+                    color.scale_alpha(0.02 + 0.23 * effective_strength),
+                );
+                let is_peak = band.strike == zone.peak_price;
+                let y = price_to_y(Price::from_f64(band.strike));
                 frame.stroke(
                     &Path::line(
                         Point::new(projection_start, y),
                         Point::new(projection_end, y),
                     ),
                     Stroke::default()
-                        .with_color(color.scale_alpha(0.55 * strength))
-                        .with_width(border_width),
+                        .with_color(
+                            color.scale_alpha(
+                                (0.16
+                                    + 0.54 * effective_strength
+                                    + if is_peak { 0.18 } else { 0.0 })
+                                .clamp(0.0, 1.0),
+                            ),
+                        )
+                        .with_width(border_width * if is_peak { 1.6 } else { 0.85 }),
                 );
             }
         }
@@ -3705,7 +3792,7 @@ fn draw_gex_zone_cores(
     bucket_ms: u64,
 ) {
     let bucket_ms = bucket_ms.max(1);
-    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache, region);
+    let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache);
     let _ = latest_candle_time;
     for (frame_index, zone_frame) in frames.iter().enumerate() {
         if !config.show_historical_zones && frame_index + 1 != frames.len() {
@@ -3718,22 +3805,33 @@ fn draw_gex_zone_cores(
             continue;
         }
         for zone in zone_frame.zones.iter() {
-            let y = price_to_y(Price::from_f64(zone.peak_price));
-            if y < region.y || y > region.y + region.height {
-                continue;
-            }
-            let height = gex_screen_width_to_world(
-                2.0 + 3.0 * zone.normalized_strength.clamp(0.0, 1.0),
-                scaling,
-            );
             let color = match zone.sign {
                 data::chart::gex::GexZoneSign::Positive => Color::from_rgb8(0x16, 0xd8, 0xc5),
                 data::chart::gex::GexZoneSign::Negative => Color::from_rgb8(0xff, 0x31, 0x5d),
             };
-            frame.fill(
-                &Path::rectangle(Point::new(x0, y - height * 0.5), Size::new(x1 - x0, height)),
-                color.scale_alpha(0.50 + 0.25 * zone_alpha(zone)),
-            );
+            for band in zone.bands.iter() {
+                let y = price_to_y(Price::from_f64(band.strike));
+                if y < region.y || y > region.y + region.height {
+                    continue;
+                }
+                let effective_strength = gex_band_effective_strength(zone, band);
+                let is_peak = band.strike == zone.peak_price;
+                let height = gex_screen_width_to_world(
+                    if is_peak {
+                        2.0 + 2.0 * band.normalized_strength.clamp(0.0, 1.0)
+                    } else {
+                        0.8 + 1.2 * band.normalized_strength.clamp(0.0, 1.0)
+                    },
+                    scaling,
+                );
+                frame.fill(
+                    &Path::rectangle(Point::new(x0, y - height * 0.5), Size::new(x1 - x0, height)),
+                    color.scale_alpha(
+                        (0.20 + 0.65 * effective_strength + if is_peak { 0.10 } else { 0.0 })
+                            .clamp(0.0, 1.0),
+                    ),
+                );
+            }
         }
     }
 }
@@ -6428,7 +6526,7 @@ mod tests {
     #[test]
     fn retained_trade_ids_prevent_bubble_reaggregation() {
         let trade = test_trade(42, 61_000, 10.0);
-        assert!(deduplicate_incoming_trades(&[trade], &[trade]).is_empty());
+        assert!(deduplicate_incoming_trades(&[trade], &[trade], "test", None).is_empty());
     }
 
     #[test]
@@ -6437,7 +6535,7 @@ mod tests {
         let mut zero = test_trade(2, 61_001, 1.0);
         zero.price = Price::from_f64(0.0);
 
-        let filtered = deduplicate_incoming_trades(&[], &[zero, valid]);
+        let filtered = deduplicate_incoming_trades(&[], &[zero, valid], "test", None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, valid.id);
         assert_eq!(filtered[0].price, valid.price);
@@ -6488,8 +6586,12 @@ mod tests {
         // The candle bucket still contains trade 42, but raw_trades no longer
         // does after retention pruning. Re-fetching an overlapping range must
         // not let trade 42 be aggregated into the bucket a second time.
-        let redelivered =
-            deduplicate_incoming_trades(&[retained_newer_trade], &[previously_aggregated]);
+        let redelivered = deduplicate_incoming_trades(
+            &[retained_newer_trade],
+            &[previously_aggregated],
+            "test",
+            None,
+        );
         for trade in redelivered {
             candle.add_trade(&trade, price_step);
         }
@@ -6741,11 +6843,54 @@ mod tests {
     }
 
     #[test]
-    fn gex_step_transition_is_vertical_and_never_diagonal() {
-        let points = gex_stepped_transition(42.0, 10.0, 30.0);
-        assert_eq!(points[0], Point::new(42.0, 10.0));
-        assert_eq!(points[1], Point::new(42.0, 30.0));
-        assert_eq!(points[0].x, points[1].x);
+    fn gex_zone_hit_test_requires_a_specific_band() {
+        use data::chart::gex::{
+            GexGammaProvenance, GexZone, GexZoneBand, GexZoneFrame, GexZoneSign, GexZoneState,
+        };
+
+        let bands: Arc<[GexZoneBand]> = vec![
+            GexZoneBand {
+                strike: 65_000.0,
+                lower_price: 64_900.0,
+                upper_price: 65_100.0,
+                normalized_strength: 0.25,
+                net_gex_1pct: 3.0,
+            },
+            GexZoneBand {
+                strike: 67_000.0,
+                lower_price: 66_900.0,
+                upper_price: 67_100.0,
+                normalized_strength: 1.0,
+                net_gex_1pct: 10.0,
+            },
+        ]
+        .into();
+        let zone = GexZone {
+            id: 1,
+            observed_at: UnixMs::new(1),
+            lower_price: 64_900.0,
+            upper_price: 67_100.0,
+            peak_price: 67_000.0,
+            net_gex_1pct: 13.0,
+            absolute_gex_1pct: 13.0,
+            normalized_strength: 1.0,
+            persistence_score: 0.5,
+            sign: GexZoneSign::Positive,
+            dominant_expiry: None,
+            gamma_provenance: GexGammaProvenance::Derived,
+            state: GexZoneState::Active,
+            missing_buckets: 0,
+            bands,
+        };
+        let frame = GexZoneFrame {
+            bucket_start: UnixMs::new(1),
+            source_spot: 66_000.0,
+            zones: vec![zone].into(),
+        };
+
+        let (_, band) = gex_zone_band_hit_test(&frame, 65_000.0).expect("65k band hit");
+        assert_eq!(band.strike, 65_000.0);
+        assert!(gex_zone_band_hit_test(&frame, 66_000.0).is_none());
     }
 
     fn proxy_test_point(

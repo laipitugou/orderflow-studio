@@ -14,7 +14,10 @@ use data::chart::{
 };
 use exchange::{
     Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
-    options::{OptionsProvider, OptionsUnderlying, gex_monitor::GexProxyHistoryPoint},
+    options::{
+        OptionsProvider, OptionsUnderlying, derive::DeriveMakerTrade,
+        gex_monitor::GexProxyHistoryPoint,
+    },
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
@@ -44,6 +47,8 @@ const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_
 const GEX_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("gex_history_v1");
 const GEX_PROXY_HISTORY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("gex_proxy_history_v1");
+const DERIVE_MAKER_TRADES_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("derive_maker_trades_v1");
 
 static CACHE: OnceLock<Option<MarketDataCache>> = OnceLock::new();
 
@@ -389,6 +394,27 @@ fn normalize_gex_proxy_history(
     let mut normalized = by_time.into_values().collect::<Vec<_>>();
     if normalized.len() > MAX_PROXY_RECORDS {
         normalized.drain(..normalized.len() - MAX_PROXY_RECORDS);
+    }
+    normalized
+}
+
+fn normalize_derive_maker_trades(
+    records: Vec<DeriveMakerTrade>,
+    now: UnixMs,
+) -> Vec<DeriveMakerTrade> {
+    const RETENTION_WITH_MARGIN_MS: u64 = 24 * 60 * 60 * 1_000 + 10 * 60 * 1_000;
+    const MAX_TRADES_PER_UNDERLYING: usize = 50_000;
+    let cutoff = now.saturating_sub(RETENTION_WITH_MARGIN_MS);
+    let mut by_id = BTreeMap::new();
+    for record in records {
+        if record.is_semantically_valid() && record.timestamp >= cutoff && record.timestamp <= now {
+            by_id.insert(record.trade_id.clone(), record);
+        }
+    }
+    let mut normalized = by_id.into_values().collect::<Vec<_>>();
+    normalized.sort_by_key(|trade| trade.timestamp);
+    if normalized.len() > MAX_TRADES_PER_UNDERLYING {
+        normalized.drain(..normalized.len() - MAX_TRADES_PER_UNDERLYING);
     }
     normalized
 }
@@ -811,6 +837,49 @@ impl MarketDataCache {
         let _ = write.commit();
     }
 
+    pub fn read_derive_maker_trades(&self, dataset_key: &str) -> Vec<DeriveMakerTrade> {
+        let Some(bucket) = self
+            .read_value(DERIVE_MAKER_TRADES_TABLE, dataset_key)
+            .ok()
+            .flatten()
+            .and_then(|blob| decode_checked::<StoredBucket<DeriveMakerTrade>>(&blob).ok())
+            .filter(|bucket| bucket.schema == CACHE_SCHEMA && bucket.dataset_key == dataset_key)
+        else {
+            return Vec::new();
+        };
+        normalize_derive_maker_trades(bucket.records, UnixMs::now())
+    }
+
+    pub fn store_derive_maker_trades(
+        &self,
+        dataset_key: &str,
+        records: &[DeriveMakerTrade],
+        now: UnixMs,
+    ) {
+        let records = normalize_derive_maker_trades(records.to_vec(), now);
+        let bucket = StoredBucket {
+            schema: CACHE_SCHEMA,
+            dataset_key: dataset_key.to_owned(),
+            bucket_start: 0,
+            records,
+        };
+        let Ok(encoded) = encode_checked(&bucket) else {
+            return;
+        };
+        let Ok(write) = self.db.begin_write() else {
+            return;
+        };
+        {
+            let Ok(mut table) = write.open_table(DERIVE_MAKER_TRADES_TABLE) else {
+                return;
+            };
+            if table.insert(dataset_key, encoded.as_slice()).is_err() {
+                return;
+            }
+        }
+        let _ = write.commit();
+    }
+
     /// Removes every persisted market-data record while keeping the database
     /// open and its schema metadata intact.
     pub fn clear_all(&self) -> Result<(), String> {
@@ -824,6 +893,7 @@ impl MarketDataCache {
             BUBBLE_TABLE,
             GEX_HISTORY_TABLE,
             GEX_PROXY_HISTORY_TABLE,
+            DERIVE_MAKER_TRADES_TABLE,
         ] {
             let mut table = write
                 .open_table(definition)
@@ -1252,6 +1322,9 @@ fn open_initialized_database(path: &Path) -> Result<Database, String> {
             .map_err(|error| error.to_string())?;
         let _ = write
             .open_table(GEX_PROXY_HISTORY_TABLE)
+            .map_err(|error| error.to_string())?;
+        let _ = write
+            .open_table(DERIVE_MAKER_TRADES_TABLE)
             .map_err(|error| error.to_string())?;
     }
     write.commit().map_err(|error| error.to_string())?;
@@ -1933,6 +2006,64 @@ mod tests {
         assert_eq!(loaded[0].gamma_source, GexGammaSource::BlackScholesDerived);
         assert_eq!(loaded[0].gamma_provenance, GexGammaProvenance::Derived);
         drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn cached_derive_trade(id: &str, timestamp: UnixMs) -> DeriveMakerTrade {
+        DeriveMakerTrade {
+            trade_id: id.to_owned(),
+            key: exchange::options::OptionContractMatchKey {
+                underlying: OptionsUnderlying::Btc,
+                expiry_utc_day: 30_000,
+                strike_cents: 10_000_000,
+                right: exchange::options::OptionRight::Call,
+            },
+            expiration_timestamp: timestamp.saturating_add(7 * 24 * 60 * 60 * 1_000),
+            timestamp,
+            side: exchange::options::derive::DeriveMakerSide::Buy,
+            amount: 1.0,
+            mark_price: 0.1,
+            index_price: 100_000.0,
+        }
+    }
+
+    #[test]
+    fn derive_cache_roundtrips_deduplicates_retains_and_is_cleared() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-derive-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let now = UnixMs::now();
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let recent = cached_derive_trade("same-id", now.saturating_sub(1_000));
+        let duplicate = cached_derive_trade("same-id", now.saturating_sub(500));
+        let expired = cached_derive_trade(
+            "expired",
+            now.saturating_sub(24 * 60 * 60 * 1_000 + 10 * 60 * 1_000 + 1),
+        );
+        cache.store_derive_maker_trades(
+            "source=derive|underlying=BTC",
+            &[recent, duplicate.clone(), expired],
+            now,
+        );
+        drop(cache);
+        let reopened = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path: path.clone(),
+        };
+        let restored = reopened.read_derive_maker_trades("source=derive|underlying=BTC");
+        assert_eq!(restored, vec![duplicate]);
+        reopened.clear_all().unwrap();
+        assert!(
+            reopened
+                .read_derive_maker_trades("source=derive|underlying=BTC")
+                .is_empty()
+        );
+        drop(reopened);
         std::fs::remove_file(path).unwrap();
     }
 }

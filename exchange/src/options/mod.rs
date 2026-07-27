@@ -4,6 +4,7 @@
 //! do not participate in normal trade, depth, or kline streaming.
 
 pub mod deribit;
+pub mod derive;
 pub mod gex_monitor;
 
 use crate::{Ticker, UnixMs};
@@ -50,6 +51,39 @@ impl std::fmt::Display for OptionsUnderlying {
 pub enum OptionRight {
     Call,
     Put,
+}
+
+/// Venue-neutral identity used only for exact option-contract matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct OptionContractMatchKey {
+    pub underlying: OptionsUnderlying,
+    pub expiry_utc_day: i32,
+    pub strike_cents: i64,
+    pub right: OptionRight,
+}
+
+impl OptionContractMatchKey {
+    pub fn new(
+        underlying: OptionsUnderlying,
+        expiration_timestamp: UnixMs,
+        strike: f64,
+        right: OptionRight,
+    ) -> Option<Self> {
+        if !strike.is_finite() || strike <= 0.0 {
+            return None;
+        }
+        let strike_cents = (strike * 100.0).round();
+        if !(i64::MIN as f64..=i64::MAX as f64).contains(&strike_cents) {
+            return None;
+        }
+        let expiry_utc_day = i32::try_from(expiration_timestamp.as_u64() / 86_400_000).ok()?;
+        Some(Self {
+            underlying,
+            expiry_utc_day,
+            strike_cents: strike_cents as i64,
+            right,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
