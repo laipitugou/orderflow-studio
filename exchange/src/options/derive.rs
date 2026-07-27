@@ -97,6 +97,7 @@ impl DeriveOptionsClient {
         &self,
         underlying: OptionsUnderlying,
     ) -> Result<Vec<DeriveOptionInstrument>, DeriveError> {
+        log::info!("Derive FetchStarted kind=instruments underlying={underlying} provider=Derive");
         let mut page = 1u32;
         let mut result = Vec::new();
         loop {
@@ -122,6 +123,10 @@ impl DeriveOptionsClient {
         }
         result.sort_by(|a, b| a.instrument_name.cmp(&b.instrument_name));
         result.dedup_by(|a, b| a.instrument_name == b.instrument_name);
+        log::info!(
+            "Derive FetchCompleted kind=instruments underlying={underlying} pages={page} instruments={}",
+            result.len()
+        );
         Ok(result)
     }
 
@@ -132,6 +137,12 @@ impl DeriveOptionsClient {
         to_timestamp: UnixMs,
         instruments: &[DeriveOptionInstrument],
     ) -> Result<Vec<DeriveMakerTrade>, DeriveError> {
+        log::info!(
+            "Derive FetchStarted kind=trades underlying={underlying} from={} to={} instruments={} provider=Derive",
+            from_timestamp,
+            to_timestamp,
+            instruments.len()
+        );
         let by_name = instruments
             .iter()
             .map(|instrument| (instrument.instrument_name.as_str(), instrument))
@@ -174,6 +185,12 @@ impl DeriveOptionsClient {
             page += 1;
         }
         result.sort_by_key(|trade| trade.timestamp);
+        log::info!(
+            "Derive FetchCompleted kind=trades underlying={underlying} from={} to={} pages={page} maker_trades={}",
+            from_timestamp,
+            to_timestamp,
+            result.len()
+        );
         Ok(result)
     }
 
@@ -182,16 +199,10 @@ impl DeriveOptionsClient {
         method: &'static str,
         params: &P,
     ) -> Result<T, DeriveError> {
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0",
-            id: "flowsurface",
-            method,
-            params,
-        };
         let response = self
             .client
             .post(format!("{}/{}", self.base_url, method))
-            .json(&request)
+            .json(params)
             .send()
             .await
             .map_err(DeriveError::Request)?;
@@ -205,9 +216,6 @@ impl DeriveOptionsClient {
         }
         let envelope: JsonRpcResponse<T> =
             serde_json::from_str(&body).map_err(DeriveError::Decode)?;
-        if envelope.jsonrpc.as_deref() != Some("2.0") {
-            return Err(DeriveError::MissingResult);
-        }
         if let Some(error) = envelope.error {
             return Err(DeriveError::Rpc {
                 code: error.code,
@@ -218,17 +226,8 @@ impl DeriveOptionsClient {
     }
 }
 
-#[derive(Serialize)]
-struct JsonRpcRequest<'a, P> {
-    jsonrpc: &'static str,
-    id: &'static str,
-    method: &'static str,
-    params: &'a P,
-}
-
 #[derive(Deserialize)]
 struct JsonRpcResponse<T> {
-    jsonrpc: Option<String>,
     result: Option<T>,
     error: Option<JsonRpcError>,
 }
@@ -412,22 +411,26 @@ mod tests {
                 let mut request = [0u8; 16_384];
                 let count = stream.read(&mut request).expect("request");
                 let request = String::from_utf8_lossy(&request[..count]);
+                let request_body = request.split("\r\n\r\n").nth(1).expect("request body");
                 let expected_method = if index < 2 {
                     "public/get_all_instruments"
                 } else {
                     "public/get_trade_history"
                 };
                 assert!(request.contains(expected_method));
-                assert!(request.contains("\"page_size\":1000"));
-                assert!(request.contains(&format!("\"page\":{}", index % 2 + 1)));
-                assert!(request.contains("\"instrument_type\":\"option\""));
-                assert!(request.contains("\"currency\":\"BTC\""));
+                assert!(!request_body.contains("\"jsonrpc\""));
+                assert!(!request_body.contains("\"method\""));
+                assert!(!request_body.contains("\"params\""));
+                assert!(request_body.contains("\"page_size\":1000"));
+                assert!(request_body.contains(&format!("\"page\":{}", index % 2 + 1)));
+                assert!(request_body.contains("\"instrument_type\":\"option\""));
+                assert!(request_body.contains("\"currency\":\"BTC\""));
                 if index >= 2 {
-                    assert!(request.contains("\"tx_status\":\"settled\""));
-                    assert!(request.contains("\"from_timestamp\":1800000000000"));
-                    assert!(request.contains("\"to_timestamp\":1800000010000"));
+                    assert!(request_body.contains("\"tx_status\":\"settled\""));
+                    assert!(request_body.contains("\"from_timestamp\":1800000000000"));
+                    assert!(request_body.contains("\"to_timestamp\":1800000010000"));
                 } else {
-                    assert!(request.contains("\"expired\":false"));
+                    assert!(request_body.contains("\"expired\":false"));
                 }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

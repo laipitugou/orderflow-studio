@@ -619,6 +619,10 @@ impl GexDataCoordinator {
         self.derive_force_instruments.remove(&underlying);
         match completion.result {
             Ok(values) if !values.is_empty() => {
+                log::info!(
+                    "Derive InstrumentsRefreshed underlying={underlying} count={} refreshed_at={now}",
+                    values.len()
+                );
                 self.derive_instruments.insert(underlying, values.into());
                 self.derive_instruments_refreshed_at.insert(underlying, now);
                 self.derive_instrument_failures.remove(&underlying);
@@ -640,6 +644,7 @@ impl GexDataCoordinator {
         self.derive_force_trades.remove(&underlying);
         match completion.result {
             Ok(values) => {
+                let received = values.len();
                 let mut by_id = self
                     .derive_trades
                     .remove(&underlying)
@@ -666,6 +671,15 @@ impl GexDataCoordinator {
                 self.derive_trades_refreshed_at.insert(underlying, now);
                 self.derive_trade_failures.remove(&underlying);
                 self.derive_stale.remove(&underlying);
+                let retained = self.derive_trades.get(&underlying).map_or(0, Vec::len);
+                let watermark = self
+                    .derive_watermarks
+                    .get(&underlying)
+                    .copied()
+                    .unwrap_or(UnixMs::ZERO);
+                log::info!(
+                    "Derive TradesRefreshed underlying={underlying} received={received} retained={retained} watermark={watermark} refreshed_at={now}"
+                );
                 if self.persist_heatmap
                     && let Some(cache) = crate::connector::persistent_cache::market_cache()
                     && let Some(trades) = self.derive_trades.get(&underlying)
@@ -740,6 +754,14 @@ impl GexDataCoordinator {
         if let Some(latest) = trades.last().map(|trade| trade.timestamp) {
             self.derive_watermarks.insert(underlying, latest);
         }
+        log::info!(
+            "Derive CacheLoaded underlying={underlying} trades={} watermark={} stale=true",
+            trades.len(),
+            trades
+                .last()
+                .map(|trade| trade.timestamp)
+                .unwrap_or(UnixMs::ZERO)
+        );
         self.derive_trades.insert(underlying, trades);
         self.derive_stale.insert(underlying);
     }
@@ -762,6 +784,10 @@ impl GexDataCoordinator {
         let delay = FAILURE_BACKOFF_BASE_MS
             .saturating_mul(1u64 << attempts.saturating_sub(1).min(10))
             .min(FAILURE_BACKOFF_MAX_MS);
+        let kind = if instruments { "instruments" } else { "trades" };
+        log::warn!(
+            "Derive FetchFailed kind={kind} underlying={underlying} attempt={attempts} backoff_ms={delay} error={error}"
+        );
         failures.insert(
             underlying,
             FailureState {
