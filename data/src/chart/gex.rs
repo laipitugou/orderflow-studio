@@ -1420,12 +1420,10 @@ pub fn calculate_derive_maker_gamma_flow(
     config: &Config,
     observed_at: UnixMs,
 ) -> DeriveMakerGammaFlow {
-    let selected = select_contracts(
-        chain,
-        config.expiry_filter,
-        config.min_open_interest,
-        observed_at,
-    );
+    // Observed Derive flow is venue-independent evidence and must not disappear when the
+    // Deribit visualization changes its expiry or minimum-OI filters. Matching still remains
+    // exact, but it is performed against the complete non-expired Deribit chain.
+    let selected = select_contracts(chain, GexExpiryFilter::All, 0.0, observed_at);
     let mut contracts: FxHashMap<OptionContractMatchKey, Vec<&RawOptionContractSnapshot>> =
         FxHashMap::default();
     let mut total_absolute_gex = 0.0;
@@ -3465,6 +3463,31 @@ mod tests {
             ObservedGammaDirection::Balanced
         );
         assert_eq!(balanced.thirty_minutes.quality, FlowQuality::Low);
+    }
+
+    #[test]
+    fn derive_flow_is_independent_from_deribit_visual_filters() {
+        let contract = contract(100.0, OptionRight::Call, 14, 10.0, 1.0);
+        let source = chain(vec![contract.clone()]);
+        let trade = maker_trade(
+            "outside-visible-expiry",
+            &contract,
+            NOW.saturating_sub(1_000),
+            DeriveMakerSide::Buy,
+        );
+        let restrictive = Config {
+            expiry_filter: GexExpiryFilter::OneDay,
+            min_open_interest: f64::MAX,
+            ..Config::default()
+        };
+
+        let flow = calculate_derive_maker_gamma_flow(&source, &[trade], &restrictive, NOW);
+
+        assert_eq!(flow.five_minutes.trade_count, 1);
+        assert_eq!(
+            flow.five_minutes.direction,
+            ObservedGammaDirection::LongGamma
+        );
     }
 
     #[test]

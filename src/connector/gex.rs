@@ -6,7 +6,8 @@ use data::chart::gex::{
 use exchange::{
     UnixMs,
     options::{
-        OptionInstrument, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
+        OptionContractMatchKey, OptionInstrument, OptionsProvider, OptionsUnderlying,
+        RawOptionChainSnapshot,
         deribit::{DeribitError, DeribitOptionsClient},
         derive::{DeriveMakerTrade, DeriveOptionInstrument, DeriveOptionsClient},
         gex_monitor::{GexMonitorClient, GexProxyHistoryPoint, GexProxyHistoryResponse},
@@ -677,8 +678,17 @@ impl GexDataCoordinator {
                     .get(&underlying)
                     .copied()
                     .unwrap_or(UnixMs::ZERO);
+                let (window_30m, exact_matches_30m) = self
+                    .raw_snapshots
+                    .get(&OptionsChainKey::deribit(underlying))
+                    .and_then(|raw| {
+                        self.derive_trades
+                            .get(&underlying)
+                            .map(|trades| derive_exact_match_count(&raw.value, trades, now, 30))
+                    })
+                    .unwrap_or_default();
                 log::info!(
-                    "Derive TradesRefreshed underlying={underlying} received={received} retained={retained} watermark={watermark} refreshed_at={now}"
+                    "Derive TradesRefreshed underlying={underlying} received={received} retained={retained} window_30m={window_30m} exact_matches_30m={exact_matches_30m} watermark={watermark} refreshed_at={now}"
                 );
                 if self.persist_heatmap
                     && let Some(cache) = crate::connector::persistent_cache::market_cache()
@@ -1169,6 +1179,53 @@ impl GexDataCoordinator {
         let bytes = serde_json::to_vec(&stored).map_err(std::io::Error::other)?;
         atomic_write(&self.cache_path, &bytes)
     }
+}
+
+fn derive_exact_match_count(
+    chain: &RawOptionChainSnapshot,
+    trades: &[DeriveMakerTrade],
+    now: UnixMs,
+    lookback_minutes: u16,
+) -> (usize, usize) {
+    const MAX_EXPIRY_DIFFERENCE_MS: u64 = 12 * 60 * 60 * 1_000;
+    let cutoff = now.saturating_sub(u64::from(lookback_minutes) * 60 * 1_000);
+    let mut expiries_by_key: FxHashMap<OptionContractMatchKey, Vec<UnixMs>> = FxHashMap::default();
+    for contract in chain
+        .contracts
+        .iter()
+        .filter(|contract| contract.instrument.expiration_timestamp > now)
+    {
+        let Some(key) = OptionContractMatchKey::new(
+            chain.underlying,
+            contract.instrument.expiration_timestamp,
+            contract.instrument.strike,
+            contract.instrument.right,
+        ) else {
+            continue;
+        };
+        expiries_by_key
+            .entry(key)
+            .or_default()
+            .push(contract.instrument.expiration_timestamp);
+    }
+    let window = trades
+        .iter()
+        .filter(|trade| trade.timestamp >= cutoff && trade.timestamp <= now)
+        .collect::<Vec<_>>();
+    let exact_matches = window
+        .iter()
+        .filter(|trade| {
+            expiries_by_key.get(&trade.key).is_some_and(|expiries| {
+                expiries.iter().any(|expiry| {
+                    expiry
+                        .as_u64()
+                        .abs_diff(trade.expiration_timestamp.as_u64())
+                        <= MAX_EXPIRY_DIFFERENCE_MS
+                })
+            })
+        })
+        .count();
+    (window.len(), exact_matches)
 }
 
 pub fn series_cache_key(key: DerivedGexSeriesKey) -> String {
