@@ -3,13 +3,28 @@ use super::aggr::time::DataPoint;
 use exchange::unit::MinQtySize;
 use exchange::unit::price::{Price, PriceStep};
 use exchange::unit::qty::{Qty, SizeUnit, volume_size_unit};
-use exchange::{Timeframe, UnixMs, adapter::MarketKind, depth::Depth};
+use exchange::{TickerInfo, Timeframe, UnixMs, adapter::MarketKind, depth::Depth};
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const CLEANUP_THRESHOLD: usize = 4800;
+
+/// Heatmaps aggregate on time buckets. Recover incompatible persisted bases
+/// by selecting the exchange's default supported heatmap timeframe.
+pub fn normalize_basis(basis: Basis, ticker_info: TickerInfo) -> (Basis, Timeframe) {
+    match basis {
+        Basis::Time(timeframe) => (basis, timeframe),
+        Basis::Tick(_) => {
+            let normalized = Basis::default_heatmap_time(Some(ticker_info));
+            let Basis::Time(timeframe) = normalized else {
+                unreachable!("default heatmap basis must be time-based");
+            };
+            (normalized, timeframe)
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
@@ -149,13 +164,10 @@ pub struct HistoricalDepth {
 }
 
 impl HistoricalDepth {
-    pub fn new(min_order_qty: MinQtySize, tick_size: PriceStep, basis: Basis) -> Self {
+    pub fn new(min_order_qty: MinQtySize, tick_size: PriceStep, aggr_time: Timeframe) -> Self {
         Self {
             price_levels: BTreeMap::new(),
-            aggr_time: match basis {
-                Basis::Time(interval) => interval,
-                Basis::Tick(_) => unimplemented!(),
-            },
+            aggr_time,
             tick_size,
             min_order_qty,
             last_snapshot_time: None,

@@ -617,12 +617,8 @@ impl MarketDataCache {
         self.store_records(CacheKind::BubbleSummary, &key, from, to_exclusive, records);
     }
 
-    pub fn read_gex_history(
-        &self,
-        dataset_key: &str,
-        from: UnixMs,
-        to: UnixMs,
-    ) -> Vec<GexSnapshot> {
+    #[cfg(test)]
+    fn read_gex_history(&self, dataset_key: &str, from: UnixMs, to: UnixMs) -> Vec<GexSnapshot> {
         self.read_gex_history_detailed(dataset_key, from, to)
             .snapshots
     }

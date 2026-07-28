@@ -22,7 +22,6 @@ pub mod toast;
 
 pub const PANE_CONTROL_BTN_HEIGHT: f32 = 26.0;
 
-#[allow(dead_code)]
 pub const DEFAULT_TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A compact GIF-backed activity indicator used in pane headers.

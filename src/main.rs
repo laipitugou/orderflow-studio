@@ -9,7 +9,6 @@ mod market_service;
 mod modal;
 mod notify;
 mod power_guard;
-mod render_scheduler;
 mod screen;
 mod style;
 mod version;
@@ -122,11 +121,8 @@ struct Flowsurface {
     theme: data::Theme,
     notifications: Notifications,
     windowing_mode: WindowingMode,
-    market_store: Arc<market_service::MarketStore>,
-    market_diagnostics: market_service::MarketDiagnostics,
     market_connectivity: market_service::MarketConnectivity,
     iceberg_detectors: connector::iceberg::IcebergDetectorRegistry,
-    dirty_flag: render_scheduler::DirtyFlag,
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
     debug_terminal_embedded: bool,
@@ -738,11 +734,7 @@ impl Flowsurface {
             reason = windowing_mode.reason()
         );
 
-        let market_store = Arc::new(market_service::MarketStore::new());
-        let market_diagnostics = market_service::MarketDiagnostics::new(market_store.clone());
-        log::info!("MARKET ServiceStarted | runtime=dedicated");
-
-        // Initialize Windows power guard if on Windows
+        // Keep Windows awake while the application is running.
         #[cfg(target_os = "windows")]
         {
             power_guard::windows_power::init();
@@ -765,11 +757,8 @@ impl Flowsurface {
             notifications: Notifications::new(),
             network: NetworkManager::new(saved_state.proxy_cfg),
             windowing_mode,
-            market_store,
-            market_diagnostics,
             market_connectivity: market_service::MarketConnectivity::new(),
             iceberg_detectors: connector::iceberg::IcebergDetectorRegistry::default(),
-            dirty_flag: render_scheduler::DirtyFlag::new(),
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
             debug_terminal_embedded: false,
@@ -858,9 +847,6 @@ impl Flowsurface {
         &mut self,
         transition: market_service::ConnectivityTransition,
     ) -> Task<Message> {
-        self.market_store
-            .set_streams_connected(self.market_connectivity.is_online());
-
         match transition {
             market_service::ConnectivityTransition::None => Task::none(),
             market_service::ConnectivityTransition::WentOffline => {
@@ -870,7 +856,6 @@ impl Flowsurface {
                     self.market_connectivity.expected_count(),
                     self.market_connectivity.last_reason()
                 );
-                self.dirty_flag.mark_dirty();
                 Task::none()
             }
             market_service::ConnectivityTransition::Restored => {
@@ -879,7 +864,6 @@ impl Flowsurface {
                     self.market_connectivity.connected_count(),
                     self.market_connectivity.expected_count()
                 );
-                self.dirty_flag.mark_dirty();
                 self.gex_coordinator.reconnect();
 
                 let handles = self.handles.clone();
@@ -898,14 +882,6 @@ impl Flowsurface {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MarketWsEvent(event) => {
-                // Record WS event in market store for diagnostics
-                self.market_store.record_ws_event();
-                self.market_store.enqueue_event();
-                self.market_diagnostics.maybe_log();
-
-                // Mark UI dirty when market data arrives
-                self.dirty_flag.mark_dirty();
-
                 let main_window_id = self.main_window.id;
 
                 if let exchange::Event::Connected(streams) = &event {
@@ -958,7 +934,6 @@ impl Flowsurface {
                     if !visible_updates.is_empty() {
                         self.active_dashboard_mut()
                             .ingest_iceberg_events(&visible_updates, main_window_id);
-                        self.dirty_flag.mark_dirty();
                     }
                     return Task::none();
                 }
@@ -981,7 +956,6 @@ impl Flowsurface {
                     if !visible_updates.is_empty() {
                         self.active_dashboard_mut()
                             .ingest_iceberg_events(&visible_updates, main_window_id);
-                        self.dirty_flag.mark_dirty();
                     }
                     return Task::none();
                 }
@@ -1079,13 +1053,6 @@ impl Flowsurface {
                     }
                 }
 
-                // Drain market events and log UI lag diagnostics
-                let drained = self.market_store.drain_events();
-                if drained > 0 {
-                    self.market_diagnostics.log_ui_lag(drained, 0);
-                }
-                self.market_diagnostics.maybe_log();
-
                 let expected_streams = self.active_dashboard().configured_market_streams();
                 let sync_transition = self
                     .market_connectivity
@@ -1118,7 +1085,6 @@ impl Flowsurface {
                             .pane_count,
                         expected_streams.len()
                     );
-                    self.dirty_flag.mark_dirty();
                     let dashboard_window = self.open_main_dashboard_window();
                     let popouts = self.open_startup_popouts();
                     let debug_terminal = if self.debug_terminal_enabled {
@@ -1233,14 +1199,12 @@ impl Flowsurface {
                 let now = exchange::UnixMs::now();
                 self.gex_coordinator.complete(completion, now);
                 self.sync_gex_dashboard(now);
-                self.dirty_flag.mark_dirty();
                 return Task::none();
             }
             Message::GexProxyFetchCompleted((underlying, result)) => {
                 let now = exchange::UnixMs::now();
                 self.gex_coordinator.complete_proxy(underlying, result, now);
                 self.sync_gex_dashboard(now);
-                self.dirty_flag.mark_dirty();
                 return Task::none();
             }
             Message::DeriveInstrumentsFetchCompleted(completion) => {
@@ -1248,14 +1212,12 @@ impl Flowsurface {
                 self.gex_coordinator
                     .complete_derive_instruments(completion, now);
                 self.sync_gex_dashboard(now);
-                self.dirty_flag.mark_dirty();
                 return Task::none();
             }
             Message::DeriveTradesFetchCompleted(completion) => {
                 let now = exchange::UnixMs::now();
                 self.gex_coordinator.complete_derive_trades(completion, now);
                 self.sync_gex_dashboard(now);
-                self.dirty_flag.mark_dirty();
                 return Task::none();
             }
             Message::WindowEvent(event) => match event {
@@ -1300,7 +1262,6 @@ impl Flowsurface {
                     return window::collect_window_specs(active_windows, Message::ExitRequested);
                 }
                 window::Event::Focused(id) => {
-                    self.market_store.set_ui_focused(true);
                     if DEBUG_WINDOW_DIAGNOSTICS {
                         log::debug!(
                             "[window] Focused: id={:?} ({})",
@@ -1310,7 +1271,6 @@ impl Flowsurface {
                     }
                 }
                 window::Event::Unfocused(id) => {
-                    self.market_store.set_ui_focused(false);
                     if DEBUG_WINDOW_DIAGNOSTICS {
                         log::debug!(
                             "[window] Unfocused: id={:?} ({})",

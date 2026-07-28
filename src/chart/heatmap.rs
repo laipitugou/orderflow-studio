@@ -268,6 +268,7 @@ impl HeatmapChart {
         config: Option<Config>,
         studies: Vec<HeatmapStudy>,
     ) -> Self {
+        let (basis, timeframe) = data::chart::heatmap::normalize_basis(basis, ticker_info);
         let mut indicators = EnumMap::default();
         for &indicator in enabled_indicators {
             indicators[indicator] = Some(match indicator {
@@ -275,7 +276,7 @@ impl HeatmapChart {
             });
         }
 
-        let heatmap = HistoricalDepth::new(ticker_info.min_qty, step, basis);
+        let heatmap = HistoricalDepth::new(ticker_info.min_qty, step, timeframe);
 
         let view_state = ViewState::new(
             basis,
@@ -295,7 +296,7 @@ impl HeatmapChart {
             indicators,
             pause_buffer: vec![],
             heatmap,
-            trades: TimeSeries::<HeatmapDataPoint>::new(basis, step),
+            trades: TimeSeries::<HeatmapDataPoint>::new(timeframe, step),
             visual_config: config.unwrap_or_default(),
             study_configurator: study::Configurator::new(),
             studies,
@@ -435,11 +436,16 @@ impl HeatmapChart {
     }
 
     pub fn set_basis(&mut self, basis: Basis) {
+        let (basis, timeframe) =
+            data::chart::heatmap::normalize_basis(basis, self.chart.ticker_info);
         self.chart.basis = basis;
 
         self.trades.datapoints.clear();
-        self.heatmap =
-            HistoricalDepth::new(self.chart.ticker_info.min_qty, self.chart.tick_size, basis);
+        self.heatmap = HistoricalDepth::new(
+            self.chart.ticker_info.min_qty,
+            self.chart.tick_size,
+            timeframe,
+        );
 
         let chart = &mut self.chart;
         chart.translation = Vector::new(
@@ -493,14 +499,15 @@ impl HeatmapChart {
     pub fn change_tick_size(&mut self, step: PriceStep) {
         let chart_state = self.mut_state();
 
-        let basis = chart_state.basis;
+        let (_, timeframe) =
+            data::chart::heatmap::normalize_basis(chart_state.basis, chart_state.ticker_info);
 
         chart_state.cell_height = 4.0;
         chart_state.tick_size = step;
         chart_state.decimals = step.decimal_places();
 
         self.trades.datapoints.clear();
-        self.heatmap = HistoricalDepth::new(self.chart.ticker_info.min_qty, step, basis);
+        self.heatmap = HistoricalDepth::new(self.chart.ticker_info.min_qty, step, timeframe);
     }
 
     pub fn tick_size(&self) -> PriceStep {

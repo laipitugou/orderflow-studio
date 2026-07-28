@@ -96,6 +96,7 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
           previous_tag=""
+          previous_distance=""
           while IFS= read -r candidate; do
             if [ "$candidate" = "$tag" ]; then
               continue
@@ -103,8 +104,11 @@ jobs:
 
             if git rev-parse --verify --quiet "refs/tags/${candidate}^{commit}" >/dev/null && \
                git merge-base --is-ancestor "$candidate" "$GITHUB_SHA"; then
-              previous_tag="$candidate"
-              break
+              distance="$(git rev-list --count "${candidate}..${GITHUB_SHA}")"
+              if [ -z "$previous_distance" ] || [ "$distance" -lt "$previous_distance" ]; then
+                previous_tag="$candidate"
+                previous_distance="$distance"
+              fi
             fi
           done < <(
             gh release list \

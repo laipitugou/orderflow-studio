@@ -1379,7 +1379,6 @@ impl State {
                             chart_kind,
                             id,
                             chart.basis(),
-                            chart.volume_bubble_qty_scale(),
                         )
                     };
 

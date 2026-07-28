@@ -28,7 +28,6 @@ impl<T> BasisSeriesExt<T> for BasisSeries<T> {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum IndicatorAvailability {
     /// Indicator can be rendered normally.
@@ -40,7 +39,6 @@ pub enum IndicatorAvailability {
     Unavailable(AvailabilityCause),
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AvailabilityCause {
     Exchange(Exchange),

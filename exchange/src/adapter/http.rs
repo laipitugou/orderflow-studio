@@ -103,6 +103,18 @@ impl<L: RateLimiter> HttpHub<L> {
         method: Method,
         json_body: Option<&serde_json::Value>,
     ) -> Result<Response, AdapterError> {
+        self.http_response_with_limiter_timeout(url, weight, method, json_body, None)
+            .await
+    }
+
+    async fn http_response_with_limiter_timeout(
+        &mut self,
+        url: &str,
+        weight: usize,
+        method: Method,
+        json_body: Option<&serde_json::Value>,
+        request_timeout: Option<Duration>,
+    ) -> Result<Response, AdapterError> {
         let request_method = method.clone();
 
         {
@@ -113,9 +125,10 @@ impl<L: RateLimiter> HttpHub<L> {
             }
         }
 
-        let response = Self::send_request_client(self.client(), method, url, json_body)
-            .await
-            .map_err(|error| AdapterError::request_failed(&request_method, url, error))?;
+        let response =
+            Self::send_request_client(self.client(), method, url, json_body, request_timeout)
+                .await
+                .map_err(|error| AdapterError::request_failed(&request_method, url, error))?;
 
         {
             let limiter = self.limiter_mut();
@@ -155,6 +168,30 @@ impl<L: RateLimiter> HttpHub<L> {
         Self::read_response_body(&method, url, response).await
     }
 
+    /// Text-response layer with a request-specific timeout override.
+    pub(super) async fn http_text_with_limiter_timeout(
+        &mut self,
+        url: &str,
+        weight: usize,
+        method: Option<Method>,
+        json_body: Option<&serde_json::Value>,
+        request_timeout: Duration,
+    ) -> Result<String, AdapterError> {
+        let method = method.unwrap_or(Method::GET);
+
+        let response = self
+            .http_response_with_limiter_timeout(
+                url,
+                weight,
+                method.clone(),
+                json_body,
+                Some(request_timeout),
+            )
+            .await?;
+
+        Self::read_response_body(&method, url, response).await
+    }
+
     /// JSON layer.
     ///
     /// Builds on `http_text_with_limiter`, validates response shape, and
@@ -180,11 +217,15 @@ impl<L: RateLimiter> HttpHub<L> {
         method: Method,
         url: &str,
         json_body: Option<&serde_json::Value>,
+        request_timeout: Option<Duration>,
     ) -> Result<Response, reqwest::Error> {
         let mut request_builder = client.request(method, url);
 
         if let Some(body) = json_body {
             request_builder = request_builder.json(body);
+        }
+        if let Some(timeout) = request_timeout {
+            request_builder = request_builder.timeout(timeout);
         }
 
         request_builder.send().await

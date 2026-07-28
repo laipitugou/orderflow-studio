@@ -12,8 +12,7 @@ use iced::{
 };
 
 pub fn view(chart: &gex::GexChart) -> Element<'_, gex::Message> {
-    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width), size.width))
-        .into()
+    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width))).into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +34,7 @@ impl GexLayoutDensity {
     }
 }
 
-fn view_sized(
-    chart: &gex::GexChart,
-    density: GexLayoutDensity,
-    width: f32,
-) -> Element<'_, gex::Message> {
+fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, gex::Message> {
     let Some(snapshot) = chart.snapshot() else {
         return iced::widget::center(text(if chart.freshness() == GexFreshness::Error {
             "GEX data unavailable."
@@ -54,7 +49,7 @@ fn view_sized(
     }
 
     let header = header_view(chart, snapshot, density);
-    let analytics = analytics_view(chart, snapshot, density, width);
+    let analytics = analytics_view(chart, snapshot, density);
     let table = canvas(GexProfileTable {
         snapshot,
         strikes: visible,
@@ -309,7 +304,6 @@ fn analytics_view<'a>(
     chart: &gex::GexChart,
     snapshot: &data::chart::gex::GexSnapshot,
     density: GexLayoutDensity,
-    width: f32,
 ) -> Element<'a, gex::Message> {
     let cfg = chart.config();
     let expiry = cfg.expiry_filter.to_string();
@@ -338,7 +332,7 @@ fn analytics_view<'a>(
             semantic,
             format_unsigned_exposure(metrics.gross_intrinsic_usd),
             format!(
-                "{:.1}% of OI · {} / {} ITM",
+                "{:.1}% OI ({} / {} ITM)",
                 metrics.intrinsic_ratio * 100.0,
                 metrics.itm_contracts, metrics.total_contracts
             ),
@@ -379,7 +373,7 @@ fn analytics_view<'a>(
                 .gamma_vega_ratio
                 .map_or_else(|| "—".into(), format_ratio),
             format!(
-                "Gamma {} · Vega {}",
+                "Gamma {} / Vega {}",
                 format_unsigned_exposure(metrics.gamma_shock_1pct_usd),
                 format_unsigned_exposure(metrics.vega_shock_1vol_usd)
             ),
@@ -397,7 +391,7 @@ fn analytics_view<'a>(
         sections.push(liquidity_card(chart, &expiry, density));
     }
     sections.push(agreement_card(chart, snapshot, &expiry, density));
-    cards_layout(sections, width)
+    cards_layout(sections, density)
 }
 
 fn agreement_card<'a>(
@@ -426,17 +420,17 @@ fn agreement_card<'a>(
     };
     let primary = match (deribit_bias, window) {
         (Some(deribit), Some(derive)) => format!(
-            "OI {:+.0}% · Flow {:+.0}%",
+            "OI {:+.0}% / Flow {:+.0}%",
             deribit * 100.0,
             derive.imbalance * 100.0
         ),
         _ => "Waiting for aligned flow".into(),
     };
     let secondary = window.map_or_else(
-        || format!("{expiry} · no Derive comparison data"),
+        || format!("{expiry}: no Derive comparison data"),
         |window| {
             format!(
-                "{} trades · {:.0}% matched · {} · {expiry}",
+                "{} trades, {:.0}% matched, {}, {expiry}",
                 window.trade_count,
                 window.matched_deribit_gex_share * 100.0,
                 window.quality
@@ -444,7 +438,7 @@ fn agreement_card<'a>(
         },
     );
     analytics_section(
-        "OI proxy agreement · 30m",
+        "OI proxy agreement (30m)",
         GaugeVisual {
             asset: include_bytes!("../../../assets/gex/oi-proxy-agreement-gauge.svg"),
             normalized: alignment.map(|score| ((score + 1.0) * 0.5) as f32),
@@ -546,7 +540,7 @@ fn liquidity_card<'a>(
         semantic,
         format_ratio(metrics.impact_ratio),
         format!(
-            "Gamma {} · Liquidity {}",
+            "Gamma {} / Liquidity {}",
             format_unsigned_exposure(metrics.gamma_exposure_usd),
             format_unsigned_exposure(metrics.effective_liquidity_usd)
         ),
@@ -558,25 +552,37 @@ fn liquidity_card<'a>(
 
 fn cards_layout<'a>(
     cards: Vec<Element<'a, gex::Message>>,
-    width: f32,
+    density: GexLayoutDensity,
 ) -> Element<'a, gex::Message> {
-    if analytics_layout_rows(width, cards.len()).is_empty() {
+    let row_sizes = analytics_layout_rows(density, cards.len());
+    if row_sizes.is_empty() {
         return space::vertical().height(0).into();
     }
-    let mut overview = row![]
-        .height(Length::Shrink)
-        .align_y(Alignment::Center)
-        .spacing(0);
-    for (index, card) in cards.into_iter().enumerate() {
-        if index > 0 {
-            overview = overview.push(
-                container(rule::vertical(1.0).style(style::split_ruler))
-                    .width(1)
-                    .height(64)
-                    .align_y(Alignment::Center),
-            );
+
+    let mut cards = cards.into_iter();
+    let mut overview = column![].width(Length::Fill).spacing(0);
+    for (row_index, row_size) in row_sizes.iter().copied().enumerate() {
+        let mut overview_row = row![]
+            .height(Length::Shrink)
+            .align_y(Alignment::Center)
+            .spacing(0);
+        for card_index in 0..row_size {
+            if card_index > 0 {
+                overview_row = overview_row.push(
+                    container(rule::vertical(1.0).style(style::split_ruler))
+                        .width(1)
+                        .height(64)
+                        .align_y(Alignment::Center),
+                );
+            }
+            if let Some(card) = cards.next() {
+                overview_row = overview_row.push(card);
+            }
         }
-        overview = overview.push(card);
+        if row_index > 0 {
+            overview = overview.push(rule::horizontal(1.0).style(style::split_ruler));
+        }
+        overview = overview.push(overview_row);
     }
     container(overview)
         .width(Length::Fill)
@@ -587,12 +593,20 @@ fn cards_layout<'a>(
         .into()
 }
 
-fn analytics_layout_rows(_width: f32, card_count: usize) -> Vec<usize> {
-    if card_count == 0 {
-        Vec::new()
-    } else {
-        vec![card_count]
+fn analytics_layout_rows(density: GexLayoutDensity, card_count: usize) -> Vec<usize> {
+    let cards_per_row = match density {
+        GexLayoutDensity::Full => card_count.max(1),
+        GexLayoutDensity::Compact => 2,
+        GexLayoutDensity::Minimal => 1,
+    };
+    let mut remaining = card_count;
+    let mut rows = Vec::new();
+    while remaining > 0 {
+        let row_size = remaining.min(cards_per_row);
+        rows.push(row_size);
+        remaining -= row_size;
     }
+    rows
 }
 
 fn format_ratio(ratio: f64) -> String {
@@ -659,7 +673,7 @@ fn cfg_bps(chart: &gex::GexChart) -> f64 {
 
 fn reference_label(ticker: exchange::TickerInfo, depth_bps: f64) -> String {
     let (symbol, _) = ticker.ticker.display_symbol_and_type();
-    format!("{} {symbol} · ±{depth_bps:.0} bps", ticker.exchange())
+    format!("{} {symbol} ±{depth_bps:.0} bps", ticker.exchange())
 }
 
 fn format_unsigned_exposure(value: f64) -> String {
@@ -709,13 +723,13 @@ fn header_view<'a>(
         row![
             zoom_button(
                 include_bytes!("../../../assets/ui/zoom-in.svg"),
-                "Zoom in · double-click chart to auto fit",
+                "Zoom in (double-click to auto fit)",
                 chart.can_zoom_in(),
                 gex::Message::ZoomIn,
             ),
             zoom_button(
                 include_bytes!("../../../assets/ui/zoom-out.svg"),
-                "Zoom out · double-click chart to auto fit",
+                "Zoom out (double-click to auto fit)",
                 chart.can_zoom_out(),
                 gex::Message::ZoomOut,
             )
@@ -790,23 +804,25 @@ fn header_view<'a>(
     if cfg.show_header_freshness {
         push("●", status.into());
     }
-    if let Some(flow) = chart.derive_flow() {
-        let window = &flow.thirty_minutes;
-        push(
-            "Derive Maker Flow 30m",
-            format!("{} · {:+.0}%", window.direction, window.imbalance * 100.0),
-        );
-        push(
-            "Derive",
-            format!(
-                "{} trades · {:.0}% matched · Quality: {}",
-                window.trade_count,
-                window.matched_deribit_gex_share * 100.0,
-                window.quality
-            ),
-        );
-    } else {
-        push("Derive Maker Flow 30m", "Unavailable".into());
+    if cfg.show_header_derive_flow {
+        if let Some(flow) = chart.derive_flow() {
+            let window = &flow.thirty_minutes;
+            push(
+                "Derive flow 30m",
+                format!("{} / {:+.0}%", window.direction, window.imbalance * 100.0),
+            );
+            push(
+                "Derive quality",
+                format!(
+                    "{} trades, {:.0}% matched, {}",
+                    window.trade_count,
+                    window.matched_deribit_gex_share * 100.0,
+                    window.quality
+                ),
+            );
+        } else {
+            push("Derive flow 30m", "Unavailable".into());
+        }
     }
     if cfg.show_header_snapshot || abnormal {
         push(
@@ -1259,7 +1275,7 @@ fn draw_references(
             columns,
             (sy + fy) * 0.5,
             &format!(
-                "{} {:.2} · {} {:.2}",
+                "{} {:.2} / {} {:.2}",
                 if density == GexLayoutDensity::Minimal {
                     "S"
                 } else {
@@ -1373,7 +1389,7 @@ fn draw_hover(
     spot: f64,
     palette: &iced::theme::palette::Extended,
 ) {
-    let bounds = hover_bounds(cursor, Size::new(250.0, 148.0), chart_size);
+    let bounds = hover_bounds(cursor, Size::new(230.0, 103.0), chart_size);
     frame.fill(
         &canvas::Path::rectangle(Point::new(bounds.x + 2.0, bounds.y + 2.0), bounds.size()),
         Color::BLACK.scale_alpha(0.24),
@@ -1392,14 +1408,8 @@ fn draw_hover(
         ),
         ("Call GEX", format_exposure(strike.call_gex_1pct)),
         ("Put GEX", format_exposure(strike.put_gex_1pct)),
-        ("Net GEX", format_exposure(strike.net_gex_1pct)),
-        (
-            "Absolute Gamma",
-            format_exposure(strike.absolute_gamma_1pct),
-        ),
         ("Call OI", format!("{:.2}", strike.call_open_interest)),
         ("Put OI", format!("{:.2}", strike.put_open_interest)),
-        ("Expiries", strike.expiration_count.to_string()),
     ];
     for (index, (label, value)) in rows.into_iter().enumerate() {
         let y = bounds.y + 10.0 + index as f32 * 15.0;
@@ -1604,12 +1614,16 @@ mod tests {
     }
 
     #[test]
-    fn analytics_overview_always_uses_one_row() {
-        assert_eq!(analytics_layout_rows(900.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(700.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(320.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(700.0, 2), vec![2]);
-        assert_eq!(analytics_layout_rows(320.0, 1), vec![1]);
-        assert!(analytics_layout_rows(900.0, 0).is_empty());
+    fn analytics_overview_wraps_at_compact_breakpoints() {
+        assert_eq!(analytics_layout_rows(GexLayoutDensity::Full, 3), vec![3]);
+        assert_eq!(
+            analytics_layout_rows(GexLayoutDensity::Compact, 3),
+            vec![2, 1]
+        );
+        assert_eq!(
+            analytics_layout_rows(GexLayoutDensity::Minimal, 3),
+            vec![1, 1, 1]
+        );
+        assert!(analytics_layout_rows(GexLayoutDensity::Full, 0).is_empty());
     }
 }

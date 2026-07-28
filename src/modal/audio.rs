@@ -316,6 +316,18 @@ impl AudioStream {
         cache.play(sound)
     }
 
+    fn play_or_disable(&mut self, sound: SoundType) -> Option<String> {
+        match self.play(sound) {
+            Ok(()) => None,
+            Err(err) => {
+                let message = err.to_string();
+                log::error!("Audio play error: {message}");
+                self.disable_audio(err)
+                    .then(|| format!("Audio disabled: {message}"))
+            }
+        }
+    }
+
     pub fn is_stream_audio_enabled(&self, stream: &StreamKind) -> bool {
         match stream {
             StreamKind::Trades { ticker_info } => self
@@ -384,30 +396,54 @@ impl AudioStream {
                     }
                 };
 
-                let play_one = |this: &mut Self, s: SoundType| -> Option<String> {
-                    match this.play(s) {
-                        Ok(()) => None,
-                        Err(err) => {
-                            let msg = err.to_string();
-                            log::error!("Audio play error: {msg}");
-
-                            if this.disable_audio(err) {
-                                Some(format!("Audio disabled: {msg}"))
-                            } else {
-                                None
-                            }
+                match buy_count.cmp(&sell_count) {
+                    std::cmp::Ordering::Greater => self.play_or_disable(sound(buy_count, false)),
+                    std::cmp::Ordering::Less => self.play_or_disable(sound(sell_count, true)),
+                    std::cmp::Ordering::Equal => self
+                        .play_or_disable(sound(buy_count, false))
+                        .or_else(|| self.play_or_disable(sound(sell_count, true))),
+                }
+            }
+            data::audio::Threshold::Qty(threshold) => {
+                let (max_buy, max_sell) = trades_buffer.iter().fold(
+                    (exchange::unit::Qty::ZERO, exchange::unit::Qty::ZERO),
+                    |(buy, sell), trade| {
+                        if trade.is_sell {
+                            (buy, sell.max(trade.qty))
+                        } else {
+                            (buy.max(trade.qty), sell)
                         }
+                    },
+                );
+                let buy_qualifies = max_buy >= threshold;
+                let sell_qualifies = max_sell >= threshold;
+                if !buy_qualifies && !sell_qualifies {
+                    return None;
+                }
+
+                let sound = |qty: exchange::unit::Qty, is_sell: bool| {
+                    let hard = qty.to_f64() > threshold.to_f64() * HARD_THRESHOLD as f64;
+                    match (hard, is_sell) {
+                        (true, true) => SoundType::HardSell,
+                        (true, false) => SoundType::HardBuy,
+                        (false, true) => SoundType::Sell,
+                        (false, false) => SoundType::Buy,
                     }
                 };
 
-                match buy_count.cmp(&sell_count) {
-                    std::cmp::Ordering::Greater => play_one(self, sound(buy_count, false)),
-                    std::cmp::Ordering::Less => play_one(self, sound(sell_count, true)),
-                    std::cmp::Ordering::Equal => play_one(self, sound(buy_count, false))
-                        .or_else(|| play_one(self, sound(sell_count, true))),
+                match (buy_qualifies, sell_qualifies) {
+                    (true, false) => self.play_or_disable(sound(max_buy, false)),
+                    (false, true) => self.play_or_disable(sound(max_sell, true)),
+                    (true, true) => match max_buy.cmp(&max_sell) {
+                        std::cmp::Ordering::Greater => self.play_or_disable(sound(max_buy, false)),
+                        std::cmp::Ordering::Less => self.play_or_disable(sound(max_sell, true)),
+                        std::cmp::Ordering::Equal => self
+                            .play_or_disable(sound(max_buy, false))
+                            .or_else(|| self.play_or_disable(sound(max_sell, true))),
+                    },
+                    (false, false) => None,
                 }
             }
-            data::audio::Threshold::Qty(_) => todo!(),
         }
     }
 

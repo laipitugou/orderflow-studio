@@ -45,7 +45,10 @@ impl ComparisonChart {
     pub fn new(basis: Basis, tickers: &[TickerInfo], config: Option<Config>) -> Self {
         let timeframe = match basis {
             Basis::Time(tf) => tf,
-            Basis::Tick(_) => todo!("WIP: ComparisonChart does not support tick basis"),
+            Basis::Tick(_) => {
+                log::warn!("COMPARISON InvalidBasis | basis=tick fallback=15m");
+                Timeframe::M15
+            }
         };
 
         let cfg = config.unwrap_or_default();
@@ -379,7 +382,10 @@ impl ComparisonChart {
                 let reqs = self.collect_fetch_reqs(self.desired_fetch_batches(self.pan));
                 self.fetch_action(reqs)
             }
-            Basis::Tick(_) => unimplemented!(),
+            Basis::Tick(_) => {
+                log::warn!("COMPARISON BasisChangeRejected | basis=tick");
+                None
+            }
         }
     }
 

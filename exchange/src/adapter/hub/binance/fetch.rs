@@ -20,8 +20,11 @@ use std::{
     io::BufReader,
     path::PathBuf,
     sync::{LazyLock, Mutex},
+    time::Duration,
     time::UNIX_EPOCH,
 };
+
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Binance can publish a daily archive after the UTC day has already closed.
 /// Remember a 404 for the lifetime of the process so REST pagination does not
@@ -212,12 +215,17 @@ pub(super) async fn fetch_ticker_metadata(
     market: MarketKind,
 ) -> Result<super::super::TickerMetadataMap, AdapterError> {
     let (url, weight) = match market {
-        MarketKind::Spot => (format!("{SPOT_DOMAIN}/api/v3/exchangeInfo"), 20),
+        MarketKind::Spot => (
+            format!("{SPOT_DOMAIN}/api/v3/exchangeInfo?showPermissionSets=false"),
+            20,
+        ),
         MarketKind::LinearPerps => (format!("{LINEAR_PERP_DOMAIN}/fapi/v1/exchangeInfo"), 1),
         MarketKind::InversePerps => (format!("{INVERSE_PERP_DOMAIN}/dapi/v1/exchangeInfo"), 1),
     };
 
-    let response_text = hub.http_text_with_limiter(&url, weight, None, None).await?;
+    let response_text = hub
+        .http_text_with_limiter_timeout(&url, weight, None, None, METADATA_REQUEST_TIMEOUT)
+        .await?;
 
     let exchange_info: Value = serde_json::from_str(&response_text)
         .map_err(|e| AdapterError::ParseError(format!("Failed to parse exchange info: {e}")))?;
