@@ -196,12 +196,6 @@ impl GroupedTrades {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-pub enum BubbleHistoricalMode {
-    #[default]
-    SummaryOnly,
-}
-
 pub type VolumeBubbleClusterId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -895,7 +889,6 @@ pub struct VolumeBubbleConfig {
     pub max_bubbles_per_bar: usize,
     pub max_bubbles_in_view: usize,
     pub max_labels_in_view: usize,
-    pub historical_mode: BubbleHistoricalMode,
     pub max_candidates_per_candle: usize,
     pub history_window_minutes: u64,
     pub use_raw_trades_when_available: bool,
@@ -932,7 +925,6 @@ impl Default for VolumeBubbleConfig {
             max_bubbles_per_bar: 3,
             max_bubbles_in_view: 40,
             max_labels_in_view: 6,
-            historical_mode: BubbleHistoricalMode::SummaryOnly,
             max_candidates_per_candle: 32,
             history_window_minutes: 30,
             use_raw_trades_when_available: true,
@@ -1007,7 +999,6 @@ struct VolumeBubbleConfigWire {
     max_bubbles_per_bar: Option<usize>,
     max_bubbles_in_view: Option<usize>,
     max_labels_in_view: Option<usize>,
-    historical_mode: Option<BubbleHistoricalMode>,
     max_candidates_per_candle: Option<usize>,
     history_window_minutes: Option<u64>,
     use_raw_trades_when_available: Option<bool>,
@@ -1062,7 +1053,6 @@ impl<'de> Deserialize<'de> for VolumeBubbleConfig {
             .max_bubbles_in_view
             .unwrap_or(config.max_bubbles_in_view);
         config.max_labels_in_view = wire.max_labels_in_view.unwrap_or(config.max_labels_in_view);
-        config.historical_mode = wire.historical_mode.unwrap_or(config.historical_mode);
         config.max_candidates_per_candle = wire
             .max_candidates_per_candle
             .unwrap_or(config.max_candidates_per_candle);

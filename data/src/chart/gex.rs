@@ -21,34 +21,6 @@ const FLIP_BISECTION_STEPS: usize = 60;
 pub const DEFAULT_SCENARIO_POINTS: usize = 512;
 pub const NATIVE_GAMMA_MAX_AGE_MS: u64 = 90_000;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum GexOverlayMode {
-    #[default]
-    GexZoneOverlay,
-}
-
-impl GexOverlayMode {
-    pub const ALL: [Self; 1] = [Self::GexZoneOverlay];
-}
-
-impl<'de> Deserialize<'de> for GexOverlayMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "GexZoneOverlay" | "Levels" | "NetHeatmap" | "AbsoluteHeatmap" | "ScenarioHeatmap" => {
-                Ok(Self::GexZoneOverlay)
-            }
-            _ => Err(serde::de::Error::unknown_variant(
-                &value,
-                &["GexZoneOverlay"],
-            )),
-        }
-    }
-}
-
 macro_rules! display_enum {
     ($name:ident, $($variant:ident => $label:literal),+ $(,)?) => {
         impl std::fmt::Display for $name {
@@ -61,28 +33,22 @@ macro_rules! display_enum {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexScenarioResolution {
-    #[default]
-    Auto,
     Samples128,
     Samples256,
+    #[default]
+    #[serde(alias = "Auto")]
     Samples512,
 }
 impl GexScenarioResolution {
-    pub const ALL: [Self; 4] = [
-        Self::Auto,
-        Self::Samples128,
-        Self::Samples256,
-        Self::Samples512,
-    ];
     pub const fn samples(self) -> usize {
         match self {
-            Self::Auto | Self::Samples512 => 512,
             Self::Samples128 => 128,
             Self::Samples256 => 256,
+            Self::Samples512 => 512,
         }
     }
 }
-display_enum!(GexScenarioResolution, Auto => "Auto (512)", Samples128 => "128 samples", Samples256 => "256 samples", Samples512 => "512 samples");
+display_enum!(GexScenarioResolution, Samples128 => "128 samples", Samples256 => "256 samples", Samples512 => "512 samples");
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexGammaSource {
@@ -103,12 +69,6 @@ pub enum GexGammaProvenance {
     Mixed,
 }
 display_enum!(GexGammaProvenance, Native => "Provider native", Derived => "Black-Scholes derived", Mixed => "Mixed native / derived");
-
-impl std::fmt::Display for GexOverlayMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("GEX Zone Overlay")
-    }
-}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum GexSignModel {
@@ -209,8 +169,6 @@ impl std::fmt::Display for GexLevelColor {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GexLevelsConfig {
-    #[serde(default)]
-    pub overlay_mode: GexOverlayMode,
     pub expiry_filter: GexExpiryFilter,
     pub gamma_source: GexGammaSource,
     pub minimum_open_interest: f64,
@@ -236,7 +194,6 @@ pub struct GexLevelsConfig {
 impl Default for GexLevelsConfig {
     fn default() -> Self {
         Self {
-            overlay_mode: GexOverlayMode::GexZoneOverlay,
             expiry_filter: GexExpiryFilter::SevenDays,
             gamma_source: GexGammaSource::ProviderNativePreferred,
             minimum_open_interest: 0.0,
@@ -263,7 +220,6 @@ impl Default for GexLevelsConfig {
 
 impl GexLevelsConfig {
     pub fn migrate_legacy_defaults(&mut self) {
-        self.overlay_mode = GexOverlayMode::GexZoneOverlay;
         if self.history_minutes == 240 {
             self.history_minutes = 1440;
         }
@@ -318,7 +274,7 @@ impl Default for Config {
             sign_model: GexSignModel::CallPutOiProxy,
             expiry_filter: GexExpiryFilter::SevenDays,
             gamma_source: GexGammaSource::ProviderNativePreferred,
-            scenario_resolution: GexScenarioResolution::Auto,
+            scenario_resolution: GexScenarioResolution::Samples512,
             max_native_gamma_instruments: 128,
             min_open_interest: 0.0,
             min_absolute_gex: 0.0,
@@ -2740,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_overlay_modes_migrate_to_zone_overlay() {
+    fn legacy_overlay_modes_are_ignored() {
         for mode in ["Levels", "NetHeatmap", "AbsoluteHeatmap", "ScenarioHeatmap"] {
             let mut config: GexLevelsConfig = serde_json::from_value(serde_json::json!({
                 "overlay_mode": mode,
@@ -2748,7 +2704,6 @@ mod tests {
             }))
             .expect("legacy GEX overlay config");
             config.migrate_legacy_defaults();
-            assert_eq!(config.overlay_mode, GexOverlayMode::GexZoneOverlay);
             assert_eq!(config.current_profile_width_percent, 7.0);
         }
     }
@@ -2809,7 +2764,6 @@ mod tests {
     #[test]
     fn new_config_roundtrips_with_zone_defaults() {
         let config = GexLevelsConfig::default();
-        assert_eq!(config.overlay_mode, GexOverlayMode::GexZoneOverlay);
         assert_eq!(config.current_profile_width_percent, 5.0);
         assert_eq!(config.positive_color, GexLevelColor::Cyan);
         assert_eq!(config.negative_color, GexLevelColor::Magenta);
@@ -2827,6 +2781,14 @@ mod tests {
         };
         config.migrate_legacy_defaults();
         assert_eq!(config.history_minutes, 1440);
+    }
+
+    #[test]
+    fn legacy_auto_resolution_migrates_to_explicit_512_samples() {
+        let resolution: GexScenarioResolution =
+            serde_json::from_str("\"Auto\"").expect("legacy resolution");
+        assert_eq!(resolution, GexScenarioResolution::Samples512);
+        assert_eq!(resolution.samples(), 512);
     }
 
     #[test]

@@ -8,18 +8,6 @@ use crate::chart::{
 };
 
 #[derive(Clone, Copy)]
-#[allow(unused)]
-/// How to anchor bar heights.
-pub enum Baseline {
-    /// Use zero as baseline (classic volume). Extents: [0, max].
-    Zero,
-    /// Use the minimum value in the visible range. Extents: [min, max].
-    Min,
-    /// Use a fixed numeric baseline.
-    Fixed(f32),
-}
-
-#[derive(Clone, Copy)]
 /// What kind of bar to render, and whether it carries a signed overlay.
 /// The sign of `overlay` selects up (success) vs down (danger).
 pub enum BarClass {
@@ -33,39 +21,24 @@ pub struct BarPlot<V, CL, T> {
     /// Maps a datapoint to the scalar value represented by the bar (before baseline).
     pub value: V,
     pub bar_width_factor: f32,
-    pub padding: f32,
     pub classify: CL, // Single vs Overlay with signed overlay
     pub tooltip: Option<TooltipFn<T>>,
-    pub baseline: Baseline,
     _phantom: std::marker::PhantomData<T>,
 }
 
-#[allow(dead_code)]
 impl<V, CL, T> BarPlot<V, CL, T> {
     pub fn new(value: V, classify: CL) -> Self {
         Self {
             value,
             bar_width_factor: 0.9,
-            padding: 0.0,
             classify,
             tooltip: None,
-            baseline: Baseline::Zero,
             _phantom: std::marker::PhantomData,
         }
     }
 
     pub fn bar_width_factor(mut self, f: f32) -> Self {
         self.bar_width_factor = f;
-        self
-    }
-
-    pub fn padding(mut self, p: f32) -> Self {
-        self.padding = p;
-        self
-    }
-
-    pub fn baseline(mut self, b: Baseline) -> Self {
-        self.baseline = b;
         self
     }
 
@@ -85,38 +58,21 @@ where
     CL: Fn(&S::Y) -> BarClass,
 {
     fn y_extents(&self, datapoints: &S, range: RangeInclusive<u64>) -> Option<(f32, f32)> {
-        let mut min_v = f32::MAX;
         let mut max_v = f32::MIN;
         let mut n = 0u32;
 
         datapoints.for_each_in(range, |_, y| {
             let v = (self.value)(y);
-            if v < min_v {
-                min_v = v;
-            }
             if v > max_v {
                 max_v = v;
             }
             n += 1;
         });
 
-        if n == 0 || (max_v <= 0.0 && matches!(self.baseline, Baseline::Zero)) {
+        if n == 0 || max_v <= 0.0 {
             return None;
         }
-
-        let min_ext = match self.baseline {
-            Baseline::Zero => 0.0,
-            Baseline::Min => min_v,
-            Baseline::Fixed(v) => v,
-        };
-
-        let lowest = min_ext;
-        let mut highest = max_v.max(min_ext + f32::EPSILON);
-        if highest > lowest && self.padding > 0.0 {
-            highest *= 1.0 + self.padding;
-        }
-
-        Some((lowest, highest))
+        Some((0.0, max_v.max(f32::EPSILON)))
     }
 
     fn draw(
@@ -131,11 +87,7 @@ where
         let palette = theme.extended_palette();
         let bar_width = ctx.cell_width * self.bar_width_factor;
 
-        let baseline_value = match self.baseline {
-            Baseline::Zero => 0.0,
-            Baseline::Min => scale.min, // extents min
-            Baseline::Fixed(v) => v,
-        };
+        let baseline_value = 0.0;
         let y_base = scale.to_y(baseline_value);
 
         datapoints.for_each_in(range, |x, y| {

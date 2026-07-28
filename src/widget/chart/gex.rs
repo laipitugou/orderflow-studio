@@ -12,8 +12,7 @@ use iced::{
 };
 
 pub fn view(chart: &gex::GexChart) -> Element<'_, gex::Message> {
-    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width), size.width))
-        .into()
+    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width))).into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +34,7 @@ impl GexLayoutDensity {
     }
 }
 
-fn view_sized(
-    chart: &gex::GexChart,
-    density: GexLayoutDensity,
-    width: f32,
-) -> Element<'_, gex::Message> {
+fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, gex::Message> {
     let Some(snapshot) = chart.snapshot() else {
         return iced::widget::center(text(if chart.freshness() == GexFreshness::Error {
             "GEX data unavailable."
@@ -54,7 +49,7 @@ fn view_sized(
     }
 
     let header = header_view(chart, snapshot, density);
-    let analytics = analytics_view(chart, snapshot, density, width);
+    let analytics = analytics_view(chart, snapshot, density);
     let table = canvas(GexProfileTable {
         snapshot,
         strikes: visible,
@@ -309,7 +304,6 @@ fn analytics_view<'a>(
     chart: &gex::GexChart,
     snapshot: &data::chart::gex::GexSnapshot,
     density: GexLayoutDensity,
-    width: f32,
 ) -> Element<'a, gex::Message> {
     let cfg = chart.config();
     let expiry = cfg.expiry_filter.to_string();
@@ -397,7 +391,7 @@ fn analytics_view<'a>(
         sections.push(liquidity_card(chart, &expiry, density));
     }
     sections.push(agreement_card(chart, snapshot, &expiry, density));
-    cards_layout(sections, width)
+    cards_layout(sections, density)
 }
 
 fn agreement_card<'a>(
@@ -558,25 +552,37 @@ fn liquidity_card<'a>(
 
 fn cards_layout<'a>(
     cards: Vec<Element<'a, gex::Message>>,
-    width: f32,
+    density: GexLayoutDensity,
 ) -> Element<'a, gex::Message> {
-    if analytics_layout_rows(width, cards.len()).is_empty() {
+    let row_sizes = analytics_layout_rows(density, cards.len());
+    if row_sizes.is_empty() {
         return space::vertical().height(0).into();
     }
-    let mut overview = row![]
-        .height(Length::Shrink)
-        .align_y(Alignment::Center)
-        .spacing(0);
-    for (index, card) in cards.into_iter().enumerate() {
-        if index > 0 {
-            overview = overview.push(
-                container(rule::vertical(1.0).style(style::split_ruler))
-                    .width(1)
-                    .height(64)
-                    .align_y(Alignment::Center),
-            );
+
+    let mut cards = cards.into_iter();
+    let mut overview = column![].width(Length::Fill).spacing(0);
+    for (row_index, row_size) in row_sizes.iter().copied().enumerate() {
+        let mut overview_row = row![]
+            .height(Length::Shrink)
+            .align_y(Alignment::Center)
+            .spacing(0);
+        for card_index in 0..row_size {
+            if card_index > 0 {
+                overview_row = overview_row.push(
+                    container(rule::vertical(1.0).style(style::split_ruler))
+                        .width(1)
+                        .height(64)
+                        .align_y(Alignment::Center),
+                );
+            }
+            if let Some(card) = cards.next() {
+                overview_row = overview_row.push(card);
+            }
         }
-        overview = overview.push(card);
+        if row_index > 0 {
+            overview = overview.push(rule::horizontal(1.0).style(style::split_ruler));
+        }
+        overview = overview.push(overview_row);
     }
     container(overview)
         .width(Length::Fill)
@@ -587,12 +593,20 @@ fn cards_layout<'a>(
         .into()
 }
 
-fn analytics_layout_rows(_width: f32, card_count: usize) -> Vec<usize> {
-    if card_count == 0 {
-        Vec::new()
-    } else {
-        vec![card_count]
+fn analytics_layout_rows(density: GexLayoutDensity, card_count: usize) -> Vec<usize> {
+    let cards_per_row = match density {
+        GexLayoutDensity::Full => card_count.max(1),
+        GexLayoutDensity::Compact => 2,
+        GexLayoutDensity::Minimal => 1,
+    };
+    let mut remaining = card_count;
+    let mut rows = Vec::new();
+    while remaining > 0 {
+        let row_size = remaining.min(cards_per_row);
+        rows.push(row_size);
+        remaining -= row_size;
     }
+    rows
 }
 
 fn format_ratio(ratio: f64) -> String {
@@ -1604,12 +1618,16 @@ mod tests {
     }
 
     #[test]
-    fn analytics_overview_always_uses_one_row() {
-        assert_eq!(analytics_layout_rows(900.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(700.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(320.0, 3), vec![3]);
-        assert_eq!(analytics_layout_rows(700.0, 2), vec![2]);
-        assert_eq!(analytics_layout_rows(320.0, 1), vec![1]);
-        assert!(analytics_layout_rows(900.0, 0).is_empty());
+    fn analytics_overview_wraps_at_compact_breakpoints() {
+        assert_eq!(analytics_layout_rows(GexLayoutDensity::Full, 3), vec![3]);
+        assert_eq!(
+            analytics_layout_rows(GexLayoutDensity::Compact, 3),
+            vec![2, 1]
+        );
+        assert_eq!(
+            analytics_layout_rows(GexLayoutDensity::Minimal, 3),
+            vec![1, 1, 1]
+        );
+        assert!(analytics_layout_rows(GexLayoutDensity::Full, 0).is_empty());
     }
 }

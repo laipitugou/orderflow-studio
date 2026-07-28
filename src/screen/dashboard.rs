@@ -381,7 +381,8 @@ impl Dashboard {
                             sign_model: data::chart::gex::GexSignModel::CallPutOiProxy,
                             expiry_filter: levels.expiry_filter,
                             gamma_source: levels.gamma_source,
-                            scenario_resolution: data::chart::gex::GexScenarioResolution::Auto,
+                            scenario_resolution:
+                                data::chart::gex::GexScenarioResolution::Samples512,
                             min_open_interest: levels.minimum_open_interest,
                             min_absolute_gex: levels.minimum_absolute_gex,
                             ..data::chart::gex::Config::default()
@@ -2534,6 +2535,8 @@ impl Dashboard {
                 continue;
             }
 
+            let streams_blocked = matches!(pane_state.streams, ResolvedStream::Blocked { .. });
+
             status.pane_count += 1;
             if matches!(
                 &pane_state.streams,
@@ -2541,10 +2544,10 @@ impl Dashboard {
             ) {
                 status.unresolved_streams += 1;
             }
-            if !pane_state.content.initialized() {
+            if !streams_blocked && !pane_state.content.initialized() {
                 status.initializing_panes += 1;
             }
-            if matches!(pane_state.status, pane::Status::Loading { .. }) {
+            if !streams_blocked && matches!(pane_state.status, pane::Status::Loading { .. }) {
                 status.loading_panes += 1;
             }
             if matches!(
@@ -3170,5 +3173,34 @@ mod gex_liquidity_reference_tests {
                 .collect::<Vec<_>>();
             assert_eq!(depth, vec![expected]);
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_load_status_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_streams_do_not_prevent_startup() {
+        let mut pane = pane::State::from_config(
+            pane::Content::TimeAndSales(None),
+            Vec::new(),
+            data::layout::pane::Settings::default(),
+            None,
+        );
+        pane.streams = ResolvedStream::Blocked {
+            streams: Vec::new(),
+            reason: "metadata unavailable".to_string(),
+            last_attempt: None,
+        };
+
+        let dashboard =
+            Dashboard::from_config(Configuration::Pane(pane), Vec::new(), uuid::Uuid::new_v4());
+        let status = dashboard.startup_load_status(window::Id::unique());
+
+        assert_eq!(status.pane_count, 1);
+        assert_eq!(status.initializing_panes, 0);
+        assert_eq!(status.loading_panes, 0);
+        assert!(status.is_ready());
     }
 }

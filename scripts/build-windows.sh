@@ -1,13 +1,6 @@
 #!/bin/bash
 EXE_NAME="flowsurface.exe"
 ARCH=${1:-x86_64} # x86_64 | aarch64
-VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
-
-# update package version on Cargo.toml
-cargo install cargo-edit
-cargo set-version $VERSION
-
-rustup override set stable-msvc
 
 # set target triple and zip name
 if [ "$ARCH" = "aarch64" ]; then

@@ -2522,10 +2522,6 @@ impl canvas::Program<Message> for KlineChart {
                 KlineChartKind::Candles => {
                     let candle_width = chart.cell_width * 0.8;
                     let svp = self.visual_config.session_volume_profile;
-                    let latest_chart_price = self
-                        .data_source
-                        .latest_y_midpoint(|kline| kline.close.to_f32_lossy())
-                        as f64;
                     let chart_interval_ms = match chart.basis {
                         Basis::Time(interval) => interval.to_milliseconds(),
                         Basis::Tick(_) => 60_000,
@@ -2545,7 +2541,6 @@ impl canvas::Program<Message> for KlineChart {
                             self.gex_freshness,
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
-                            latest_chart_price,
                             latest,
                             chart.latest_x,
                             proxy_asset,
@@ -2672,18 +2667,12 @@ impl canvas::Program<Message> for KlineChart {
                             interval_to_x,
                             snapshot,
                             &self.gex_history,
-                            self.gex_freshness,
                             self.derive_flow.as_deref(),
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
-                            chart.tick_size,
-                            latest_chart_price,
-                            latest,
                             chart_interval_ms,
                             region,
                             chart.scaling,
-                            visible_low.to_f64(),
-                            visible_high.to_f64(),
                             palette,
                         );
                     }
@@ -3045,7 +3034,6 @@ fn draw_gex_overlay_background(
     freshness: data::chart::gex::GexFreshness,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
-    _latest_chart_price: f64,
     latest_candle_time: u64,
     actual_latest_candle_time: u64,
     proxy_asset: Option<exchange::options::OptionsUnderlying>,
@@ -3439,21 +3427,14 @@ fn draw_gex_overlay_foreground(
     time_to_x: impl Fn(u64) -> f32 + Copy,
     snapshot: &data::chart::gex::GexSnapshot,
     history: &[Arc<data::chart::gex::GexSnapshot>],
-    _freshness: data::chart::gex::GexFreshness,
     derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
-    tick_size: PriceStep,
-    latest_chart_price: f64,
-    latest_candle_time: u64,
     chart_interval_ms: u64,
     visible_region: Rectangle,
     chart_scaling: f32,
-    visible_low: f64,
-    visible_high: f64,
     palette: &Extended,
 ) {
-    let _ = (tick_size, latest_chart_price, visible_low, visible_high);
     draw_gex_zone_cores(
         frame,
         price_to_y,
@@ -3463,7 +3444,6 @@ fn draw_gex_overlay_foreground(
         config,
         visible_region,
         chart_scaling,
-        latest_candle_time,
         chart_interval_ms,
     );
     if config.show_current_profile {
@@ -3788,12 +3768,10 @@ fn draw_gex_zone_cores(
     config: &data::chart::gex::GexLevelsConfig,
     region: Rectangle,
     scaling: f32,
-    latest_candle_time: u64,
     bucket_ms: u64,
 ) {
     let bucket_ms = bucket_ms.max(1);
     let frames = cached_gex_zone_frames(history, bucket_ms, config, render_cache);
-    let _ = latest_candle_time;
     for (frame_index, zone_frame) in frames.iter().enumerate() {
         if !config.show_historical_zones && frame_index + 1 != frames.len() {
             continue;
@@ -6970,25 +6948,6 @@ mod tests {
             interval_ms,
             UnixMs::new(latest),
         )
-    }
-
-    #[test]
-    fn proxy_zone_geometry_is_independent_from_viewport_and_zoom() {
-        let points = vec![proxy_test_point(0), proxy_test_point(5 * 60_000)];
-        let frames = proxy_frames(&points, &[], 60_000, 10 * 60_000);
-        let runs_before = build_gex_proxy_zone_runs(&frames);
-        let narrow_view = Rectangle::new(Point::new(2.0, 90.0), Size::new(3.0, 20.0));
-        let wide_view = Rectangle::new(Point::new(-10.0, 0.0), Size::new(100.0, 500.0));
-        let _ = (narrow_view, wide_view);
-        let runs_after = build_gex_proxy_zone_runs(&frames);
-        assert_eq!(runs_before.len(), runs_after.len());
-        for (before, after) in runs_before.iter().zip(runs_after.iter()) {
-            assert_eq!(
-                (before.role, before.start, before.end),
-                (after.role, after.start, after.end)
-            );
-            assert_eq!(before.center_price, after.center_price);
-        }
     }
 
     #[test]

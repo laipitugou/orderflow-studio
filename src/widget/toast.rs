@@ -18,7 +18,6 @@ const MAX_TOAST_BODY_HEIGHT: f32 = 120.0;
 
 const MIN_VISIBLE_TOAST_HEIGHT: f32 = 40.0;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Status {
     #[default]

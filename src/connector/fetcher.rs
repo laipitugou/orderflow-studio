@@ -1,4 +1,3 @@
-use super::market_data::{DataRequirement, DataSet, RefreshPolicy, RequestKey, TimeRange};
 use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summaries};
 use data::chart::kline::{BubbleVolumeSummary, VolumeBubbleConfig, cluster_volume_bubble_trades};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
@@ -1016,63 +1015,6 @@ impl FetchRange {
             FetchRange::OpenInterest { from, to, .. } => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
-    }
-
-    /// Compatibility bridge used while legacy chart callers are migrated to
-    /// declaring `DataRequirement` directly. Bubble summaries deliberately map
-    /// to raw trades: aggregation is a derivation concern, not a transport.
-    pub fn requirement(self, stream: StreamKind) -> Option<(RequestKey, DataRequirement)> {
-        let (dataset, from, to) = match (self, stream) {
-            (FetchRange::Kline(from, to), StreamKind::Kline { timeframe, .. }) => (
-                DataSet::Klines {
-                    timeframe_ms: timeframe.to_milliseconds(),
-                },
-                from,
-                to,
-            ),
-            (
-                FetchRange::OpenInterest {
-                    from,
-                    to,
-                    timeframe,
-                },
-                StreamKind::Kline { ticker_info, .. },
-            ) => {
-                let source_stream = StreamKind::Kline {
-                    ticker_info,
-                    timeframe,
-                };
-                let range = TimeRange::new(from, to)?;
-                let dataset = DataSet::OpenInterest;
-                let key = RequestKey::new(source_stream, dataset)?;
-                return Some((
-                    key,
-                    DataRequirement {
-                        dataset,
-                        range,
-                        refresh: RefreshPolicy::Historical,
-                    },
-                ));
-            }
-            (FetchRange::Trades(from, to), StreamKind::Trades { .. }) => {
-                (DataSet::Trades, from, to)
-            }
-            (FetchRange::BubbleSummary { from, to, .. }, StreamKind::Kline { ticker_info, .. }) => {
-                return DataRequirement::trades(TimeRange::new(from, to)?)
-                    .with_stream(StreamKind::Trades { ticker_info });
-            }
-            _ => return None,
-        };
-        let range = TimeRange::new(from, to)?;
-        let key = RequestKey::new(stream, dataset)?;
-        Some((
-            key,
-            DataRequirement {
-                dataset,
-                range,
-                refresh: RefreshPolicy::Historical,
-            },
-        ))
     }
 }
 
@@ -2698,28 +2640,6 @@ mod tests {
                 && actual_req == req_id
                 && (from, to) == range
         ));
-    }
-
-    #[test]
-    fn open_interest_requirement_uses_explicit_source_timeframe() {
-        let ticker_info = ticker_info();
-        let chart_stream = StreamKind::Kline {
-            ticker_info,
-            timeframe: Timeframe::M1,
-        };
-        let request = FetchRange::OpenInterest {
-            from: UnixMs::new(1),
-            to: UnixMs::new(2),
-            timeframe: Timeframe::M5,
-        };
-        let (key, _) = request.requirement(chart_stream).unwrap();
-        assert_eq!(
-            key.stream,
-            StreamKind::Kline {
-                ticker_info,
-                timeframe: Timeframe::M5,
-            }
-        );
     }
 
     fn trade(id: Option<u64>, time: u64) -> Trade {

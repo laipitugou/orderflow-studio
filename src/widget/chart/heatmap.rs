@@ -119,8 +119,9 @@ impl HeatmapShader {
         indicators: Vec<HeatmapIndicator>,
         config: Option<data::chart::heatmap::Config>,
     ) -> Self {
-        let depth_history = HistoricalDepth::new(ticker_info.min_qty, step, basis);
-        let trades = TimeSeries::<HeatmapDataPoint>::new(basis, step);
+        let (basis, timeframe) = data::chart::heatmap::normalize_basis(basis, ticker_info);
+        let depth_history = HistoricalDepth::new(ticker_info.min_qty, step, timeframe);
+        let trades = TimeSeries::<HeatmapDataPoint>::new(timeframe, step);
 
         let qty_scale: f32 = match exchange::unit::qty::volume_size_unit() {
             exchange::SizeUnit::Base => {

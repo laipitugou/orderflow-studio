@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use crate::chart::Basis;
 use crate::chart::heatmap::HeatmapDataPoint;
 use crate::chart::kline::{
     BubbleVolumeSummary, ClusterKind, KlineDataPoint, KlineTrades, NPoc, TradeCoverage,
@@ -509,12 +508,7 @@ impl TimeSeries<KlineDataPoint> {
 }
 
 impl TimeSeries<HeatmapDataPoint> {
-    pub fn new(basis: Basis, tick_size: PriceStep) -> Self {
-        let timeframe = match basis {
-            Basis::Time(interval) => interval,
-            Basis::Tick(_) => unimplemented!(),
-        };
-
+    pub fn new(timeframe: Timeframe, tick_size: PriceStep) -> Self {
         Self {
             datapoints: BTreeMap::new(),
             interval: timeframe,

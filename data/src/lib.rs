@@ -1253,10 +1253,6 @@ mod tests {
                     levels.expiry_filter,
                     crate::chart::gex::GexExpiryFilter::ThirtyDays
                 );
-                assert_eq!(
-                    levels.overlay_mode,
-                    crate::chart::gex::GexOverlayMode::GexZoneOverlay
-                );
                 assert_eq!(levels.current_profile_width_percent, 5.0);
 
                 let serialized = serde_json::to_value(config).unwrap();

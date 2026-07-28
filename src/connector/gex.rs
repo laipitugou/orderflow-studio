@@ -21,51 +21,6 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum GexHistoryError {
-    #[error("local GEX history cache is unavailable")]
-    CacheUnavailable,
-}
-
-#[allow(dead_code)]
-pub trait GexHistoryProvider {
-    async fn load_range(
-        &self,
-        series: &DerivedGexSeriesKey,
-        from: UnixMs,
-        to: UnixMs,
-    ) -> Result<Vec<GexSnapshot>, GexHistoryError>;
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LocalGexHistoryProvider;
-
-impl LocalGexHistoryProvider {
-    fn load_range_detailed(
-        self,
-        series: &DerivedGexSeriesKey,
-        from: UnixMs,
-        to: UnixMs,
-    ) -> Result<crate::connector::persistent_cache::GexHistoryCacheRead, GexHistoryError> {
-        crate::connector::persistent_cache::market_cache()
-            .map(|cache| cache.read_gex_history_detailed(&series_cache_key(*series), from, to))
-            .ok_or(GexHistoryError::CacheUnavailable)
-    }
-}
-
-impl GexHistoryProvider for LocalGexHistoryProvider {
-    async fn load_range(
-        &self,
-        series: &DerivedGexSeriesKey,
-        from: UnixMs,
-        to: UnixMs,
-    ) -> Result<Vec<GexSnapshot>, GexHistoryError> {
-        crate::connector::persistent_cache::market_cache()
-            .map(|cache| cache.read_gex_history(&series_cache_key(*series), from, to))
-            .ok_or(GexHistoryError::CacheUnavailable)
-    }
-}
-
 pub const INSTRUMENT_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MARKET_SNAPSHOT_TTL_MS: u64 = 15 * 1_000;
 pub const FRESH_THRESHOLD_MS: u64 = 45 * 1_000;
@@ -231,7 +186,6 @@ pub struct GexDataCoordinator {
     next_revision: u64,
     cache_path: PathBuf,
     persist_heatmap: bool,
-    history_provider: LocalGexHistoryProvider,
 }
 
 impl Default for GexDataCoordinator {
@@ -277,7 +231,6 @@ impl GexDataCoordinator {
             next_revision: 1,
             cache_path,
             persist_heatmap,
-            history_provider: LocalGexHistoryProvider,
         };
         coordinator.load_persistent();
         for underlying in OptionsUnderlying::ALL {
@@ -1026,10 +979,7 @@ impl GexDataCoordinator {
         self.loaded_history.insert(key);
         let from = now.saturating_sub(24 * 60 * 60 * 1_000);
         let canonical = series_cache_key(key);
-        let mut report = self
-            .history_provider
-            .load_range_detailed(&key, from, now)
-            .unwrap_or_default();
+        let mut report = cache.read_gex_history_detailed(&canonical, from, now);
         let legacy = legacy_series_cache_key(key);
         let legacy_report = cache.read_gex_history_detailed(&legacy, from, now);
         if !legacy_report.snapshots.is_empty() {
@@ -1752,7 +1702,7 @@ mod tests {
             model: GexSignModel::CallPutOiProxy,
             gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
-            scenario_resolution: GexScenarioResolution::Auto,
+            scenario_resolution: GexScenarioResolution::Samples512,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };
@@ -1781,7 +1731,7 @@ mod tests {
             model: GexSignModel::CallPutOiProxy,
             gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
-            scenario_resolution: GexScenarioResolution::Auto,
+            scenario_resolution: GexScenarioResolution::Samples512,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };
@@ -1807,7 +1757,7 @@ mod tests {
             model: GexSignModel::CallPutOiProxy,
             gamma_source: GexGammaSource::ProviderNativePreferred,
             expiry: GexExpiryFilter::SevenDays,
-            scenario_resolution: GexScenarioResolution::Auto,
+            scenario_resolution: GexScenarioResolution::Samples512,
             min_oi_bits: 0.0f64.to_bits(),
             min_gex_bits: 0.0f64.to_bits(),
         };
