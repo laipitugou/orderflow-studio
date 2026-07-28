@@ -1,6 +1,6 @@
 # Binance USDⓈ-M iceberg/replenishment detector
 
-FlowSurface can mark **possible** passive iceberg activity on Binance USDⓈ-M linear perpetuals. The detector is disabled by default and is not supported for Binance Spot, COIN-M, or other venues yet.
+Flowdepth can mark **possible** passive iceberg activity on Binance USDⓈ-M linear perpetuals. The detector is disabled by default and is not supported for Binance Spot, COIN-M, or other venues yet.
 
 ## What it detects
 

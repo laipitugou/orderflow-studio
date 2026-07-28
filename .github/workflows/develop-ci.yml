@@ -114,7 +114,13 @@ jobs:
           )
 
           {
-            echo "Automated multi-platform prerelease from the develop branch at commit [\`${short_sha}\`](https://github.com/${GH_REPO}/commit/${GITHUB_SHA})."
+            echo "# Flowdepth Beta"
+            echo
+            echo "Automated beta build from the \`develop\` branch at commit [\`${short_sha}\`](https://github.com/${GH_REPO}/commit/${GITHUB_SHA})."
+            echo
+            echo "Platforms: Windows x64, Linux x64, and universal macOS. The application binary remains named \`flowsurface\` for upstream compatibility."
+            echo
+            echo "> This is experimental beta software. Back up important layouts before updating; regressions may occur."
             echo
 
             if [ -n "$previous_tag" ]; then
@@ -138,12 +144,12 @@ jobs:
 
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" \
-              --title "Develop build ${short_sha}" \
+              --title "Flowdepth Beta develop-${short_sha}" \
               --notes-file "$notes_file"
           else
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
-              --title "Develop build ${short_sha}" \
+              --title "Flowdepth Beta develop-${short_sha}" \
               --notes-file "$notes_file" \
               --draft \
               --prerelease

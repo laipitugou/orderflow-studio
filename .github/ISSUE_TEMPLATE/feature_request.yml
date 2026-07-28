@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose an improvement for Flowdepth
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the use case rather than a trading outcome. Open a discussion issue before implementing a major architectural change.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow or limitation should this proposal address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior and UI you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note current workarounds or simpler alternatives.
+  - type: textarea
+    id: data-impact
+    attributes:
+      label: Layout or market-data impact
+      description: Could this affect saved layouts, caches, exchange requests, reconnect behavior, or data compatibility?
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched for existing issues and requests.
+          required: true
+        - label: This request does not rely on proprietary data being added to the repository.
+          required: true

@@ -1,148 +1,140 @@
-# Flowdepth - Flowsurface, below the surface
+# Flowdepth — crypto order flow, below the surface
 
-[![Crates.io](https://img.shields.io/crates/v/flowsurface)](https://crates.io/crates/flowsurface)
+> Flowdepth is an open-source native desktop terminal for crypto order flow and options analytics, built in Rust as an advanced fork of Flowsurface.
+
 [![Develop CI](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml/badge.svg?branch=develop)](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml)
-[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](https://discord.gg/RN2XAF7ZuR)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/flowsurface-rs/flowsurface/blob/main/LICENSE)
+[![Latest GitHub release](https://img.shields.io/github/v/release/Niketion/flowdepth?include_prereleases&label=latest%20beta)](https://github.com/Niketion/flowdepth/releases)
+[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)](./LICENSE)
+[![Rust 1.95](https://img.shields.io/badge/Rust-1.95-orange.svg?logo=rust)](./rust-toolchain.toml)
 [![Made with iced](https://iced.rs/badge.svg)](https://github.com/iced-rs/iced)
+[![Upstream Discord](https://img.shields.io/badge/Discord-upstream%20community-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/RN2XAF7ZuR)
 
-An open-source native desktop charting application for crypto markets. Supports Binance, Bybit, Hyperliquid, OKX, and MEXC.
+Flowdepth combines crypto order-flow charts with footprint and L2 heatmap views, adaptive volume bubbles, Binance iceberg/replenishment detection, Deribit GEX, and Derive observed maker flow. A persistent market-data cache, automatic reconnect, and historical gap recovery help charts remain useful through longer sessions and network interruptions.
 
-> [!WARNING]
-> This fork and its `develop` branch are unstable, under active development, and may contain incomplete features, regressions, or breaking changes. The automated prereleases published here are intended for testing only. For stable, officially supported releases, follow the upstream [Flowsurface project](https://github.com/flowsurface-rs/flowsurface) and its [official Releases page](https://github.com/flowsurface-rs/flowsurface/releases).
-
-## Changes in `develop` compared with `upstream/main`
-
-The `develop` branch currently adds the following features and behavior on top of the upstream project:
-
--   **Footprint analysis:** a table display mode, per-bar analysis, dynamic cluster color scaling, clearer imbalance markers, and centralized chart/indicator compatibility rules.
--   **[Adaptive volume bubbles](./docs/adaptive-volume-bubbles.md):** configurable smart clustering of aggressive executions on candlestick charts, with fixed, percentile, or hybrid thresholds; stable live updates; delta/dominant-side coloring; collision and label budgets; age fading; and optional price-response classification.
--   **[Binance iceberg detector](./docs/binance-iceberg-detector.md):** optional markers for possible passive iceberg/replenishment activity on Binance USDⓈ-M perpetuals, using sequence-validated L2 depth, raw trades, adaptive baselines, deterministic scoring, and gap/reconnect invalidation.
--   **Session volume profile:** volume or delta profiles with configurable session interval, side, width, value area, row size, POC, VAH/VAL, session VWAP, and session high/low.
--   **Cumulative volume delta:** optional candlestick rendering in addition to the line view, with daily or continuous reset behavior.
--   **GEX options chart:** BTC and ETH gamma-exposure profiles sourced from Deribit, with call/put walls, gamma flip, intrinsic-pressure, gamma-versus-vega, liquidity-impact analytics, strike-weighted historical zones, and rolling expiry filters from the next expiry through all expiries.
--   **Derive observed maker flow:** settled maker option trades from Derive are matched exactly to Deribit contracts and shown as an independent directional confirmation, with 5-minute, 30-minute, and 2-hour gamma-flow windows, coverage quality, and an expiry-aligned OI-proxy agreement gauge.
--   **Persistent market-data cache:** local `redb` storage for klines, open interest, trades, and derived bubble summaries, including gap detection, deduplication, invalidation, and shared data requirements across panes.
--   **Connection recovery:** automatic historical gap backfill after WebSocket disconnects, deferred recovery until the real offline range is known, reconnect-backoff reset, request generations, stale/orphaned request cancellation, timeouts, bounded retries, no-progress protection, raw-trade/history limits, and upstream rejection of Binance non-execution trade markers before chart and order-flow consumers.
--   **Fetch visibility and feedback:** loading indicators, data-coverage state, richer fetch/stream/window diagnostics, and a filterable in-app debug terminal with multiple log levels.
--   **Saved-state resilience:** schema migration, sanitization, atomic writes, rolling backups, recovery from corrupt or incompatible state, preservation of overlay indicators, and correction of off-screen window positions.
--   **Windows stability:** a single-native-window mode that disables unsupported pop-outs to avoid the winit multi-window redraw freeze; macOS and Linux keep native multi-window behavior.
--   **Runtime and build metadata:** dirty-state render scheduling, Windows power-guard scaffolding, embedded loading animation, and Git branch/commit/release information in builds.
--   **Develop automation:** formatting, check, Clippy, tests, and Windows/Linux/universal-macOS packages generated by one workflow; successful builds are published as GitHub prereleases.
-
-Removed or replaced relative to `upstream/main`:
-
--   Native pane pop-outs are hidden on Windows while single-window compatibility mode is active.
--   The separate `lint.yml` and `format.yml` workflows were replaced by the combined `develop-ci.yml` quality gate.
-
-See the complete source comparison: [`upstream/main...origin/develop`](https://github.com/flowsurface-rs/flowsurface/compare/main...Niketion:develop).
-
-See [Derive Maker Flow and GEX architecture](./docs/derive-maker-flow.md) for matching rules, formulas, quality and agreement classification, refresh/cache behavior, strike-weighted zone rendering, and Binance raw-trade data-quality handling.
+> [!IMPORTANT]
+> **Beta status:** Flowdepth is experimental but usable beta software and is evolving quickly. Back up important layouts before updating. Beta releases may contain regressions.
+> Flowdepth is derived from and continues to credit the upstream [Flowsurface](https://github.com/flowsurface-rs/flowsurface) project.
 
 <div align="center">
   <img
     src="https://github.com/user-attachments/assets/8ebf2bc1-1a4b-48cc-a108-348a6ef58825"
-    alt="Flowsurface screenshot"
+    alt="Flowdepth desktop terminal showing crypto market charts"
     style="max-width: 100%; height: auto;"
   />
 </div>
 
-### Key Features
+## Why Flowdepth?
 
--   Multiple chart/panel types:
-    -   **Heatmap (Historical DOM):** Uses live trades and L2 orderbook to create a time-series heatmap chart. Supports customizable price grouping, different time aggregations, fixed or visible range volume profiles.
-    -   **Candlestick:** Traditional kline chart supporting both time-based and custom tick-based intervals.
-    -   **Footprint:** Price grouped and interval aggregated views for trades on top of a candlestick chart. Supports different clustering methods, configurable imbalance and naked-POC studies.
-    -   **GEX Options Chart:** Gamma-exposure profiles and analytics for the supported BTC and ETH option markets, using Deribit option-chain data.
-    -   **Time & Sales:** Scrollable list of live trades.
-    -   **DOM (Depth of Market) / Ladder:** Displays current L2 orderbook alongside recent trade volumes on grouped price levels.
-    -   **Comparison:** Line graph for comparing multiple data sources, normalized by kline `close` prices on a percentage scale
--   **Adaptive Volume Bubbles:** Highlights significant bursts of aggressive executions on candlestick charts using configurable smart clustering, adaptive thresholds, side/delta coloring, and bounded labels.
--   **Possible Iceberg Detection:** Marks probable passive absorption and replenishment on Binance USDⓈ-M heatmaps. Detection is disabled by default and reports market-structure evidence, not proof of an exchange-native iceberg order.
--   Real-time sound effects driven by trade streams
--   Multi window/monitor support
--   Pane linking for quickly switching tickers across multiple panes
--   Persistent layouts and customizable themes with editable color palettes
+Flowdepth extends Flowsurface for traders and market observers who want deeper crypto order-flow tooling in a native desktop application. Its development focuses on richer execution and liquidity visualization, resilient market-data ingestion and recovery, and crypto-options analytics while preserving the open-source Rust foundation of the upstream project.
 
-##### Market data is received directly from exchanges' public REST APIs and WebSockets
+Detection and analytics such as possible iceberg activity, GEX, and observed maker flow describe market data; they are not certain trading signals.
 
-#
+## Download
 
-#### Historical Trades on Footprint Charts:
+Automated beta builds are available from the [Flowdepth Releases page](https://github.com/Niketion/flowdepth/releases). They are generated from the `develop` branch after the full quality gate succeeds.
 
--   By default, it captures and plots live trades in real time via WebSocket.
--   For Binance tickers, you can optionally backfill the visible time range by enabling trade fetching in the settings:
-    -   [data.binance.vision](https://data.binance.vision/): Fast daily bulk downloads (no intraday).
-    -   REST API (e.g., `/fapi/v1/aggTrades`): Slower, paginated intraday fetching (subject to rate limits).
-    -   The Binance connector can use either or both methods to retrieve historical data as needed.
--   Fetching trades for Bybit/Hyperliquid is not supported, as both lack a suitable REST API. OKX is WIP.
+For a quick start:
+
+1. Open the [Releases page](https://github.com/Niketion/flowdepth/releases).
+2. Download the package for your platform: Windows x64, Linux x64, or universal macOS.
+3. Extract the archive.
+4. Run `flowsurface.exe` on Windows or the `flowsurface` binary on Linux/macOS.
+
+The application binary and Rust package are currently still named `flowsurface` for upstream compatibility.
+
+Windows and macOS beta binaries are not currently signed. Windows SmartScreen may require **More info → Run anyway**. On macOS, control-click the binary and choose **Open**, or allow it under **System Settings → Privacy & Security**.
+
+### Release channels
+
+- **Beta builds:** automated builds from `develop`, published as GitHub prereleases after formatting, check, Clippy, tests, and all platform packages succeed. Tags use `develop-<commit>`, where `<commit>` is the seven-character Git commit identifier used for the build.
+- **Stable releases:** not currently available.
+
+## Key features
+
+- **Order-flow charts:** footprint views, historical L2 heatmaps, Time & Sales, DOM/ladder, candlesticks, comparisons, volume profiles, and cumulative volume delta.
+- **Adaptive volume bubbles:** configurable clustering of aggressive executions with adaptive thresholds, side/delta coloring, bounded labels, and stable live updates.
+- **Possible Binance iceberg/replenishment detection:** optional markers for evidence of passive absorption on Binance USDⓈ-M perpetuals. The detector is probabilistic, disabled by default, and does not prove that an exchange-native iceberg order exists.
+- **Crypto options analytics:** BTC and ETH GEX profiles sourced from Deribit, plus independently displayed Derive observed maker flow matched to Deribit contracts.
+- **Persistent market-data cache:** local storage for klines, open interest, trades, and derived bubble summaries with gap detection, deduplication, and invalidation.
+- **Connection recovery:** automatic reconnect, historical gap backfill, bounded retries, stale-request cancellation, and sequence-aware recovery.
+- **Workspace tools:** persistent layouts, saved-state recovery, customizable themes, pane linking, loading/coverage feedback, and an in-app debug terminal.
+- **Public market data:** market data is received directly from exchange REST APIs and WebSockets. Current features do not require exchange trading credentials.
+
+### Historical trades on footprint charts
+
+Live trades are captured over WebSocket. Binance charts can optionally backfill the visible range from [data.binance.vision](https://data.binance.vision/) daily files, the paginated REST API, or both. Historical trade fetching for Bybit and Hyperliquid is not available; OKX support remains work in progress.
 
 ## Installation
 
-### Method 1: Prebuilt Binaries
+### Prebuilt beta packages
 
-Experimental packages for Windows, macOS, and Linux are available on this fork's [Releases page](https://github.com/Niketion/flowdepth/releases).
-These builds are unstable and intended for testing; use the upstream [Flowsurface Releases page](https://github.com/flowsurface-rs/flowsurface/releases) for official releases.
+Follow the [quick-start download steps](#download). Packages contain the application binary and the assets needed by that platform.
 
-Every successful push to `develop` creates a prerelease named `develop-<commit>`.
+### Build from source
 
-<details>
-<summary><strong>Having trouble running the file? (Permission/Security warnings)</strong></summary>
- 
-Since these binaries are currently unsigned they might get flagged.
+Requirements:
 
--   **Windows**: If you see a "Windows protected your PC" pop-up, click **More info** -> **Run anyway**.
--   **macOS**: If you see "Developer cannot be verified", control-click (right-click) the app and select **Open**, or go to _System Settings > Privacy & Security_ to allow it.
-</details>
+- [Rust](https://www.rust-lang.org/tools/install); the pinned version and components are defined in [`rust-toolchain.toml`](./rust-toolchain.toml).
+- [Git](https://git-scm.com/).
+- Platform dependencies:
+  - Debian/Ubuntu: `sudo apt install build-essential pkg-config libasound2-dev`
+  - Arch Linux: `sudo pacman -S base-devel alsa-lib`
+  - Fedora: `sudo dnf install gcc make alsa-lib-devel`
+  - macOS: install Xcode Command Line Tools with `xcode-select --install`.
+  - Windows: use a Rust MSVC toolchain; no additional project dependency is required.
 
-### Method 2: Build from Source
-
-#### Requirements
-
--   [Rust toolchain](https://www.rust-lang.org/tools/install)
--   [Git version control system](https://git-scm.com/)
--   System dependencies:
-    -   **Linux**:
-        -   Debian/Ubuntu: `sudo apt install build-essential pkg-config libasound2-dev`
-        -   Arch: `sudo pacman -S base-devel alsa-lib`
-        -   Fedora: `sudo dnf install gcc make alsa-lib-devel`
-    -   **macOS**: Install Xcode Command Line Tools: `xcode-select --install`
-    -   **Windows**: No additional dependencies required
-
-#### Option A: `cargo install`
+Install directly from the `develop` branch:
 
 ```bash
-# Install latest globally
-cargo install --git https://github.com/Niketion/flowdepth --branch develop flowsurface
-
-# Run
+cargo install --git https://github.com/Niketion/flowdepth.git --branch develop flowsurface
 flowsurface
 ```
 
-#### Option B: Cloning the repo
+Or clone, build, and run the repository:
 
 ```bash
-# Clone the repository
-git clone --branch develop https://github.com/Niketion/flowdepth
-
-cd flowsurface
-
-# Build and run
-cargo build --release
-cargo run --release
+git clone --branch develop https://github.com/Niketion/flowdepth.git
+cd flowdepth
+cargo build --release --locked
+cargo run --release --locked
 ```
 
-## Credits and thanks to
+The application binary and Rust package are currently still named `flowsurface` for upstream compatibility. The public project and fork are named Flowdepth; internal crate and module names intentionally retain their upstream-compatible names.
 
--   [Kraken Desktop](https://www.kraken.com/desktop) (formerly [Cryptowatch](https://blog.kraken.com/product/cryptowatch-to-sunset-kraken-pro-to-integrate-cryptowatch-features)), the main inspiration that sparked this project
--   [Halloy](https://github.com/squidowl/halloy), an excellent open-source reference for the foundational code design and the project architecture
--   And of course, [iced](https://github.com/iced-rs/iced), the GUI library that makes all of this possible
+## Technical documentation
+
+- [Adaptive volume bubbles](./docs/adaptive-volume-bubbles.md)
+- [Binance iceberg/replenishment detector](./docs/binance-iceberg-detector.md)
+- [Derive maker flow and GEX architecture](./docs/derive-maker-flow.md)
+- [Contributing guide](./CONTRIBUTING.md)
+- [Security policy](./SECURITY.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+
+### Notable changes from `upstream/main`
+
+The `develop` branch adds the order-flow, options, caching, recovery, diagnostics, saved-state, and build automation features summarized above. Windows uses a single-native-window compatibility mode to avoid an upstream multi-window redraw issue, while macOS and Linux retain native multi-window behavior.
+
+See the complete [`upstream/main...develop` source comparison](https://github.com/flowsurface-rs/flowsurface/compare/main...Niketion:develop).
+
+## Project relationship
+
+Flowdepth is a fork of [Flowsurface](https://github.com/flowsurface-rs/flowsurface). It retains upstream compatibility and attribution and does not seek to obscure or replace the origin of its code. Flowdepth-specific features are developed independently, and Flowdepth releases and support are separate from official Flowsurface releases.
+
+The Rust package and executable remain named `flowsurface` for compatibility. Changes can be reviewed directly in the [`upstream/main...develop` comparison](https://github.com/flowsurface-rs/flowsurface/compare/main...Niketion:develop).
+
+## Credits
+
+- [Flowsurface](https://github.com/flowsurface-rs/flowsurface) and its contributors, whose project is the foundation of this fork.
+- [Kraken Desktop](https://www.kraken.com/desktop), formerly [Cryptowatch](https://blog.kraken.com/product/cryptowatch-to-sunset-kraken-pro-to-integrate-cryptowatch-features), which inspired the original project.
+- [Halloy](https://github.com/squidowl/halloy), an open-source reference for foundational design and architecture.
+- [iced](https://github.com/iced-rs/iced), the Rust GUI library used by the application.
 
 ## Community
 
-For feedback, questions, or for more casual conversations about the project, join our community on Discord:  
-https://discord.gg/RN2XAF7ZuR
+Questions and discussion are welcome in this repository's [GitHub issues](https://github.com/Niketion/flowdepth/issues). The existing [Discord invite](https://discord.gg/RN2XAF7ZuR) leads to the upstream Flowsurface community; Flowdepth releases and support remain separate.
+
+Please read the [contribution guide](./CONTRIBUTING.md) and [Code of Conduct](./CODE_OF_CONDUCT.md) before contributing.
 
 ## License
 
-Flowsurface is released under the [GPLv3](./LICENSE) license. Contributions to the project are shared under the same license.  
+Flowdepth is distributed under the [GNU General Public License v3.0 or later](./LICENSE), consistent with its Flowsurface foundation. Contributions are shared under the same license.

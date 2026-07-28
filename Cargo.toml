@@ -3,7 +3,7 @@ name = "flowsurface"
 version.workspace = true
 readme = "README.md"
 license = "GPL-3.0-or-later"
-description = "A native desktop charting platform for crypto markets"
+description = "A native desktop terminal for crypto order flow and options analytics"
 categories = ["finance", "visualization", "gui"]
 edition.workspace = true
 repository.workspace = true
@@ -12,8 +12,8 @@ homepage.workspace = true
 [workspace.package]
 version = "0.8.9"
 edition = "2024"
-repository = "https://github.com/flowsurface-rs/flowsurface"
-homepage = "https://flowsurface.com"
+repository = "https://github.com/Niketion/flowdepth"
+homepage = "https://github.com/Niketion/flowdepth"
 
 [workspace]
 members = [ "data", "exchange"]

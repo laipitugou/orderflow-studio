@@ -1,0 +1,101 @@
+name: Bug report
+description: Report a reproducible problem in Flowdepth
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Search existing issues first and remove sensitive information from logs, screenshots, and layouts.
+  - type: input
+    id: version
+    attributes:
+      label: Flowdepth version or commit
+      description: Use the release tag (for example, develop-abcdef0) or full Git commit.
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      placeholder: Windows 11, macOS 15, Ubuntu 24.04, etc.
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Include the GPU model and driver version if known.
+    validations:
+      required: true
+  - type: input
+    id: exchange-symbol
+    attributes:
+      label: Exchange and symbol
+      placeholder: Binance USD-M, BTCUSDT
+    validations:
+      required: true
+  - type: dropdown
+    id: chart-type
+    attributes:
+      label: Chart or panel type
+      options:
+        - Heatmap
+        - Footprint
+        - Candlestick
+        - GEX options
+        - Comparison
+        - DOM / Ladder
+        - Time & Sales
+        - Dashboard / other UI
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal, numbered sequence that reproduces the problem.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste only relevant excerpts. Remove credentials, proxy authentication, private paths, and other sensitive data.
+      render: shell
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag images here. Remove account details and other sensitive data first.
+  - type: textarea
+    id: layout
+    attributes:
+      label: Saved layout (optional)
+      description: Attach a minimal layout only if useful. Remove credentials, private endpoints, paths, and all sensitive data before uploading.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched for an existing issue describing this problem.
+          required: true
+        - label: I removed sensitive information from everything attached to this report.
+          required: true
