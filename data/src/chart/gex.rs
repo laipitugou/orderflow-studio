@@ -261,6 +261,7 @@ pub struct Config {
     pub show_header_freshness: bool,
     pub show_header_snapshot: bool,
     pub show_header_model: bool,
+    pub show_header_derive_flow: bool,
     pub show_intrinsic_stress_panel: bool,
     pub show_gamma_vega_panel: bool,
     pub show_gamma_liquidity_panel: bool,
@@ -298,6 +299,7 @@ impl Default for Config {
             show_header_freshness: true,
             show_header_snapshot: false,
             show_header_model: true,
+            show_header_derive_flow: false,
             show_intrinsic_stress_panel: true,
             show_gamma_vega_panel: true,
             show_gamma_liquidity_panel: true,
@@ -2684,6 +2686,7 @@ mod tests {
         assert!(cfg.show_header_expiry);
         assert!(cfg.show_header_freshness);
         assert!(cfg.show_header_model);
+        assert!(!cfg.show_header_derive_flow);
         assert!(!cfg.show_header_absolute_gex);
         assert!(!cfg.show_header_call_wall);
         assert!(!cfg.show_header_put_wall);

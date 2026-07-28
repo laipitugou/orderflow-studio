@@ -2667,7 +2667,6 @@ impl canvas::Program<Message> for KlineChart {
                             interval_to_x,
                             snapshot,
                             &self.gex_history,
-                            self.derive_flow.as_deref(),
                             &self.gex_render_cache,
                             &self.visual_config.gex_levels(),
                             chart_interval_ms,
@@ -2722,8 +2721,6 @@ impl canvas::Program<Message> for KlineChart {
                         chart,
                         &self.gex_history,
                         &self.gex_proxy_history,
-                        self.gex_freshness,
-                        self.derive_flow.as_deref(),
                         &self.gex_render_cache,
                         &self.visual_config.gex_levels(),
                         cursor_position,
@@ -2783,8 +2780,6 @@ fn draw_gex_hover_tooltip(
     chart: &ViewState,
     history: &[Arc<data::chart::gex::GexSnapshot>],
     proxy_history: &[Arc<exchange::options::gex_monitor::GexProxyHistoryPoint>],
-    freshness: data::chart::gex::GexFreshness,
-    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2807,8 +2802,6 @@ fn draw_gex_hover_tooltip(
         frame,
         chart,
         history,
-        freshness,
-        derive_flow,
         render_cache,
         config,
         cursor,
@@ -2857,12 +2850,10 @@ fn draw_gex_proxy_tooltip(
     let lines = [
         proxy_zone_label(zone.role).to_owned(),
         format!("Range: ${:.2} – ${:.2}", zone.lower_price, zone.upper_price),
-        format!("Center: ${:.2}", zone.center_price),
         format!("Strength: {:.0}%", zone.strength * 100.0),
         format!("Provider Total GEX: {:+.2}", zone_frame.total_gex),
-        format!("Provider spot: ${:.2}", zone_frame.source_spot),
         format!("Observed: {observed} UTC"),
-        "Source: GEX Monitor · synthetic aggregate zone".to_owned(),
+        "GEX Monitor synthetic zone".to_owned(),
     ];
     let width = 330.0;
     let height = 12.0 + lines.len() as f32 * 16.0;
@@ -2891,8 +2882,6 @@ fn draw_gex_zone_tooltip(
     frame: &mut canvas::Frame,
     chart: &ViewState,
     history: &[Arc<data::chart::gex::GexSnapshot>],
-    freshness: data::chart::gex::GexFreshness,
-    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     cursor: Point,
@@ -2945,7 +2934,6 @@ fn draw_gex_zone_tooltip(
         lines.extend([
             format!("Strike ${:.2}", strike.strike),
             format!("Net GEX {:+.2}", strike.net_gex_1pct),
-            format!("Absolute GEX {:.2}", strike.absolute_gamma_1pct),
             format!(
                 "Call / Put GEX {:+.2} / {:+.2}",
                 strike.call_gex_1pct, strike.put_gex_1pct
@@ -2966,41 +2954,22 @@ fn draw_gex_zone_tooltip(
         };
         lines.extend([
             label.to_owned(),
-            format!("Local strike: ${:.0}", band.strike),
+            format!("Range: ${:.0} – ${:.0}", band.lower_price, band.upper_price),
+            format!("Net GEX: {:+.2}", band.net_gex_1pct),
+            format!("Strength: {:.0}%", band.normalized_strength * 100.0),
             format!(
-                "Local range: ${:.0} – ${:.0}",
-                band.lower_price, band.upper_price
+                "Peak: ${:.0} ({:.0}%)",
+                zone.peak_price,
+                zone.normalized_strength * 100.0
             ),
-            format!("Local strength: {:.0}%", band.normalized_strength * 100.0),
-            format!("Local Net GEX: {:+.2}", band.net_gex_1pct),
-            format!("Zone peak: ${:.0}", zone.peak_price),
-            format!("Peak strength: {:.0}%", zone.normalized_strength * 100.0),
             format!("Persistence: {:.0}%", zone.persistence_score * 100.0),
             format!(
-                "Dominant expiry: {}",
+                "Expiry: {}",
                 zone.dominant_expiry
                     .map_or_else(|| "n/a".to_owned(), |value| value.as_u64().to_string())
             ),
-            "Source: Deribit · OI Proxy".to_owned(),
-            format!("Gamma: {}", zone.gamma_provenance),
-            format!("Last update: {} UTC", zone.observed_at.as_u64()),
-            format!("Freshness: {freshness:?}"),
+            format!("Deribit OI Proxy / {}", zone.gamma_provenance),
         ]);
-    }
-    if let Some(flow) = derive_flow {
-        let window = &flow.thirty_minutes;
-        if window.direction != data::chart::gex::ObservedGammaDirection::Unavailable {
-            lines.extend([
-                format!("Derive observed maker flow: {}", window.direction),
-                format!("30m imbalance: {:+.0}%", window.imbalance * 100.0),
-                format!(
-                    "Matched share: {:.0}%",
-                    window.matched_deribit_gex_share * 100.0
-                ),
-                format!("Trades: {}", window.trade_count),
-                "Source: Derive · observed settled maker flow".to_owned(),
-            ]);
-        }
     }
     let width = 300.0;
     let height = 12.0 + lines.len() as f32 * 16.0;
@@ -3427,7 +3396,6 @@ fn draw_gex_overlay_foreground(
     time_to_x: impl Fn(u64) -> f32 + Copy,
     snapshot: &data::chart::gex::GexSnapshot,
     history: &[Arc<data::chart::gex::GexSnapshot>],
-    derive_flow: Option<&data::chart::gex::DeriveMakerGammaFlow>,
     render_cache: &RefCell<GexRenderCache>,
     config: &data::chart::gex::GexLevelsConfig,
     chart_interval_ms: u64,
@@ -3466,25 +3434,6 @@ fn draw_gex_overlay_foreground(
         chart_scaling,
         palette,
     );
-    if let Some(flow) = derive_flow {
-        let window = &flow.thirty_minutes;
-        let imbalance = window.imbalance.abs() * 100.0;
-        draw_cluster_text(
-            frame,
-            &format!(
-                "Derive flow 30m: {} · {:.0}% · {}",
-                window.direction, imbalance, window.quality
-            ),
-            Point::new(
-                visible_region.x + gex_screen_width_to_world(8.0, chart_scaling),
-                visible_region.y + gex_screen_width_to_world(14.0, chart_scaling),
-            ),
-            gex_screen_width_to_world(10.0, chart_scaling),
-            palette.background.base.text,
-            Alignment::Start,
-            Alignment::Center,
-        );
-    }
 }
 
 fn cached_gex_zone_frames(

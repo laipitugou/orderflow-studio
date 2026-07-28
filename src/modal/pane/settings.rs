@@ -990,6 +990,9 @@ pub fn gex_cfg_view<'a>(
             v),
         toggle("Model", cfg.show_header_model, |c, v| c.show_header_model =
             v),
+        toggle("Derive flow (30m)", cfg.show_header_derive_flow, |c, v| c
+            .show_header_derive_flow =
+            v),
         row![
             space::horizontal(),
             sync_all_button(pane, VisualConfig::Gex(cfg))
