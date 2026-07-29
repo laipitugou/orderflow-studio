@@ -10,13 +10,14 @@ use data::sidebar;
 use iced::{
     Alignment, Element, Subscription, Task,
     widget::responsive,
-    widget::{column, row, space},
+    widget::{button, column, container, row, space, text, tooltip},
 };
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone)]
 pub enum Message {
     ToggleSidebarMenu(Option<sidebar::Menu>),
+    AddViewSelected(data::layout::pane::ContentKind),
     SetSidebarPosition(sidebar::Position),
     TickersTable(super::tickers_table::Message),
 }
@@ -27,6 +28,7 @@ pub struct Sidebar {
 }
 
 pub enum Action {
+    AddViewSelected(data::layout::pane::ContentKind),
     TickerSelected(
         exchange::TickerInfo,
         Option<data::layout::pane::ContentKind>,
@@ -58,12 +60,22 @@ impl Sidebar {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Action>) {
         match message {
             Message::ToggleSidebarMenu(menu) => {
+                if menu.is_some() {
+                    self.tickers_table.is_shown = false;
+                }
                 self.set_menu(menu.filter(|&m| !self.is_menu_active(m)));
+            }
+            Message::AddViewSelected(kind) => {
+                self.set_menu(None);
+                return (Task::none(), Some(Action::AddViewSelected(kind)));
             }
             Message::SetSidebarPosition(position) => {
                 self.state.position = position;
             }
             Message::TickersTable(msg) => {
+                if matches!(msg, super::tickers_table::Message::ToggleTable) {
+                    self.set_menu(None);
+                }
                 let action = self.tickers_table.update(msg);
 
                 match action {
@@ -90,7 +102,13 @@ impl Sidebar {
         (Task::none(), None)
     }
 
-    pub fn view(&self, audio_volume: Option<f32>) -> Element<'_, Message> {
+    pub fn view(
+        &self,
+        audio_volume: Option<f32>,
+        connectivity: crate::market_service::ConnectivityPhase,
+        connected_count: usize,
+        expected_count: usize,
+    ) -> Element<'_, Message> {
         let state = &self.state;
 
         let tooltip_position = if state.position == sidebar::Position::Left {
@@ -101,7 +119,14 @@ impl Sidebar {
 
         let is_table_open = self.tickers_table.is_shown;
 
-        let nav_buttons = self.nav_buttons(is_table_open, audio_volume, tooltip_position);
+        let nav_buttons = self.nav_buttons(
+            is_table_open,
+            audio_volume,
+            connectivity,
+            connected_count,
+            expected_count,
+            tooltip_position,
+        );
 
         let tickers_table = if is_table_open {
             column![responsive(move |size| self
@@ -129,21 +154,25 @@ impl Sidebar {
         &self,
         is_table_open: bool,
         audio_volume: Option<f32>,
+        connectivity: crate::market_service::ConnectivityPhase,
+        connected_count: usize,
+        expected_count: usize,
         tooltip_position: TooltipPosition,
     ) -> iced::widget::Column<'_, Message> {
         let settings_modal_button = {
             let is_active = self.is_menu_active(sidebar::Menu::Settings)
-                || self.is_menu_active(sidebar::Menu::ThemeEditor)
-                || self.is_menu_active(sidebar::Menu::Network);
+                || self.is_menu_active(sidebar::Menu::ThemeEditor);
 
             button_with_tooltip(
                 icon_text(Icon::Cog, 14)
-                    .width(24)
-                    .align_x(Alignment::Center),
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
                 Message::ToggleSidebarMenu(Some(sidebar::Menu::Settings)),
-                None,
+                Some("Settings"),
                 tooltip_position,
-                move |theme, status| crate::style::button::transparent(theme, status, is_active),
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
             )
         };
 
@@ -152,25 +181,45 @@ impl Sidebar {
 
             button_with_tooltip(
                 icon_text(Icon::Layout, 14)
-                    .width(24)
-                    .align_x(Alignment::Center),
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
                 Message::ToggleSidebarMenu(Some(sidebar::Menu::Layout)),
-                None,
+                Some("Dashboard layouts"),
                 tooltip_position,
-                move |theme, status| crate::style::button::transparent(theme, status, is_active),
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
             )
         };
 
         let ticker_search_button = {
             button_with_tooltip(
                 icon_text(Icon::Search, 14)
-                    .width(24)
-                    .align_x(Alignment::Center),
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
                 Message::TickersTable(super::tickers_table::Message::ToggleTable),
-                None,
+                Some("Markets"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_table_open),
+            )
+        };
+
+        let add_view_button = {
+            let is_active = self.is_menu_active(sidebar::Menu::AddView);
+            button_with_tooltip(
+                text("+")
+                    .size(24)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::AddView)),
+                Some("Add view"),
                 tooltip_position,
                 move |theme, status| {
-                    crate::style::button::transparent(theme, status, is_table_open)
+                    crate::style::button::toolbar_primary(theme, status, is_active)
                 },
             )
         };
@@ -185,23 +234,75 @@ impl Sidebar {
             };
 
             button_with_tooltip(
-                icon_text(icon, 14).width(24).align_x(Alignment::Center),
+                icon_text(icon, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
                 Message::ToggleSidebarMenu(Some(sidebar::Menu::Audio)),
-                None,
+                Some("Audio"),
                 tooltip_position,
-                move |theme, status| crate::style::button::transparent(theme, status, is_active),
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
             )
+        };
+
+        let connection_btn: Element<'_, Message> = {
+            let is_active = self.is_menu_active(sidebar::Menu::Network);
+            let state = match connectivity {
+                crate::market_service::ConnectivityPhase::Online => "Online",
+                crate::market_service::ConnectivityPhase::Connecting => "Connecting",
+                crate::market_service::ConnectivityPhase::Offline => "Offline",
+            };
+            let label: iced::widget::Text<'_, iced::Theme, iced::Renderer> = text("●")
+                .size(14)
+                .width(26)
+                .height(26)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .style(move |theme: &iced::Theme| iced::widget::text::Style {
+                    color: Some(match connectivity {
+                        crate::market_service::ConnectivityPhase::Online => {
+                            theme.extended_palette().success.base.color
+                        }
+                        crate::market_service::ConnectivityPhase::Connecting => {
+                            theme.extended_palette().warning.base.color
+                        }
+                        crate::market_service::ConnectivityPhase::Offline => {
+                            theme.extended_palette().danger.base.color
+                        }
+                    }),
+                });
+            let btn = button(label)
+                .on_press(Message::ToggleSidebarMenu(Some(sidebar::Menu::Network)))
+                .style(move |theme, status| {
+                    crate::style::button::toolbar(theme, status, is_active)
+                });
+            let details = if expected_count > 0 {
+                format!("Connection status: {state} ({connected_count}/{expected_count})")
+            } else {
+                format!("Connection status: {state}")
+            };
+            tooltip(
+                btn,
+                container(text(details))
+                    .style(crate::style::tooltip)
+                    .padding(8),
+                tooltip_position,
+            )
+            .into()
         };
 
         column![
             ticker_search_button,
+            add_view_button,
             layout_modal_button,
-            audio_btn,
             space::vertical(),
+            audio_btn,
+            connection_btn,
             settings_modal_button,
         ]
-        .width(32)
-        .spacing(8)
+        .width(40)
+        .spacing(4)
     }
 
     pub fn hide_tickers_table(&mut self) -> bool {

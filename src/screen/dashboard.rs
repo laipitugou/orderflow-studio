@@ -449,6 +449,14 @@ impl Dashboard {
         }
     }
 
+    pub fn empty(layout_id: uuid::Uuid) -> Self {
+        Self::from_config(
+            Configuration::Pane(pane::State::new()),
+            Vec::new(),
+            layout_id,
+        )
+    }
+
     pub fn from_config(
         panes: Configuration<pane::State>,
         popout_windows: Vec<(Configuration<pane::State>, WindowSpec)>,
@@ -1327,6 +1335,83 @@ impl Dashboard {
         }
 
         Task::none()
+    }
+
+    pub fn add_view(
+        &mut self,
+        handles: &AdapterHandles,
+        main_window: window::Id,
+        content_kind: ContentKind,
+    ) -> Task<Message> {
+        let inherited_ticker = self.focus.and_then(|(window, pane)| {
+            self.get_pane(main_window, window, pane).and_then(|state| {
+                state.stream_pair().or_else(|| {
+                    state
+                        .gex_liquidity_resolution()
+                        .and_then(|(_, _, reference, _)| reference)
+                })
+            })
+        });
+
+        let reusable = self.focus.filter(|(window, pane)| {
+            self.get_pane(main_window, *window, *pane)
+                .is_some_and(|state| {
+                    matches!(state.content, pane::Content::Starter) || !state.content.initialized()
+                })
+        });
+
+        let target = reusable.or_else(|| {
+            self.iter_all_panes(main_window)
+                .find(|(_, _, state)| matches!(state.content, pane::Content::Starter))
+                .map(|(window, pane, _)| (window, pane))
+        });
+
+        let (window, target_pane) = if let Some(target) = target {
+            target
+        } else {
+            let target = self
+                .focus
+                .filter(|(window, _)| *window == main_window)
+                .map(|(_, pane)| pane)
+                .or_else(|| self.panes.iter().last().map(|(pane, _)| *pane));
+            let Some(target) = target else {
+                return Task::none();
+            };
+            let axis = if self.panes.len() == 1 {
+                pane_grid::Axis::Vertical
+            } else {
+                pane_grid::Axis::Horizontal
+            };
+            let Some((new_pane, _)) = self.panes.split(axis, target, pane::State::new()) else {
+                return Task::none();
+            };
+            (main_window, new_pane)
+        };
+
+        self.focus = Some((window, target_pane));
+
+        let compatible_ticker = inherited_ticker.filter(|ticker| {
+            content_kind != ContentKind::GexChart
+                || exchange::options::resolve_options_underlying(ticker.ticker).is_some()
+        });
+        if let Some(ticker) = compatible_ticker {
+            return self.init_pane(
+                handles,
+                main_window,
+                window,
+                target_pane,
+                ticker,
+                content_kind,
+            );
+        }
+
+        let Some(state) = self.get_mut_pane(main_window, window, target_pane) else {
+            return Task::none();
+        };
+        match state.update(pane::Event::ContentSelected(content_kind)) {
+            Some(pane::Effect::FocusWidget(id)) => iced::widget::operation::focus(id),
+            _ => Task::none(),
+        }
     }
 
     pub fn switch_tickers_in_group(

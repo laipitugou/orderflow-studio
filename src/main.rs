@@ -18,7 +18,7 @@ mod windowing;
 
 use data::config::theme::default_theme;
 use data::{layout::WindowSpec, sidebar};
-use layout::{LayoutId, configuration};
+use layout::LayoutId;
 use modal::{
     LayoutManager, ThemeEditor,
     audio::AudioStream,
@@ -36,8 +36,8 @@ use widget::{
 use iced::{
     Alignment, Element, Length, Subscription, Task, Theme, keyboard, padding,
     widget::{
-        button, column, container, pane_grid, pick_list, progress_bar, row, rule, scrollable, text,
-        text_input, tooltip::Position as TooltipPosition,
+        button, column, container, pick_list, progress_bar, row, scrollable, text, text_input,
+        tooltip::Position as TooltipPosition,
     },
 };
 use std::{
@@ -60,6 +60,25 @@ const STARTUP_MIN_VISIBLE: Duration = Duration::from_millis(900);
 const STARTUP_READY_SETTLE: Duration = Duration::from_millis(650);
 const STARTUP_WINDOW_WIDTH: f32 = 500.0;
 const STARTUP_WINDOW_HEIGHT: f32 = 420.0;
+
+fn template_file_name(name: &str) -> String {
+    let stem = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_ascii_lowercase();
+    format!(
+        "{}.flowsurface-template.json",
+        if stem.is_empty() { "dashboard" } else { &stem }
+    )
+}
 
 fn main() {
     logger::install_panic_hook();
@@ -309,6 +328,8 @@ enum Message {
     ThemeEditor(modal::theme_editor::Message),
     NetworkManager(modal::network_manager::Message),
     Layouts(modal::layout_manager::Message),
+    TemplateImported(Result<Option<Vec<u8>>, String>),
+    TemplateExported(Result<Option<String>, String>),
     AudioStream(modal::audio::Message),
 }
 
@@ -1633,37 +1654,125 @@ impl Flowsurface {
                         let source_data = manager.get(id).map(|layout| {
                             (
                                 layout.id.name.clone(),
-                                layout.id.unique,
                                 data::Dashboard::from(&layout.dashboard),
                             )
                         });
 
-                        if let Some((name, old_id, ser_dashboard)) = source_data {
+                        if let Some((name, ser_dashboard)) = source_data {
                             let new_uid = uuid::Uuid::new_v4();
                             let new_layout = LayoutId {
                                 unique: new_uid,
                                 name: manager.ensure_unique_name(&name, new_uid),
                             };
-
-                            let mut popout_windows = Vec::new();
-
-                            for (pane, window_spec) in &ser_dashboard.popout {
-                                let configuration = configuration(pane.clone());
-                                popout_windows.push((configuration, *window_spec));
-                            }
-
-                            let dashboard = Dashboard::from_config(
-                                configuration(ser_dashboard.pane.clone()),
-                                popout_windows,
-                                old_id,
-                            );
-
-                            manager.insert_layout(new_layout.clone(), dashboard);
+                            let dashboard = layout::dashboard_from_data(ser_dashboard, new_uid);
+                            manager.insert_layout(new_layout, dashboard);
+                            self.notifications.push(Toast::info(
+                                "Current dashboard saved as a new template".to_string(),
+                            ));
                         }
+                    }
+                    Some(modal::layout_manager::Action::Overwrite { source, target }) => {
+                        let dashboard = self
+                            .layout_manager
+                            .get(source)
+                            .map(|layout| data::Dashboard::from(&layout.dashboard));
+                        if let Some(dashboard) = dashboard
+                            && let Some(target_layout) = self.layout_manager.get_mut(target)
+                        {
+                            target_layout.dashboard =
+                                layout::dashboard_from_data(dashboard, target);
+                            self.notifications.push(Toast::info(format!(
+                                "Saved current dashboard to {}",
+                                target_layout.id.name
+                            )));
+                        }
+                    }
+                    Some(modal::layout_manager::Action::Export(id)) => {
+                        let result = self
+                            .layout_manager
+                            .get(id)
+                            .ok_or_else(|| "Template not found".to_string())
+                            .and_then(layout::export_template);
+                        let bytes = match result {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                self.notifications.push(Toast::error(error));
+                                return Task::none();
+                            }
+                        };
+                        let suggested_name = self
+                            .layout_manager
+                            .get(id)
+                            .map(|layout| template_file_name(&layout.id.name))
+                            .unwrap_or_else(|| "dashboard-template.json".to_string());
+                        return Task::perform(
+                            async move {
+                                let Some(file) = rfd::AsyncFileDialog::new()
+                                    .add_filter("FlowSurface template", &["json"])
+                                    .set_file_name(suggested_name)
+                                    .save_file()
+                                    .await
+                                else {
+                                    return Ok(None);
+                                };
+                                file.write(&bytes)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                Ok(Some(file.path().display().to_string()))
+                            },
+                            Message::TemplateExported,
+                        );
+                    }
+                    Some(modal::layout_manager::Action::Import) => {
+                        return Task::perform(
+                            async {
+                                let Some(file) = rfd::AsyncFileDialog::new()
+                                    .add_filter("FlowSurface template", &["json"])
+                                    .pick_file()
+                                    .await
+                                else {
+                                    return Ok(None);
+                                };
+                                Ok(Some(file.read().await))
+                            },
+                            Message::TemplateImported,
+                        );
                     }
                     None => {}
                 }
             }
+            Message::TemplateImported(result) => match result {
+                Ok(Some(bytes)) => match layout::import_template(&bytes) {
+                    Ok(imported) => {
+                        let id = uuid::Uuid::new_v4();
+                        let name = self.layout_manager.ensure_unique_name(&imported.name, id);
+                        let dashboard = layout::dashboard_from_data(imported.dashboard, id);
+                        self.layout_manager.insert_layout(
+                            LayoutId {
+                                unique: id,
+                                name: name.clone(),
+                            },
+                            dashboard,
+                        );
+                        self.notifications
+                            .push(Toast::info(format!("Imported template {name}")));
+                    }
+                    Err(error) => self.notifications.push(Toast::error(error)),
+                },
+                Ok(None) => {}
+                Err(error) => self
+                    .notifications
+                    .push(Toast::error(format!("Could not import template: {error}"))),
+            },
+            Message::TemplateExported(result) => match result {
+                Ok(Some(path)) => self
+                    .notifications
+                    .push(Toast::info(format!("Template exported to {path}"))),
+                Ok(None) => {}
+                Err(error) => self
+                    .notifications
+                    .push(Toast::error(format!("Could not export template: {error}"))),
+            },
             Message::AudioStream(message) => {
                 if let Some(event) = self.audio_stream.update(message) {
                     match event {
@@ -1740,9 +1849,6 @@ impl Flowsurface {
                             Message::SaveStateRequested,
                         );
                     }
-                    Some(network_manager::Action::Exit) => {
-                        self.sidebar.set_menu(Some(sidebar::Menu::Settings));
-                    }
                     None => {}
                 }
             }
@@ -1750,6 +1856,17 @@ impl Flowsurface {
                 let (task, action) = self.sidebar.update(message);
 
                 match action {
+                    Some(dashboard::sidebar::Action::AddViewSelected(kind)) => {
+                        let handles = self.handles.clone();
+                        let main_window = self.main_window.id;
+                        return self
+                            .active_dashboard_mut()
+                            .add_view(&handles, main_window, kind)
+                            .map(|event| Message::Dashboard {
+                                layout_id: None,
+                                event,
+                            });
+                    }
                     Some(dashboard::sidebar::Action::TickerSelected(ticker_info, content)) => {
                         let main_window_id = self.main_window.id;
                         let handles = self.handles.clone();
@@ -1979,7 +2096,12 @@ impl Flowsurface {
         let content = if id == self.main_window.id {
             let sidebar_view = self
                 .sidebar
-                .view(self.audio_stream.volume())
+                .view(
+                    self.audio_stream.volume(),
+                    self.market_connectivity.phase(),
+                    self.market_connectivity.connected_count(),
+                    self.market_connectivity.expected_count(),
+                )
                 .map(Message::Sidebar);
 
             let dashboard_view = dashboard
@@ -2237,11 +2359,31 @@ impl Flowsurface {
         };
 
         let hotkeys = keyboard::listen().filter_map(|event| {
-            let keyboard::Event::KeyPressed { key, .. } = event else {
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
             match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
+                keyboard::Key::Character(value)
+                    if modifiers.control()
+                        && !modifiers.shift()
+                        && value.eq_ignore_ascii_case("k") =>
+                {
+                    Some(Message::Sidebar(dashboard::sidebar::Message::TickersTable(
+                        dashboard::tickers_table::Message::ToggleTable,
+                    )))
+                }
+                keyboard::Key::Character(value)
+                    if modifiers.control()
+                        && modifiers.shift()
+                        && value.eq_ignore_ascii_case("a") =>
+                {
+                    Some(Message::Sidebar(
+                        dashboard::sidebar::Message::ToggleSidebarMenu(Some(
+                            sidebar::Menu::AddView,
+                        )),
+                    ))
+                }
                 _ => None,
             }
         });
@@ -2628,12 +2770,6 @@ impl Flowsurface {
                         ))),
                     );
 
-                    let toggle_network_editor = button(text("Network")).on_press(Message::Sidebar(
-                        dashboard::sidebar::Message::ToggleSidebarMenu(Some(
-                            sidebar::Menu::Network,
-                        )),
-                    ));
-
                     let timezone_picklist = pick_list(
                         [data::UserTimezone::Utc, data::UserTimezone::Local],
                         Some(self.timezone),
@@ -2850,8 +2986,7 @@ impl Flowsurface {
                             column![
                                 trade_fetch_checkbox,
                                 debug_terminal_checkbox,
-                                toggle_theme_editor,
-                                toggle_network_editor
+                                toggle_theme_editor
                             ]
                             .spacing(8),
                         ]
@@ -2902,118 +3037,16 @@ impl Flowsurface {
                 }
             }
             sidebar::Menu::Layout => {
-                let main_window = self.main_window.id;
-
-                let manage_pane = if let Some((window_id, pane_id)) = dashboard.focus {
-                    let selected_pane_str =
-                        if let Some(state) = dashboard.get_pane(main_window, window_id, pane_id) {
-                            let link_group_name: String =
-                                state.link_group.as_ref().map_or_else(String::new, |g| {
-                                    " - Group ".to_string() + &g.to_string()
-                                });
-
-                            state.content.to_string() + &link_group_name
-                        } else {
-                            "".to_string()
-                        };
-
-                    let is_main_window = window_id == main_window;
-
-                    let reset_pane_button = {
-                        let btn = button(text("Reset").align_x(Alignment::Center))
-                            .width(iced::Length::Fill);
-                        if is_main_window {
-                            let dashboard_msg = Message::Dashboard {
-                                layout_id: None,
-                                event: dashboard::Message::Pane(
-                                    main_window,
-                                    dashboard::pane::Message::ReplacePane(pane_id),
-                                ),
-                            };
-
-                            btn.on_press(dashboard_msg)
-                        } else {
-                            btn
-                        }
-                    };
-                    let split_pane_button = {
-                        let btn = button(text("Split").align_x(Alignment::Center))
-                            .width(iced::Length::Fill);
-                        if is_main_window {
-                            let dashboard_msg = Message::Dashboard {
-                                layout_id: None,
-                                event: dashboard::Message::Pane(
-                                    main_window,
-                                    dashboard::pane::Message::SplitPane(
-                                        pane_grid::Axis::Horizontal,
-                                        pane_id,
-                                    ),
-                                ),
-                            };
-                            btn.on_press(dashboard_msg)
-                        } else {
-                            btn
-                        }
-                    };
-
-                    column![
-                        text(selected_pane_str),
-                        row![
-                            tooltip(
-                                reset_pane_button,
-                                if is_main_window {
-                                    Some("Reset selected pane")
-                                } else {
-                                    None
-                                },
-                                TooltipPosition::Top,
-                            ),
-                            tooltip(
-                                split_pane_button,
-                                if is_main_window {
-                                    Some("Split selected pane horizontally")
-                                } else {
-                                    None
-                                },
-                                TooltipPosition::Top,
-                            ),
-                        ]
-                        .spacing(8)
-                    ]
-                    .spacing(8)
-                } else {
-                    let reset_pane_button =
-                        button(text("Reset").align_x(Alignment::Center)).width(iced::Length::Fill);
-                    let split_pane_button =
-                        button(text("Split").align_x(Alignment::Center)).width(iced::Length::Fill);
-
-                    column![
-                        text("No pane selected"),
-                        row![
-                            tooltip(reset_pane_button, None, TooltipPosition::Top),
-                            tooltip(split_pane_button, None, TooltipPosition::Top),
-                        ]
-                        .spacing(8)
-                    ]
-                    .spacing(8)
-                };
-
                 let manage_layout_modal = {
-                    let col = column![
-                        manage_pane,
-                        rule::horizontal(1.0).style(style::split_ruler),
-                        self.layout_manager.view().map(Message::Layouts)
-                    ];
-
-                    container(col.align_x(Alignment::Center).spacing(20))
+                    container(self.layout_manager.view().map(Message::Layouts))
                         .width(260)
                         .padding(24)
                         .style(style::dashboard_modal)
                 };
 
                 let (align_x, padding) = match sidebar_pos {
-                    sidebar::Position::Left => (Alignment::Start, padding::left(44).top(40)),
-                    sidebar::Position::Right => (Alignment::End, padding::right(44).top(40)),
+                    sidebar::Position::Left => (Alignment::Start, padding::left(48).top(84)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(48).top(84)),
                 };
 
                 dashboard_modal(
@@ -3025,10 +3058,37 @@ impl Flowsurface {
                     align_x,
                 )
             }
+            sidebar::Menu::AddView => {
+                let add_view = container(
+                    column![
+                        text("Add view").size(crate::style::text_size::TITLE),
+                        widget::add_view::selector(2, |kind| Message::Sidebar(
+                            dashboard::sidebar::Message::AddViewSelected(kind)
+                        )),
+                    ]
+                    .spacing(12),
+                )
+                .width(316)
+                .padding(16)
+                .style(style::dashboard_modal);
+
+                let (align_x, padding) = match sidebar_pos {
+                    sidebar::Position::Left => (Alignment::Start, padding::left(48).top(44)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(48).top(44)),
+                };
+                dashboard_modal(
+                    base,
+                    add_view,
+                    Message::Sidebar(dashboard::sidebar::Message::ToggleSidebarMenu(None)),
+                    padding,
+                    Alignment::Start,
+                    align_x,
+                )
+            }
             sidebar::Menu::Audio => {
                 let (align_x, padding) = match sidebar_pos {
-                    sidebar::Position::Left => (Alignment::Start, padding::left(44).top(76)),
-                    sidebar::Position::Right => (Alignment::End, padding::right(44).top(76)),
+                    sidebar::Position::Left => (Alignment::Start, padding::left(48).bottom(84)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(48).bottom(84)),
                 };
 
                 let trade_streams_list = dashboard.streams.trade_streams(None);
@@ -3040,7 +3100,7 @@ impl Flowsurface {
                         .map(Message::AudioStream),
                     Message::Sidebar(dashboard::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
-                    Alignment::Start,
+                    Alignment::End,
                     align_x,
                 )
             }
@@ -3063,8 +3123,8 @@ impl Flowsurface {
             }
             sidebar::Menu::Network => {
                 let (align_x, padding) = match sidebar_pos {
-                    sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
-                    sidebar::Position::Right => (Alignment::End, padding::right(44).bottom(4)),
+                    sidebar::Position::Left => (Alignment::Start, padding::left(48).bottom(44)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(48).bottom(44)),
                 };
 
                 let base_content = dashboard_modal(

@@ -6,7 +6,7 @@ use crate::widget::dragger_row;
 use crate::{style, tooltip};
 
 use iced::widget::{
-    button, center, column, container, row, scrollable, space, text, text_input,
+    button, center, column, container, row, scrollable, space, svg, text, text_input,
     tooltip::Position as TooltipPosition,
 };
 use iced::{Element, Theme, padding, window};
@@ -27,6 +27,13 @@ pub enum Message {
     SetLayoutName(Uuid, String),
     Renaming(String),
     AddLayout,
+    ToggleAddMenu,
+    SaveCurrentAsNew,
+    RequestOverwrite(Uuid),
+    ConfirmOverwrite(Uuid),
+    CancelOverwrite,
+    ExportLayout(Uuid),
+    ImportLayout,
     RemoveLayout(Uuid),
     ToggleEditMode(Editing),
     CloneLayout(Uuid),
@@ -36,12 +43,17 @@ pub enum Message {
 pub enum Action {
     Select(Uuid),
     Clone(Uuid),
+    Overwrite { source: Uuid, target: Uuid },
+    Export(Uuid),
+    Import,
 }
 
 pub struct LayoutManager {
     pub layouts: Vec<Layout>,
     active_layout_id: Option<Uuid>,
     pub edit_mode: Editing,
+    add_menu_open: bool,
+    overwrite_target: Option<Uuid>,
 }
 
 impl LayoutManager {
@@ -58,6 +70,8 @@ impl LayoutManager {
             }],
             active_layout_id: Some(default_layout.unique),
             edit_mode: Editing::None,
+            add_menu_open: false,
+            overwrite_target: None,
         }
     }
 
@@ -66,6 +80,8 @@ impl LayoutManager {
             layouts,
             active_layout_id: active_layout.map(|l| l.unique),
             edit_mode: Editing::None,
+            add_menu_open: false,
+            overwrite_target: None,
         }
     }
 
@@ -147,31 +163,76 @@ impl LayoutManager {
     pub fn update(&mut self, message: Message) -> Option<Action> {
         match message {
             Message::SelectActive(id) => {
+                self.add_menu_open = false;
+                self.overwrite_target = None;
                 self.active_layout_id = Some(id);
                 return Some(Action::Select(id));
             }
-            Message::ToggleEditMode(new_mode) => match (&new_mode, &self.edit_mode) {
-                (Editing::Preview, Editing::Preview) => {
-                    self.edit_mode = Editing::None;
+            Message::ToggleEditMode(new_mode) => {
+                self.add_menu_open = false;
+                self.overwrite_target = None;
+                match (&new_mode, &self.edit_mode) {
+                    (Editing::Preview, Editing::Preview) => {
+                        self.edit_mode = Editing::None;
+                    }
+                    (Editing::Renaming(id, _), Editing::Renaming(renaming_id, _))
+                        if id == renaming_id =>
+                    {
+                        self.edit_mode = Editing::None;
+                    }
+                    _ => {
+                        self.edit_mode = new_mode;
+                    }
                 }
-                (Editing::Renaming(id, _), Editing::Renaming(renaming_id, _))
-                    if id == renaming_id =>
-                {
-                    self.edit_mode = Editing::None;
-                }
-                _ => {
-                    self.edit_mode = new_mode;
-                }
-            },
+            }
             Message::AddLayout => {
                 let new_layout = LayoutId {
                     unique: Uuid::new_v4(),
                     name: self.generate_unique_layout_name(),
                 };
 
-                self.insert_layout(new_layout.clone(), Dashboard::default());
+                self.insert_layout(new_layout.clone(), Dashboard::empty(new_layout.unique));
+
+                self.add_menu_open = false;
+                self.overwrite_target = None;
 
                 return Some(Action::Select(new_layout.unique));
+            }
+            Message::ToggleAddMenu => {
+                self.add_menu_open = !self.add_menu_open;
+                self.overwrite_target = None;
+                self.edit_mode = Editing::None;
+            }
+            Message::SaveCurrentAsNew => {
+                self.add_menu_open = false;
+                self.overwrite_target = None;
+                if let Some(active) = self.active_layout_id {
+                    return Some(Action::Clone(active));
+                }
+            }
+            Message::RequestOverwrite(id) => {
+                if Some(id) != self.active_layout_id {
+                    self.overwrite_target = Some(id);
+                }
+            }
+            Message::ConfirmOverwrite(target) => {
+                let source = self.active_layout_id?;
+                if source != target && self.overwrite_target == Some(target) {
+                    self.add_menu_open = false;
+                    self.overwrite_target = None;
+                    return Some(Action::Overwrite { source, target });
+                }
+            }
+            Message::CancelOverwrite => {
+                self.overwrite_target = None;
+            }
+            Message::ExportLayout(id) => {
+                self.add_menu_open = false;
+                return Some(Action::Export(id));
+            }
+            Message::ImportLayout => {
+                self.add_menu_open = false;
+                return Some(Action::Import);
             }
             Message::RemoveLayout(id) => {
                 if Some(id) == self.active_layout_id {
@@ -220,6 +281,15 @@ impl LayoutManager {
         };
 
         content = content.push(row![
+            tooltip(
+                button(text("+").size(crate::style::text_size::TITLE))
+                    .style(|theme, status| {
+                        style::button::transparent(theme, status, self.add_menu_open)
+                    })
+                    .on_press(Message::ToggleAddMenu),
+                Some("Save or create template"),
+                TooltipPosition::Top,
+            ),
             space::horizontal(),
             if is_edit_mode {
                 row![edit_btn]
@@ -235,6 +305,94 @@ impl LayoutManager {
                 .spacing(4)
             }
         ]);
+
+        if self.add_menu_open {
+            let active = self.active_layout_id;
+            let mut save_targets = column![].spacing(4);
+            for layout in self
+                .layouts
+                .iter()
+                .filter(|layout| Some(layout.id.unique) != active)
+            {
+                let target = layout.id.unique;
+                let target_row: Element<'_, Message> = if self.overwrite_target == Some(target) {
+                    row![
+                        text(format!("Replace {}?", layout.id.name))
+                            .size(crate::style::text_size::BODY),
+                        space::horizontal(),
+                        button("Cancel").on_press(Message::CancelOverwrite),
+                        button("Save").on_press(Message::ConfirmOverwrite(target)),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+                } else {
+                    button(text(layout.id.name.clone()).align_x(iced::Alignment::Start))
+                        .width(iced::Length::Fill)
+                        .style(style::button::layout_name)
+                        .on_press(Message::RequestOverwrite(target))
+                        .into()
+                };
+                save_targets = save_targets.push(target_row);
+            }
+
+            let existing = if self.layouts.len() > 1 {
+                column![
+                    text("Save current to existing").size(crate::style::text_size::SECTION),
+                    save_targets,
+                ]
+                .spacing(6)
+            } else {
+                column![text("No other templates yet").size(crate::style::text_size::SMALL)]
+            };
+
+            let active_actions = if let Some(active) = active {
+                column![
+                    button(
+                        row![icon_text(Icon::Clone, 12), text("Save current as new")].spacing(8)
+                    )
+                    .width(iced::Length::Fill)
+                    .on_press(Message::SaveCurrentAsNew),
+                    button(
+                        row![
+                            template_svg(include_bytes!("../../assets/ui/template-export.svg")),
+                            text("Export current"),
+                        ]
+                        .spacing(8),
+                    )
+                    .width(iced::Length::Fill)
+                    .on_press(Message::ExportLayout(active)),
+                ]
+                .spacing(6)
+            } else {
+                column![]
+            };
+
+            content = content.push(
+                container(
+                    column![
+                        text("Templates").size(crate::style::text_size::SECTION),
+                        active_actions,
+                        button(row![text("+"), text("Create empty template")].spacing(8))
+                            .width(iced::Length::Fill)
+                            .on_press(Message::AddLayout),
+                        button(
+                            row![
+                                template_svg(include_bytes!("../../assets/ui/template-import.svg")),
+                                text("Import template"),
+                            ]
+                            .spacing(8),
+                        )
+                        .width(iced::Length::Fill)
+                        .on_press(Message::ImportLayout),
+                        existing,
+                    ]
+                    .spacing(8),
+                )
+                .padding(8)
+                .style(style::modal_container),
+            );
+        }
 
         let mut layout_widgets: Vec<Element<'_, Message>> = vec![];
 
@@ -436,4 +594,13 @@ fn create_icon_button<'a>(
     }
 
     btn
+}
+
+fn template_svg(bytes: &'static [u8]) -> svg::Svg<'static> {
+    svg(svg::Handle::from_memory(bytes))
+        .width(14)
+        .height(14)
+        .style(|theme: &Theme, _| svg::Style {
+            color: Some(theme.extended_palette().background.base.text),
+        })
 }

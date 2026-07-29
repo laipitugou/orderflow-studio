@@ -11,12 +11,10 @@ use iced::{
 
 pub enum Action {
     ApplyProxy,
-    Exit,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    GoBack,
     ToggleShowPassword(bool),
     SchemeChanged(ProxyScheme),
     HostChanged(String),
@@ -188,21 +186,11 @@ impl NetworkManager {
                 self.confirming_clear = false;
                 self.confirming_apply = false;
             }
-            Message::GoBack => {
-                self.confirming_clear = false;
-                self.confirming_apply = false;
-                return Some(Action::Exit);
-            }
         }
         None
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let modal_header = row![
-            button(style::icon_text(style::Icon::Return, 11)).on_press(Message::GoBack),
-            iced::widget::space::horizontal(),
-        ];
-
         let proxy_settings = {
             let saved_cfg = self.proxy_cfg();
             let is_pending = { saved_cfg != self.effective_proxy_cfg };
@@ -420,7 +408,7 @@ impl NetworkManager {
             body.push(buttons)
         };
 
-        container(column![modal_header, proxy_settings].spacing(12))
+        container(proxy_settings)
             .max_width(320)
             .padding(24)
             .style(style::dashboard_modal)

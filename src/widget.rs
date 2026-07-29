@@ -13,6 +13,7 @@ use iced::{
     },
 };
 
+pub mod add_view;
 pub mod chart;
 pub mod color_picker;
 pub mod column_drag;
