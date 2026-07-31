@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 pub use audio::AudioStream;
 pub use config::ScaleFactor;
+pub use config::network::{Network, TradeFetchMode};
 pub use config::sidebar::{self, Sidebar};
 pub use config::state::{CURRENT_SAVED_STATE_VERSION, Layouts, State};
 pub use config::theme::Theme;

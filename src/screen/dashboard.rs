@@ -10,6 +10,7 @@ use crate::{
     chart,
     connector::{
         ResolvedStream,
+        client::DataSources,
         fetcher::{self, FetchRange, FetchedData, InfoKind},
     },
     screen::dashboard::tickers_table::TickersTable,
@@ -566,12 +567,13 @@ impl Dashboard {
 
     pub fn update(
         &mut self,
-        handles: &AdapterHandles,
         message: Message,
         main_window: &Window,
         layout_id: &uuid::Uuid,
+        data_sources: &DataSources,
         windowing_mode: WindowingMode,
     ) -> (Task<Message>, Option<Event>) {
+        let handles = &data_sources.exchange;
         match message {
             Message::SavePopoutSpecs(specs) => {
                 for (window_id, new_spec) in specs {
@@ -784,7 +786,7 @@ impl Dashboard {
                                     };
 
                                 fetcher::request_fetch_many(
-                                    handles.clone(),
+                                    data_sources,
                                     pane_id,
                                     &ready_streams,
                                     *layout_id,
@@ -851,9 +853,9 @@ impl Dashboard {
                 );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
                     pane_state.status = pane::Status::Ready;
-                    pane_state
-                        .notifications
-                        .push(Toast::error(DashboardError::Fetch(error).to_string()));
+                    pane_state.notifications.push(Toast::error(
+                        DashboardError::Fetch(error, req_id).to_string(),
+                    ));
                 }
             }
             Message::DistributeFetchedData {
@@ -1947,9 +1949,9 @@ impl Dashboard {
 
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
-                    pane_state
-                        .notifications
-                        .push(Toast::error(DashboardError::Fetch(error).to_string()));
+                    pane_state.notifications.push(Toast::error(
+                        DashboardError::Fetch(error, req_id).to_string(),
+                    ));
                 }
             }
         }
@@ -2326,8 +2328,8 @@ impl Dashboard {
 
     pub fn tick(
         &mut self,
-        handles: &AdapterHandles,
         now: Instant,
+        data_sources: &DataSources,
         _main_window: window::Id,
     ) -> Task<Message> {
         // Clean up backfill handles when no backfills are pending.
@@ -2364,7 +2366,7 @@ impl Dashboard {
                         };
 
                     let fetch_tasks = fetcher::request_fetch_many(
-                        handles.clone(),
+                        data_sources,
                         pane_id,
                         &ready_streams,
                         self.layout_id,
@@ -2670,7 +2672,7 @@ impl Dashboard {
     /// concurrent REST calls or silently dropping older data.
     pub fn backfill_disconnected_streams(
         &mut self,
-        handles: &exchange::adapter::AdapterHandles,
+        data_sources: &DataSources,
         main_window: window::Id,
         streams: &[StreamKind],
         disconnect_last_seen: &HashMap<StreamKind, UnixMs>,
@@ -2913,7 +2915,7 @@ impl Dashboard {
                     let ready_streams = vec![*stream];
                     let stream_kind = *stream;
                     let task = fetcher::request_fetch(
-                        handles.clone(),
+                        data_sources,
                         pane_id,
                         &ready_streams,
                         self.layout_id,
@@ -3017,7 +3019,7 @@ impl Dashboard {
     /// which accurately reflects the offline duration.
     pub fn execute_reconnect_backfill(
         &mut self,
-        handles: &exchange::adapter::AdapterHandles,
+        data_sources: &DataSources,
         main_window: window::Id,
         reconnect_time: UnixMs,
     ) -> Task<Message> {
@@ -3041,7 +3043,7 @@ impl Dashboard {
         // This computes gap = reconnect_time - last_seen for each stream,
         // which reflects the real offline duration.
         self.backfill_disconnected_streams(
-            handles,
+            data_sources,
             main_window,
             &streams,
             &pending.stream_last_seen,

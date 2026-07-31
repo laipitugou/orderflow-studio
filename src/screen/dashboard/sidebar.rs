@@ -34,6 +34,7 @@ pub enum Action {
         Option<data::layout::pane::ContentKind>,
     ),
     ErrorOccurred(data::InternalError),
+    MenuChanged(Option<sidebar::Menu>),
 }
 
 impl Sidebar {
@@ -63,7 +64,9 @@ impl Sidebar {
                 if menu.is_some() {
                     self.tickers_table.is_shown = false;
                 }
-                self.set_menu(menu.filter(|&m| !self.is_menu_active(m)));
+                let new_menu = menu.filter(|&m| !self.is_menu_active(m));
+                self.set_menu(new_menu);
+                return (Task::none(), Some(Action::MenuChanged(new_menu)));
             }
             Message::AddViewSelected(kind) => {
                 self.set_menu(None);

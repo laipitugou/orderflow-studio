@@ -45,7 +45,7 @@ pub struct SavedState {
     pub custom_theme: Option<data::Theme>,
     pub audio_cfg: data::AudioStream,
     pub volume_size_unit: exchange::SizeUnit,
-    pub proxy_cfg: Option<exchange::proxy::Proxy>,
+    pub network: data::Network,
     pub debug_terminal_enabled: bool,
 }
 
@@ -96,7 +96,7 @@ impl Default for SavedState {
             custom_theme: None,
             audio_cfg: data::AudioStream::default(),
             volume_size_unit: exchange::SizeUnit::Base,
-            proxy_cfg: None,
+            network: data::Network::default(),
             debug_terminal_enabled: false,
         }
     }
@@ -620,14 +620,19 @@ fn saved_state_from_config(state: data::State) -> SavedState {
         }
     };
 
-    crate::connector::fetcher::toggle_trade_fetch(state.trade_fetch_enabled);
+    let mut network = state.network.clone();
+    if network.server_auth_token.is_none()
+        && let Some(ref url) = network.server_url
+    {
+        network.server_auth_token = data::config::auth::load_server_token(url);
+    }
+
+    crate::connector::fetcher::set_trade_fetch_mode(network.trade_fetch_mode.clone());
     exchange::unit::qty::set_preferred_currency(state.size_in_quote_ccy);
 
-    // Hydrate proxy auth from keychain (keeps auth out of persisted JSON)
-    let mut proxy_cfg = state.proxy_cfg;
-    if let Some(proxy) = proxy_cfg.as_mut()
+    if let Some(proxy) = network.proxy.as_mut()
         && proxy.auth().is_none()
-        && let Some(auth) = data::config::proxy::load_proxy_auth(proxy)
+        && let Some(auth) = data::config::auth::load_proxy_auth(proxy)
     {
         proxy.set_auth(Some(auth));
     }
@@ -642,7 +647,7 @@ fn saved_state_from_config(state: data::State) -> SavedState {
         scale_factor: state.scale_factor,
         audio_cfg: state.audio_cfg,
         volume_size_unit: state.size_in_quote_ccy,
-        proxy_cfg,
+        network,
         debug_terminal_enabled: state.debug_terminal_enabled,
     }
 }

@@ -1420,6 +1420,22 @@ impl KlineChart {
         }
     }
 
+    pub fn reset_trade_fetch_state(&mut self) {
+        self.fetching_trades = (false, None);
+    }
+
+    /// Mark a fetch request as failed to unblock re-fetches of the same range.
+    pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
+        self.request_handler
+            .mark_failed(req_id, "Fetch failed".to_string());
+    }
+
+    /// Mark a fetch request as having no data. The source confirmed the
+    /// range is empty and it should never be retried.
+    pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {
+        self.request_handler.mark_no_data(req_id);
+    }
+
     pub fn raw_trades(&self) -> Vec<Trade> {
         self.raw_trades.clone()
     }
@@ -1855,8 +1871,18 @@ impl KlineChart {
             fetcher::format_optional_time(earliest),
             fetcher::format_optional_time(latest)
         );
-
         if matches!(&self.data_source, PlotData::TickBased(_)) {
+            if is_batches_done {
+                self.fetching_trades = (false, None);
+            }
+            return;
+        }
+
+        // Skip unnecessary work when the batch is empty (e.g. the final
+        // batch was completely filtered out by until_time).  The true
+        // "no data at all" case is handled separately via
+        // mark_fetch_no_data in the dashboard.
+        if raw_trades.is_empty() {
             if is_batches_done {
                 self.fetching_trades = (false, None);
             }
@@ -2021,11 +2047,10 @@ impl KlineChart {
 
                 if klines_raw.is_empty() {
                     log::warn!(
-                        "DATA Klines Complete | req={} records=0 transition=failed reason=no_data",
+                        "DATA Klines Complete | req={} records=0 transition=no_data",
                         fetcher::short_id(req_id)
                     );
-                    self.request_handler
-                        .mark_failed(req_id, "No data received".to_string());
+                    self.request_handler.mark_no_data(req_id);
                 } else {
                     log::debug!(
                         "DATA Klines Complete | req={} records={} transition=completed",
@@ -2043,8 +2068,7 @@ impl KlineChart {
     pub fn insert_open_interest(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
         if let Some(req_id) = req_id {
             if oi_data.is_empty() {
-                self.request_handler
-                    .mark_failed(req_id, "No data received".to_string());
+                self.request_handler.mark_no_data(req_id);
             } else {
                 self.request_handler.mark_completed(req_id);
             }

@@ -11,9 +11,13 @@ use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use crate::connector::client::{DataSources, ServerClient};
+
+pub use data::TradeFetchMode;
 
 // ── Human-readable log helpers ──────────────────────────────────────────────
 
@@ -152,14 +156,34 @@ fn trades_contained(
     inner_from >= outer_from && inner_to <= outer_to
 }
 
-static TRADE_FETCH_ENABLED: AtomicBool = AtomicBool::new(false);
+static TRADE_FETCH_MODE: RwLock<TradeFetchMode> = RwLock::new(TradeFetchMode::Off);
+const ARROW_LIMIT: usize = 400_000;
 
 pub fn toggle_trade_fetch(value: bool) {
-    TRADE_FETCH_ENABLED.store(value, Ordering::Relaxed);
+    set_trade_fetch_mode(if value {
+        TradeFetchMode::Exchange
+    } else {
+        TradeFetchMode::Off
+    });
+}
+
+pub fn set_trade_fetch_mode(mode: TradeFetchMode) {
+    if let Ok(mut guard) = TRADE_FETCH_MODE.write() {
+        *guard = mode;
+    } else {
+        log::error!("Trade fetch mode lock poisoned — resetting to Off");
+    }
+}
+
+pub fn trade_fetch_mode() -> TradeFetchMode {
+    TRADE_FETCH_MODE
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or(TradeFetchMode::Off)
 }
 
 pub fn is_trade_fetch_enabled() -> bool {
-    TRADE_FETCH_ENABLED.load(Ordering::Relaxed)
+    trade_fetch_mode() != TradeFetchMode::Off
 }
 
 const TRADE_REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
@@ -943,6 +967,11 @@ impl RequestHandler {
         }
     }
 
+    /// Mark a range as terminally empty so it is not immediately requested again.
+    pub fn mark_no_data(&mut self, id: Uuid) {
+        self.mark_completed(id);
+    }
+
     pub fn mark_failed(&mut self, id: Uuid, error: String) {
         if let Some(request) = self.requests.get_mut(&id) {
             // Do not overwrite a terminal status (Superseded, Completed)
@@ -1199,7 +1228,7 @@ pub enum FetchUpdate {
 }
 
 pub fn request_fetch(
-    handles: AdapterHandles,
+    sources: &DataSources,
     pane_id: Uuid,
     ready_streams: &[StreamKind],
     layout_id: Uuid,
@@ -1209,6 +1238,8 @@ pub fn request_fetch(
     on_trade_handle: &mut impl FnMut(Handle),
     chart_generation: u64,
 ) -> Task<FetchUpdate> {
+    let handles = sources.exchange.clone();
+    let server = sources.server.clone();
     log::info!(
         "FETCH Owner | req={} pane={} chart_generation={} {}",
         short_id(req_id),
@@ -1337,8 +1368,30 @@ pub fn request_fetch(
                     ticker_info.exchange(),
                     Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
                 );
+                let mode = trade_fetch_mode();
 
-                if is_binance {
+                if mode == TradeFetchMode::Server && server.is_none() {
+                    return Task::done(FetchUpdate::Error {
+                        pane_id,
+                        error: "Server mode selected but the server URL is invalid.".to_string(),
+                        req_id: Some(req_id),
+                        fetch: Some(FetchRange::Trades(from_time, to_time)),
+                    });
+                }
+
+                if mode == TradeFetchMode::Exchange && !is_binance {
+                    return Task::done(FetchUpdate::Error {
+                        pane_id,
+                        error: format!(
+                            "Trade fetch via exchange API is only supported for Binance, got {}",
+                            ticker_info.exchange()
+                        ),
+                        req_id: Some(req_id),
+                        fetch: Some(FetchRange::Trades(from_time, to_time)),
+                    });
+                }
+
+                if server.is_some() || is_binance {
                     let data_path = data::data_path(Some("market_data/binance/"));
                     log::info!(
                         "TRADE Start | venue={} symbol={} range={} req={} pane={} stream={} path={}",
@@ -1353,6 +1406,7 @@ pub fn request_fetch(
 
                     let (task, handle) = Task::sip(
                         fetch_trades_batched(
+                            server,
                             handles.clone(),
                             ticker_info,
                             from_time,
@@ -1627,7 +1681,7 @@ fn trace_ready_streams(prefix: &str, ready_streams: &[StreamKind]) {
 }
 
 pub fn request_fetch_many(
-    handles: AdapterHandles,
+    sources: &DataSources,
     pane_id: Uuid,
     ready_streams: &[StreamKind],
     layout_id: Uuid,
@@ -1657,7 +1711,7 @@ pub fn request_fetch_many(
 
     for (req_id, fetch, stream) in reqs {
         tasks.push(request_fetch(
-            handles.clone(),
+            sources,
             pane_id,
             ready_streams,
             layout_id,
@@ -2051,6 +2105,7 @@ fn kline_success_updates(
 }
 
 pub fn fetch_trades_batched(
+    server: Option<ServerClient>,
     handles: AdapterHandles,
     ticker_info: TickerInfo,
     from_time: UnixMs,
@@ -2160,10 +2215,18 @@ pub fn fetch_trades_batched(
                     format_time_short(target_to)
                 );
 
-                let fetch_result = tokio::time::timeout(
-                    TRADE_REST_REQUEST_TIMEOUT,
-                    handles.fetch_trades(ticker_info, request_from, Some(data_path.clone())),
-                )
+                let fetch_result = tokio::time::timeout(TRADE_REST_REQUEST_TIMEOUT, async {
+                    if let Some(client) = server.as_ref() {
+                        client
+                            .fetch_trades_arrow(ticker_info, request_from, target_to, ARROW_LIMIT)
+                            .await
+                            .map(|parsed| parsed.trades)
+                    } else {
+                        handles
+                            .fetch_trades(ticker_info, request_from, Some(data_path.clone()))
+                            .await
+                    }
+                })
                 .await;
 
                 match fetch_result {
