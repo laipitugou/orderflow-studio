@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 const OFFLINE_GRACE: Duration = Duration::from_millis(1_500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectivityPhase {
+pub enum ConnectivityPhase {
     Connecting,
     Online,
     Offline,
@@ -99,6 +99,10 @@ impl MarketConnectivity {
 
     pub fn is_online(&self) -> bool {
         self.phase == ConnectivityPhase::Online
+    }
+
+    pub fn phase(&self) -> ConnectivityPhase {
+        self.phase
     }
 
     pub fn overlay_visible(&self) -> bool {

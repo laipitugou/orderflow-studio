@@ -237,6 +237,16 @@ impl ContentKind {
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
     ];
+
+    pub const ADDABLE: [ContentKind; 7] = [
+        ContentKind::CandlestickChart,
+        ContentKind::FootprintChart,
+        ContentKind::ShaderHeatmap,
+        ContentKind::Ladder,
+        ContentKind::TimeAndSales,
+        ContentKind::GexChart,
+        ContentKind::ComparisonChart,
+    ];
 }
 
 impl std::fmt::Display for ContentKind {

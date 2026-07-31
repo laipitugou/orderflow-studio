@@ -349,14 +349,22 @@ impl TimeSeries<KlineDataPoint> {
         }
     }
 
-    pub fn change_tick_size(&mut self, tick_size: PriceStep, raw_trades: &[Trade]) {
+    pub fn change_tick_size(&mut self, tick_size: PriceStep) {
         self.tick_size = tick_size;
 
-        self.clear_trades();
-
-        if !raw_trades.is_empty() {
-            self.insert_trades_existing_buckets(raw_trades);
+        // Re-bin from every candle's retained sequence. The chart-level raw
+        // buffer is capped and may no longer contain the full SVP session.
+        for data_point in self.datapoints.values_mut() {
+            let trades = std::mem::take(&mut data_point.trade_sequence);
+            let coverage = data_point.trade_coverage;
+            data_point.clear_trades();
+            for trade in &trades {
+                data_point.add_trade(trade, tick_size);
+            }
+            data_point.trade_coverage = coverage;
+            data_point.calculate_poc();
         }
+        self.update_poc_status();
     }
 
     pub fn update_poc_status(&mut self) {
@@ -443,14 +451,39 @@ impl TimeSeries<KlineDataPoint> {
                 }
                 let (data_earliest, data_latest) = self.timerange();
 
-                let fetch_from = last_t_before_gap
-                    .map_or(data_earliest, |t| t.saturating_add(1))
-                    .max(visible_earliest);
-                let fetch_to = first_t_after_gap
-                    .map_or(data_latest, |t| t.saturating_sub(1))
-                    .min(visible_latest);
+                let gap_start = last_t_before_gap.map_or(data_earliest, |t| t.saturating_add(1));
+
+                // Round down to the nearest kline boundary so the first
+                // bucket is fully covered.
+                let fetch_from = gap_start
+                    .max(visible_earliest)
+                    .floor_to(self.interval)
+                    .max(gap_start);
+
+                // When we know where the next trade sits, fetch the entire
+                // gap in one shot instead of truncating at `visible_latest`
+                // - otherwise fast scrolling leaves a trailing gap that
+                // must be back-filled on the next scroll.  When there is no
+                // trade after the gap (`None`) we still stop at the visible
+                // edge to avoid an unbounded fetch.
+                let fetch_to = match first_t_after_gap {
+                    Some(t) => t.saturating_sub(1),
+                    None => data_latest.min(visible_latest),
+                };
 
                 if fetch_from < fetch_to {
+                    // When the gap originates before the visible window,
+                    // clamping `fetch_from` to `visible_earliest` can
+                    // collapse the range into a sub-interval sliver (e.g.
+                    // the first few seconds of a kline bucket that already
+                    // has trades).  Skip fetches that cover less than one
+                    // full interval.
+                    if gap_start < visible_earliest {
+                        let interval_ms = self.interval.to_milliseconds();
+                        if fetch_to.as_u64().saturating_sub(fetch_from.as_u64()) < interval_ms {
+                            return None;
+                        }
+                    }
                     Some((fetch_from, fetch_to))
                 } else {
                     None
@@ -573,5 +606,60 @@ impl From<&TimeSeries<KlineDataPoint>> for BTreeMap<UnixMs, exchange::Volume> {
             .iter()
             .map(|(time, dp)| (*time, dp.kline.volume))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kline_tick_size_change_preserves_full_trade_sequences() {
+        let old_step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let new_step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let candle_time = UnixMs::new(60_000);
+        let kline = Kline {
+            time: candle_time,
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(101.0),
+            low: Price::from_f64(99.0),
+            close: Price::from_f64(100.5),
+            volume: Volume::empty_buy_sell(),
+        };
+        let trades = [
+            Trade {
+                id: Some(1),
+                time: UnixMs::new(61_000),
+                is_sell: false,
+                price: Price::from_f64(100.1),
+                qty: Qty::from_f64(2.0),
+            },
+            Trade {
+                id: Some(2),
+                time: UnixMs::new(62_000),
+                is_sell: true,
+                price: Price::from_f64(100.9),
+                qty: Qty::from_f64(3.0),
+            },
+        ];
+        let mut series = TimeSeries::<KlineDataPoint>::new(Timeframe::M1, old_step, &[kline]);
+        series.insert_trades_existing_buckets(&trades);
+        series.mark_range_trades_complete(candle_time, candle_time.saturating_add(60_000));
+
+        series.change_tick_size(new_step);
+
+        let data_point = series.datapoints.get(&candle_time).expect("candle exists");
+        assert_eq!(data_point.trade_sequence.len(), trades.len());
+        assert_eq!(data_point.trade_coverage, TradeCoverage::Complete);
+        let total = data_point
+            .footprint
+            .trades
+            .values()
+            .fold(Qty::ZERO, |sum, group| sum + group.total_qty());
+        assert_eq!(total, Qty::from_f64(5.0));
     }
 }

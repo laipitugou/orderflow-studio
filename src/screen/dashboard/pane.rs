@@ -47,7 +47,7 @@ use exchange::{
 };
 use iced::{
     Alignment, Element, Length, Renderer, Theme, padding,
-    widget::{button, center, column, container, pane_grid, pick_list, row, text, tooltip},
+    widget::{button, center, column, container, pane_grid, responsive, row, rule, text, tooltip},
 };
 use std::time::Instant;
 
@@ -1026,17 +1026,17 @@ impl State {
 
         let body = match &self.content {
             Content::Starter => {
-                let content_picklist =
-                    pick_list(ContentKind::ALL, Some(ContentKind::Starter), move |kind| {
-                        Message::PaneEvent(id, Event::ContentSelected(kind))
-                    });
-
                 let base: Element<_> = widget::toast::Manager::new(
                     center(
                         column![
                             text("Choose a view to get started")
                                 .size(crate::style::text_size::TITLE),
-                            content_picklist
+                            container(responsive(move |size| widget::add_view::selector(
+                                if size.width < 420.0 { 1 } else { 2 },
+                                move |kind| Message::PaneEvent(id, Event::ContentSelected(kind)),
+                            )))
+                            .width(Length::Fill)
+                            .max_width(620.0)
                         ]
                         .align_x(Alignment::Center)
                         .spacing(12),
@@ -2082,7 +2082,7 @@ impl State {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Cog, 12),
                 show_modal(Modal::Settings),
-                None,
+                Some("Settings"),
                 tooltip_pos,
                 modal_btn_style(Modal::Settings),
             ));
@@ -2130,7 +2130,7 @@ impl State {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(resize_icon, 12),
                 message,
-                None,
+                Some(if is_maximized { "Restore" } else { "Maximize" }),
                 tooltip_pos,
                 control_btn_style(is_maximized),
             ));
@@ -2138,7 +2138,7 @@ impl State {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Close, 12),
                 Message::ClosePane(pane),
-                None,
+                Some("Close pane"),
                 tooltip_pos,
                 control_btn_style(false),
             ));
@@ -2247,13 +2247,23 @@ impl State {
                     Alignment::Start,
                 )
             }
-            Some(Modal::Settings) => stack_modal(
-                base,
-                settings_modal(),
-                on_blur,
-                padding::right(12).left(12),
-                Alignment::End,
-            ),
+            Some(Modal::Settings) => {
+                let settings = column![
+                    settings_modal(),
+                    rule::horizontal(1.0).style(style::split_ruler),
+                    button(text("Reset view"))
+                        .width(Length::Fill)
+                        .on_press(Message::ReplacePane(pane)),
+                ]
+                .spacing(12);
+                stack_modal(
+                    base,
+                    settings,
+                    on_blur,
+                    padding::right(12).left(12),
+                    Alignment::End,
+                )
+            }
             Some(Modal::Indicators) => stack_modal(
                 base,
                 indicator_modal.unwrap_or_else(|| column![].into()),

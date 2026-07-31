@@ -224,6 +224,67 @@ pub mod button {
         }
     }
 
+    pub fn toolbar(theme: &Theme, status: Status, is_active: bool) -> Style {
+        let palette = theme.extended_palette();
+        Style {
+            text_color: palette.background.base.text,
+            background: match status {
+                Status::Pressed => Some(palette.background.strongest.color.into()),
+                Status::Hovered => Some(palette.background.strong.color.into()),
+                Status::Active | Status::Disabled if is_active => {
+                    Some(palette.background.weak.color.into())
+                }
+                Status::Active | Status::Disabled => None,
+            },
+            border: Border {
+                radius: 4.0.into(),
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn toolbar_primary(theme: &Theme, status: Status, _is_active: bool) -> Style {
+        let palette = theme.extended_palette();
+        Style {
+            text_color: palette.primary.base.color,
+            background: match status {
+                Status::Pressed => Some(palette.background.strongest.color.into()),
+                Status::Hovered => Some(palette.background.strong.color.into()),
+                Status::Active | Status::Disabled => None,
+            },
+            border: Border {
+                radius: 4.0.into(),
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn add_view_card(theme: &Theme, status: Status) -> Style {
+        let palette = theme.extended_palette();
+        Style {
+            text_color: palette.background.base.text,
+            background: Some(match status {
+                Status::Pressed => palette.primary.weak.color.into(),
+                Status::Hovered => palette.background.strong.color.into(),
+                Status::Active | Status::Disabled => palette.background.weak.color.into(),
+            }),
+            border: Border {
+                radius: 4.0.into(),
+                width: 1.0,
+                color: if matches!(status, Status::Hovered | Status::Pressed) {
+                    palette.primary.base.color
+                } else {
+                    palette.background.strong.color
+                },
+            },
+            ..Default::default()
+        }
+    }
+
     pub fn modifier(theme: &Theme, status: Status, is_clicked: bool) -> Style {
         let palette = theme.extended_palette();
 
@@ -471,21 +532,15 @@ pub fn pane_background(theme: &Theme, is_focused: bool) -> Style {
 
     Style {
         text_color: Some(palette.background.base.text),
-        background: Some(palette.background.weakest.color.into()),
-        border: {
-            if is_focused {
-                Border {
-                    width: 1.0,
-                    color: palette.background.strong.color,
-                    radius: 4.0.into(),
-                }
-            } else {
-                Border {
-                    width: 1.0,
-                    color: color.scale_alpha(0.5),
-                    radius: 2.0.into(),
-                }
-            }
+        background: Some(if is_focused {
+            palette.background.weak.color.scale_alpha(0.35).into()
+        } else {
+            palette.background.weakest.color.into()
+        }),
+        border: Border {
+            width: 1.0,
+            color: color.scale_alpha(0.5),
+            radius: 2.0.into(),
         },
         ..Default::default()
     }

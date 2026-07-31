@@ -64,6 +64,43 @@ Windows and macOS beta binaries are not currently signed. Windows SmartScreen ma
 
 Live trades are captured over WebSocket. Binance charts can optionally backfill the visible range from [data.binance.vision](https://data.binance.vision/) daily files, the paginated REST API, or both. Historical trade fetching for Bybit and Hyperliquid is not available; OKX support remains work in progress.
 
+By default, Flowsurface captures and plots live trades in real time via WebSocket.
+
+To backfill the visible time range on footprint charts, enable **trade fetching**
+in Settings → Network. Three modes are available:
+
+- **Exchange**: Fetches directly from Binance's public REST API and bulk data
+  mirrors ([data.binance.vision](https://data.binance.vision/)). Fast for
+  daily archives; paginated and rate-limited for intraday ranges. **Binance
+  only** (spot, linear, inverse).
+
+- **[Server](https://github.com/flowsurface-rs/server)**: Fetches from any HTTP server that exposes a
+  `GET /trades.arrow` endpoint returning an
+  [Arrow IPC](https://arrow.apache.org/) stream with:
+    - Response: `Content-Type: application/vnd.apache.arrow.stream`
+    - Schema (columns matched by name, order not significant):
+
+        `ts (int64)`, `price (float64)`, `qty (float64)`, `is_sell (bool)`
+
+    - Query parameters:
+      `venue`, `market`, `symbol`, `from` (inclusive), `to` (inclusive), `limit`
+    - Optional bearer-token auth: (`Authorization: Bearer <token>`)
+
+    Self-signed TLS certificates are
+    accepted. Works with **all exchanges** and has no exchange rate limits.
+    Bring your own data source.
+
+    A reference implementation is available at
+    [flowsurface-server](https://github.com/flowsurface-rs/server), a
+    self-contained collector that writes trades to DuckDB and serves
+    them over this protocol.
+
+- **Off**: Live trades only; no historical backfill.
+
+##### Historical klines, open interest, and ticker metadata/stats are always fetched from exchange REST APIs.
+
+##### Live trades, orderbook and kline updates are streamed from exchange WebSocket feeds.
+
 ## Installation
 
 ### Prebuilt beta packages
