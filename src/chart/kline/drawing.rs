@@ -2,12 +2,17 @@ use super::KlineChart;
 use crate::chart::scale::AxisOverlayLabel;
 use crate::chart::{Chart, DrawingMessage, Interaction, Message};
 use crate::widget::color_picker::color_picker;
-use data::chart::{Basis, kline::drawing::*};
+use data::chart::{
+    Basis,
+    kline::{SessionProfileMode, SessionProfilePlacement, drawing::*},
+};
 use exchange::{UnixMs, unit::Price};
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{
     Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, Vector, mouse,
-    widget::{button, column, container, opaque, row, slider, svg, text, text_input},
+    widget::{
+        button, checkbox, column, container, opaque, pick_list, row, slider, svg, text, text_input,
+    },
 };
 use iced_core::mouse::{Click, click};
 
@@ -72,6 +77,7 @@ impl Default for DrawingState {
                 DrawingTool::Fibonacci,
                 DrawingTool::TrendLine,
                 DrawingTool::Text,
+                DrawingTool::FixedRangeVolumeProfile,
             ]
             .into_iter()
             .map(|tool| (tool, DrawingStyle::default()))
@@ -90,6 +96,10 @@ pub struct CanvasState {
 }
 
 impl KlineChart {
+    const MAX_FIXED_VOLUME_PROFILES: usize = 16;
+    const MAX_FIXED_VOLUME_PROFILE_RANGE_MS: u64 = 7 * 24 * 60 * 60_000;
+    const MAX_FIXED_VOLUME_PROFILE_CANDLES: usize = 10_000;
+
     pub(super) fn drawing_anchor(&self, point: Point, bounds: Rectangle) -> DrawingAnchor {
         let chart = self.state();
         let center = bounds.center();
@@ -114,6 +124,117 @@ impl KlineChart {
             + (Vector::new(x, chart.price_to_y(anchor.price)) + chart.translation) * chart.scaling
     }
 
+    fn volume_profile_screen_x(&self, time: UnixMs, bounds: Rectangle) -> f32 {
+        let chart = self.state();
+        bounds.center().x
+            + (chart.interval_to_x(time.as_u64()) + chart.translation.x) * chart.scaling
+    }
+
+    fn snap_volume_profile_time(&self, x: DrawingX) -> Option<UnixMs> {
+        let DrawingX::Time(requested) = x else {
+            return None;
+        };
+        let data::chart::PlotData::TimeBased(timeseries) = &self.data_source else {
+            return None;
+        };
+        let keys = timeseries.datapoints.keys().copied().collect::<Vec<_>>();
+        snap_timestamp_to_candle(&keys, requested)
+    }
+
+    fn normalized_fixed_range(&self, first: UnixMs, second: UnixMs) -> Option<(UnixMs, UnixMs)> {
+        let data::chart::PlotData::TimeBased(timeseries) = &self.data_source else {
+            return None;
+        };
+        let keys = timeseries.datapoints.keys().copied().collect::<Vec<_>>();
+        normalize_fixed_range(&keys, first, second)
+    }
+
+    fn normalize_fixed_range_drawings(&mut self) {
+        let data::chart::PlotData::TimeBased(timeseries) = &self.data_source else {
+            return;
+        };
+        let keys = timeseries.datapoints.keys().copied().collect::<Vec<_>>();
+        for drawing in &mut self.drawings.drawings {
+            if let DrawingGeometry::FixedRangeVolumeProfile { first, second } =
+                &mut drawing.geometry
+                && let Some((normalized_first, normalized_second)) =
+                    normalize_fixed_range(&keys, *first, *second)
+            {
+                *first = normalized_first;
+                *second = normalized_second;
+            }
+        }
+    }
+
+    pub(super) fn fixed_volume_profiles(
+        &self,
+    ) -> Vec<(UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> {
+        let Basis::Time(timeframe) = self.chart.basis else {
+            return Vec::new();
+        };
+        self.drawings
+            .visible
+            .then(|| {
+                self.drawings
+                    .drawings
+                    .iter()
+                    .filter_map(|drawing| {
+                        let DrawingGeometry::FixedRangeVolumeProfile { first, second } =
+                            drawing.geometry
+                        else {
+                            return None;
+                        };
+                        let (from, last) = if first <= second {
+                            (first, second)
+                        } else {
+                            (second, first)
+                        };
+                        Some((
+                            from,
+                            last.saturating_add(timeframe.to_milliseconds()),
+                            sanitize_volume_profile_config(
+                                drawing.style.fixed_range_volume_profile,
+                            ),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_fixed_volume_profiles(&self) -> bool {
+        self.drawings.drawings.iter().any(|drawing| {
+            matches!(
+                drawing.geometry,
+                DrawingGeometry::FixedRangeVolumeProfile { .. }
+            )
+        })
+    }
+
+    pub(super) fn fixed_volume_profile_ready(&self, from: UnixMs, to: UnixMs) -> bool {
+        let (Basis::Time(timeframe), data::chart::PlotData::TimeBased(timeseries)) =
+            (self.chart.basis, &self.data_source)
+        else {
+            return false;
+        };
+        let (_, latest) = timeseries.timerange();
+        let historical_to =
+            super::historical_trade_target_to(latest, timeframe.to_milliseconds(), UnixMs::now());
+        let required_to = to.min(historical_to);
+        required_to <= from || self.is_trade_range_covered(from, required_to)
+    }
+
+    fn fixed_volume_profile_loading(&self, first: UnixMs, second: UnixMs) -> bool {
+        let Basis::Time(timeframe) = self.chart.basis else {
+            return true;
+        };
+        let from = first.min(second);
+        let to = first
+            .max(second)
+            .saturating_add(timeframe.to_milliseconds());
+        !self.fixed_volume_profile_ready(from, to)
+    }
+
     fn style_for_tool(&self, tool: DrawingTool) -> DrawingStyle {
         self.drawings
             .tool_styles
@@ -124,6 +245,23 @@ impl KlineChart {
     }
 
     fn commit(&mut self, geometry: DrawingGeometry) {
+        if matches!(geometry, DrawingGeometry::FixedRangeVolumeProfile { .. })
+            && self
+                .drawings
+                .drawings
+                .iter()
+                .filter(|drawing| {
+                    matches!(
+                        drawing.geometry,
+                        DrawingGeometry::FixedRangeVolumeProfile { .. }
+                    )
+                })
+                .count()
+                >= Self::MAX_FIXED_VOLUME_PROFILES
+        {
+            self.drawings.active_tool = DrawingTool::Select;
+            return;
+        }
         let id = self.drawings.next_id;
         self.drawings.next_id = self.drawings.next_id.saturating_add(1);
         let tool = geometry_tool(&geometry);
@@ -162,28 +300,52 @@ impl KlineChart {
                 DrawingTool::VerticalLine => {
                     self.commit(DrawingGeometry::VerticalLine { x: anchor.x })
                 }
-                DrawingTool::Rectangle | DrawingTool::Fibonacci | DrawingTool::TrendLine => {
+                DrawingTool::Rectangle
+                | DrawingTool::Fibonacci
+                | DrawingTool::TrendLine
+                | DrawingTool::FixedRangeVolumeProfile => {
+                    let mut anchor = *anchor;
+                    if self.drawings.active_tool == DrawingTool::FixedRangeVolumeProfile {
+                        let Some(time) = self.snap_volume_profile_time(anchor.x) else {
+                            return true;
+                        };
+                        anchor.x = DrawingX::Time(time);
+                    }
                     if let Some(Draft::TwoPoint { tool, first, .. }) = self.drawings.draft.take() {
                         let geometry = match tool {
                             DrawingTool::Rectangle => DrawingGeometry::Rectangle {
                                 first,
-                                second: *anchor,
+                                second: anchor,
                             },
                             DrawingTool::Fibonacci => DrawingGeometry::Fibonacci {
                                 first,
-                                second: *anchor,
+                                second: anchor,
                             },
+                            DrawingTool::FixedRangeVolumeProfile => {
+                                let DrawingX::Time(first) = first.x else {
+                                    return true;
+                                };
+                                let DrawingX::Time(second) = anchor.x else {
+                                    return true;
+                                };
+                                let Some((first, second)) =
+                                    self.normalized_fixed_range(first, second)
+                                else {
+                                    return true;
+                                };
+                                DrawingGeometry::FixedRangeVolumeProfile { first, second }
+                            }
                             _ => DrawingGeometry::TrendLine {
                                 first,
-                                second: *anchor,
+                                second: anchor,
                             },
                         };
                         self.commit(geometry);
                     } else {
                         self.drawings.draft = Some(Draft::TwoPoint {
                             tool: self.drawings.active_tool,
-                            first: *anchor,
-                            preview: *anchor,
+                            first: anchor,
+                            preview: anchor,
                         });
                     }
                 }
@@ -200,41 +362,56 @@ impl KlineChart {
                     self.drawings.text_editor_position = Some(*editor_position);
                 }
             },
-            DrawingMessage::PointerMoved(anchor, screen_point) => match &mut self.drawings.draft {
-                Some(Draft::TwoPoint { preview, .. }) => *preview = *anchor,
-                Some(Draft::Freehand { points }) => {
-                    if points.last().is_none_or(|last| last != anchor) {
-                        points.push(*anchor);
-                    }
-                }
-                Some(Draft::Moving {
-                    original,
-                    start,
-                    id,
-                }) => {
-                    if let Some(drawing) = self.drawings.drawings.iter_mut().find(|d| d.id == *id) {
-                        drawing.geometry = translate_geometry(original, *start, *anchor);
-                    }
-                }
-                Some(Draft::Resizing {
-                    id,
-                    original,
-                    start_screen,
-                    handle,
-                    original_text_scale,
-                }) => {
-                    if let Some(drawing) = self.drawings.drawings.iter_mut().find(|d| d.id == *id) {
-                        drawing.geometry = resize_geometry(original, *anchor, *handle);
-                        if matches!(original, DrawingGeometry::Text { .. }) {
-                            let distance = (screen_point.x - start_screen.x)
-                                .hypot(screen_point.y - start_screen.y);
-                            drawing.style.text_scale =
-                                (*original_text_scale * (1.0 + distance / 120.0)).clamp(0.4, 8.0);
+            DrawingMessage::PointerMoved(anchor, screen_point) => {
+                let profile_time = self.snap_volume_profile_time(anchor.x);
+                match &mut self.drawings.draft {
+                    Some(Draft::TwoPoint { tool, preview, .. }) => {
+                        *preview = *anchor;
+                        if *tool == DrawingTool::FixedRangeVolumeProfile
+                            && let Some(time) = profile_time
+                        {
+                            preview.x = DrawingX::Time(time);
                         }
                     }
+                    Some(Draft::Freehand { points }) => {
+                        if points.last().is_none_or(|last| last != anchor) {
+                            points.push(*anchor);
+                        }
+                    }
+                    Some(Draft::Moving {
+                        original,
+                        start,
+                        id,
+                    }) => {
+                        if let Some(drawing) =
+                            self.drawings.drawings.iter_mut().find(|d| d.id == *id)
+                        {
+                            drawing.geometry = translate_geometry(original, *start, *anchor);
+                        }
+                    }
+                    Some(Draft::Resizing {
+                        id,
+                        original,
+                        start_screen,
+                        handle,
+                        original_text_scale,
+                    }) => {
+                        if let Some(drawing) =
+                            self.drawings.drawings.iter_mut().find(|d| d.id == *id)
+                        {
+                            drawing.geometry = resize_geometry(original, *anchor, *handle);
+                            if matches!(original, DrawingGeometry::Text { .. }) {
+                                let distance = (screen_point.x - start_screen.x)
+                                    .hypot(screen_point.y - start_screen.y);
+                                drawing.style.text_scale = (*original_text_scale
+                                    * (1.0 + distance / 120.0))
+                                    .clamp(0.4, 8.0);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             DrawingMessage::PointerReleased(_) => {
                 if let Some(Draft::Freehand { points }) = self.drawings.draft.take() {
                     if points.len() > 1 {
@@ -287,6 +464,7 @@ impl KlineChart {
                     Some(Draft::Moving { .. }) | Some(Draft::Resizing { .. })
                 ) {
                     self.drawings.draft = None;
+                    self.normalize_fixed_range_drawings();
                 }
             }
             DrawingMessage::CancelOrCommit => match self.drawings.draft.take() {
@@ -372,11 +550,19 @@ impl KlineChart {
                     level.visible = !level.visible;
                 }
             }),
+            DrawingMessage::SetFixedRangeVolumeProfile(config) => {
+                self.modify_selected_style(|style| {
+                    style.fixed_range_volume_profile = sanitize_volume_profile_config(*config)
+                })
+            }
             DrawingMessage::ToggleToolbar => {
                 self.drawings.toolbar_open = !self.drawings.toolbar_open
             }
         }
         self.chart.cache.clear_all();
+        if self.has_fixed_volume_profiles() {
+            self.last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
         true
     }
 
@@ -723,6 +909,77 @@ fn color(value: DrawingColor, opacity: f32) -> Color {
     }
 }
 
+fn snap_timestamp_to_candle(keys: &[UnixMs], requested: UnixMs) -> Option<UnixMs> {
+    let first = *keys.first()?;
+    let last = *keys.last()?;
+    if requested <= first {
+        return Some(first);
+    }
+    if requested >= last {
+        return Some(last);
+    }
+    let index = keys.partition_point(|value| *value < requested);
+    let after = keys.get(index).copied().unwrap_or(last);
+    let before = keys.get(index.saturating_sub(1)).copied().unwrap_or(first);
+    (requested.as_u64().saturating_sub(before.as_u64())
+        <= after.as_u64().saturating_sub(requested.as_u64()))
+    .then_some(before)
+    .or(Some(after))
+}
+
+fn normalize_fixed_range(
+    keys: &[UnixMs],
+    first: UnixMs,
+    second: UnixMs,
+) -> Option<(UnixMs, UnixMs)> {
+    let first = snap_timestamp_to_candle(keys, first)?;
+    let mut second = snap_timestamp_to_candle(keys, second)?;
+    let first_index = keys.binary_search(&first).ok()?;
+    let second_index = keys.binary_search(&second).ok()?;
+    let max_index_distance = KlineChart::MAX_FIXED_VOLUME_PROFILE_CANDLES.saturating_sub(1);
+    second = if second >= first {
+        let latest_time = UnixMs::new(
+            first
+                .as_u64()
+                .saturating_add(KlineChart::MAX_FIXED_VOLUME_PROFILE_RANGE_MS),
+        );
+        let latest_time_index = keys.partition_point(|value| *value <= latest_time);
+        let max_index = (first_index + max_index_distance)
+            .min(latest_time_index.saturating_sub(1))
+            .min(keys.len().saturating_sub(1));
+        keys[second_index.min(max_index)]
+    } else {
+        let earliest_time = UnixMs::new(
+            first
+                .as_u64()
+                .saturating_sub(KlineChart::MAX_FIXED_VOLUME_PROFILE_RANGE_MS),
+        );
+        let earliest_time_index = keys.partition_point(|value| *value < earliest_time);
+        let min_index = first_index
+            .saturating_sub(max_index_distance)
+            .max(earliest_time_index);
+        keys[second_index.max(min_index)]
+    };
+    Some((first, second))
+}
+
+fn sanitize_volume_profile_config(
+    mut config: FixedRangeVolumeProfileConfig,
+) -> FixedRangeVolumeProfileConfig {
+    config.width_percent = if config.width_percent.is_finite() {
+        config.width_percent.clamp(10.0, 90.0)
+    } else {
+        FixedRangeVolumeProfileConfig::default().width_percent
+    };
+    config.value_area_percent = if config.value_area_percent.is_finite() {
+        config.value_area_percent.clamp(50.0, 95.0)
+    } else {
+        FixedRangeVolumeProfileConfig::default().value_area_percent
+    };
+    config.row_size_ticks = config.row_size_ticks.clamp(1, 50);
+    config
+}
+
 fn geometry_tool(geometry: &DrawingGeometry) -> DrawingTool {
     match geometry {
         DrawingGeometry::Freehand { .. } => DrawingTool::Pen,
@@ -732,6 +989,7 @@ fn geometry_tool(geometry: &DrawingGeometry) -> DrawingTool {
         DrawingGeometry::Fibonacci { .. } => DrawingTool::Fibonacci,
         DrawingGeometry::TrendLine { .. } => DrawingTool::TrendLine,
         DrawingGeometry::Text { .. } => DrawingTool::Text,
+        DrawingGeometry::FixedRangeVolumeProfile { .. } => DrawingTool::FixedRangeVolumeProfile,
     }
 }
 fn line(style: &DrawingStyle) -> Stroke<'static> {
@@ -853,6 +1111,37 @@ fn draw_one(
             size: iced::Pixels(style.text_size * style.text_scale),
             ..Default::default()
         }),
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
+            let first_x = chart.volume_profile_screen_x(*first, bounds);
+            let second_x = chart.volume_profile_screen_x(*second, bounds);
+            let stroke = Stroke::default()
+                .with_width(1.0)
+                .with_color(color(style.color, style.opacity * 0.55));
+            frame.stroke(
+                &Path::line(Point::new(first_x, 0.0), Point::new(first_x, bounds.height)),
+                stroke.clone(),
+            );
+            frame.stroke(
+                &Path::line(
+                    Point::new(second_x, 0.0),
+                    Point::new(second_x, bounds.height),
+                ),
+                stroke.clone(),
+            );
+            frame.stroke(
+                &Path::line(Point::new(first_x, 8.0), Point::new(second_x, 8.0)),
+                stroke,
+            );
+            if chart.fixed_volume_profile_loading(*first, *second) {
+                frame.fill_text(canvas::Text {
+                    content: "Loading VP…".to_string(),
+                    position: Point::new(first_x.min(second_x) + 3.0, 20.0),
+                    color: color(style.color, style.opacity),
+                    size: iced::Pixels(10.0),
+                    ..Default::default()
+                });
+            }
+        }
     }
     if selected {
         draw_selection(chart, frame, drawing, bounds);
@@ -889,6 +1178,13 @@ fn draw_draft(
                     first: *first,
                     second: *preview,
                 },
+                DrawingTool::FixedRangeVolumeProfile => {
+                    let (DrawingX::Time(first), DrawingX::Time(second)) = (first.x, preview.x)
+                    else {
+                        return;
+                    };
+                    DrawingGeometry::FixedRangeVolumeProfile { first, second }
+                }
                 _ => DrawingGeometry::TrendLine {
                     first: *first,
                     second: *preview,
@@ -1016,6 +1312,10 @@ fn drawing_handles(chart: &KlineChart, drawing: &Drawing, bounds: Rectangle) -> 
             .chain(points.last().copied())
             .map(|anchor| chart.drawing_screen_point(anchor, bounds))
             .collect(),
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => vec![
+            Point::new(chart.volume_profile_screen_x(*first, bounds), 8.0),
+            Point::new(chart.volume_profile_screen_x(*second, bounds), 8.0),
+        ],
         _ => vec![],
     }
 }
@@ -1100,6 +1400,15 @@ fn hit_test(chart: &KlineChart, drawing: &Drawing, point: Point, bounds: Rectang
                 chart.drawing_screen_point(pair[1], bounds),
             ) <= T
         }),
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
+            let left = chart
+                .volume_profile_screen_x(*first, bounds)
+                .min(chart.volume_profile_screen_x(*second, bounds));
+            let right = chart
+                .volume_profile_screen_x(*first, bounds)
+                .max(chart.volume_profile_screen_x(*second, bounds));
+            point.x >= left - T && point.x <= right + T && point.y <= 24.0
+        }
     }
 }
 
@@ -1189,6 +1498,18 @@ fn translate_geometry(
             anchor: translate_anchor(*anchor, start, end),
             content: content.clone(),
         },
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
+            let delta = match (start.x, end.x) {
+                (DrawingX::Time(from), DrawingX::Time(to)) => {
+                    to.as_u64() as i64 - from.as_u64() as i64
+                }
+                _ => 0,
+            };
+            DrawingGeometry::FixedRangeVolumeProfile {
+                first: UnixMs::new(first.as_u64().saturating_add_signed(delta)),
+                second: UnixMs::new(second.as_u64().saturating_add_signed(delta)),
+            }
+        }
     }
 }
 
@@ -1223,6 +1544,15 @@ fn resize_geometry(
             first: if handle == 0 { anchor } else { *first },
             second: if handle == 0 { *second } else { anchor },
         },
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
+            let DrawingX::Time(time) = anchor.x else {
+                return geometry.clone();
+            };
+            DrawingGeometry::FixedRangeVolumeProfile {
+                first: if handle == 0 { time } else { *first },
+                second: if handle == 0 { *second } else { time },
+            }
+        }
         DrawingGeometry::Text { .. } | DrawingGeometry::Freehand { .. } => geometry.clone(),
         DrawingGeometry::HorizontalLine { .. } | DrawingGeometry::VerticalLine { .. } => {
             geometry.clone()
@@ -1252,6 +1582,11 @@ fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, M
             "Trendline",
         ),
         (DrawingTool::Text, "drawing-text.svg", "Text"),
+        (
+            DrawingTool::FixedRangeVolumeProfile,
+            "drawing-volume-profile.svg",
+            "Volume profile",
+        ),
     ];
     let mut items = column![].spacing(2);
     let arrow = if open {
@@ -1293,6 +1628,9 @@ fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, M
             "drawing-rectangle.svg" => include_bytes!("../../../assets/ui/drawing-rectangle.svg"),
             "drawing-fibonacci.svg" => include_bytes!("../../../assets/ui/drawing-fibonacci.svg"),
             "drawing-trend-line.svg" => include_bytes!("../../../assets/ui/drawing-trend-line.svg"),
+            "drawing-volume-profile.svg" => {
+                include_bytes!("../../../assets/ui/drawing-volume-profile.svg")
+            }
             _ => include_bytes!("../../../assets/ui/drawing-text.svg"),
         };
         let selected = tool == active;
@@ -1364,6 +1702,12 @@ fn settings(chart: &KlineChart) -> Element<'_, Message> {
     else {
         return column![].into();
     };
+    if matches!(
+        drawing.geometry,
+        DrawingGeometry::FixedRangeVolumeProfile { .. }
+    ) {
+        return fixed_range_volume_profile_settings(drawing);
+    }
     let style = &drawing.style;
     let selected_color = Color {
         r: style.color.r,
@@ -1447,4 +1791,112 @@ fn settings(chart: &KlineChart) -> Element<'_, Message> {
         .max_width(240)
         .style(crate::style::chart_modal)
         .into()
+}
+
+fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message> {
+    let config = sanitize_volume_profile_config(drawing.style.fixed_range_volume_profile);
+    let update = |config| Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(config));
+    let placement = pick_list(
+        SessionProfilePlacement::ALL,
+        Some(config.placement),
+        move |placement| {
+            update(FixedRangeVolumeProfileConfig {
+                placement,
+                ..config
+            })
+        },
+    );
+    let mode = pick_list(SessionProfileMode::ALL, Some(config.mode), move |mode| {
+        Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(
+            FixedRangeVolumeProfileConfig { mode, ..config },
+        ))
+    });
+    let width = slider(10.0..=90.0, config.width_percent, move |width_percent| {
+        Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(
+            FixedRangeVolumeProfileConfig {
+                width_percent,
+                ..config
+            },
+        ))
+    });
+    let value_area = slider(
+        50.0..=95.0,
+        config.value_area_percent,
+        move |value_area_percent| {
+            Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(
+                FixedRangeVolumeProfileConfig {
+                    value_area_percent,
+                    ..config
+                },
+            ))
+        },
+    );
+    let rows = slider(1.0..=50.0, config.row_size_ticks as f32, move |value| {
+        Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(
+            FixedRangeVolumeProfileConfig {
+                row_size_ticks: value as u16,
+                ..config
+            },
+        ))
+    });
+    let toggle =
+        |label,
+         enabled,
+         apply: fn(FixedRangeVolumeProfileConfig, bool) -> FixedRangeVolumeProfileConfig| {
+            checkbox(enabled).label(label).on_toggle(move |value| {
+                Message::Drawing(DrawingMessage::SetFixedRangeVolumeProfile(apply(
+                    config, value,
+                )))
+            })
+        };
+    let poc = toggle("POC", config.show_poc, |mut value, enabled| {
+        value.show_poc = enabled;
+        value
+    });
+    let va = toggle("VAH / VAL", config.show_value_area, |mut value, enabled| {
+        value.show_value_area = enabled;
+        value
+    });
+    let vwap = toggle("Range VWAP", config.show_vwap, |mut value, enabled| {
+        value.show_vwap = enabled;
+        value
+    });
+    let high_low = toggle(
+        "Range high / low",
+        config.show_range_high_low,
+        |mut value, enabled| {
+            value.show_range_high_low = enabled;
+            value
+        },
+    );
+
+    container(
+        column![
+            row![
+                text("Fixed Range Volume Profile").size(14),
+                button(text("×")).on_press(Message::Drawing(DrawingMessage::CloseSettings))
+            ]
+            .spacing(12),
+            text("Placement"),
+            placement,
+            text("Mode"),
+            mode,
+            text(format!("Width: {:.0}%", config.width_percent)),
+            width,
+            text(format!("Value area: {:.0}%", config.value_area_percent)),
+            value_area,
+            text(format!("Ticks / row: {}", config.row_size_ticks)),
+            rows,
+            row![poc, va].spacing(8),
+            vwap,
+            high_low,
+            button(text("Delete drawing"))
+                .on_press(Message::Drawing(DrawingMessage::DeleteSelected)),
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .max_width(240)
+    .style(crate::style::chart_modal)
+    .into()
 }

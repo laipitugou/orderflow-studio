@@ -209,11 +209,17 @@ impl State {
         let needs_trades = match &self.content {
             Content::Kline {
                 indicators,
+                chart,
                 kind: data::chart::KlineChartKind::Candles,
                 ..
-            } => indicators
-                .iter()
-                .any(|indicator| indicator.requires_trades(ticker_info.exchange())),
+            } => {
+                indicators
+                    .iter()
+                    .any(|indicator| indicator.requires_trades(ticker_info.exchange()))
+                    || chart
+                        .as_ref()
+                        .is_some_and(|chart| chart.has_fixed_volume_profiles())
+            }
             _ => return,
         };
         let ResolvedStream::Ready(streams) = &mut self.streams else {
@@ -424,10 +430,14 @@ impl State {
             };
             let trade_overlay_enabled = matches!(
                 &self.content,
-                Content::Kline { indicators, .. }
+                Content::Kline { indicators, drawings, chart, .. }
                     if indicators.iter().any(|indicator| indicator.requires_trades(
                         derived_plan.ticker_info.exchange()
-                    ))
+                    )) || chart.as_ref().is_some_and(|chart| chart.has_fixed_volume_profiles())
+                        || drawings.iter().any(|drawing| matches!(
+                            drawing.geometry,
+                            data::chart::kline::drawing::DrawingGeometry::FixedRangeVolumeProfile { .. }
+                        ))
             );
 
             match kind {
@@ -647,10 +657,14 @@ impl State {
         self.streams = ResolvedStream::Ready(streams.clone());
         let final_trade_overlays = matches!(
             &self.content,
-            Content::Kline { indicators, .. }
+            Content::Kline { indicators, drawings, chart, .. }
                 if indicators.iter().any(|indicator| indicator.requires_trades(
                     base_ticker.exchange()
-                ))
+                )) || chart.as_ref().is_some_and(|chart| chart.has_fixed_volume_profiles())
+                    || drawings.iter().any(|drawing| matches!(
+                        drawing.geometry,
+                        data::chart::kline::drawing::DrawingGeometry::FixedRangeVolumeProfile { .. }
+                    ))
         );
 
         log::info!(
@@ -1642,7 +1656,13 @@ impl State {
                 }
                 Content::Kline { chart: Some(c), .. } => {
                     if let super::chart::Message::Drawing(drawing) = &msg {
+                        let had_fixed_volume_profiles = c.has_fixed_volume_profiles();
                         c.handle_drawing(drawing);
+                        let has_fixed_volume_profiles = c.has_fixed_volume_profiles();
+                        if had_fixed_volume_profiles != has_fixed_volume_profiles {
+                            self.reconcile_candlestick_trade_stream();
+                            return Some(Effect::RefreshStreams);
+                        }
                         if matches!(drawing, super::chart::DrawingMessage::PointerPressed(_, _))
                             && let Some(id) = c.drawing_text_input_id()
                         {
@@ -1900,7 +1920,8 @@ impl State {
                                                     ) && c
                                                         .visual_config()
                                                         .volume_bubbles
-                                                        .enabled);
+                                                        .enabled)
+                                                        || c.has_fixed_volume_profiles();
 
                                                     if needs_trades {
                                                         streams.push(StreamKind::Trades {

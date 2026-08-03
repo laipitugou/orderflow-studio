@@ -82,6 +82,7 @@ pub enum DrawingMessage {
     SetTextSize(f32),
     ToggleLabels(bool),
     ToggleFibonacciLevel(usize),
+    SetFixedRangeVolumeProfile(data::chart::kline::drawing::FixedRangeVolumeProfileConfig),
     DeleteSelected,
     ToggleDrawingsVisibility,
     ClearAllDrawings,

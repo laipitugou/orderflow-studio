@@ -9,6 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 pub mod drawing {
+    use super::{SessionProfileMode, SessionProfilePlacement};
     use exchange::{UnixMs, unit::Price};
     use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,7 @@ pub mod drawing {
         Fibonacci,
         TrendLine,
         Text,
+        FixedRangeVolumeProfile,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,40 @@ pub mod drawing {
         pub visible: bool,
     }
 
+    /// Settings owned by one fixed-range volume-profile drawing.
+    ///
+    /// They intentionally mirror the visual options of the session volume
+    /// profile without sharing that indicator's state or its time interval.
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct FixedRangeVolumeProfileConfig {
+        pub placement: SessionProfilePlacement,
+        pub mode: SessionProfileMode,
+        pub value_area_percent: f32,
+        pub width_percent: f32,
+        pub row_size_ticks: u16,
+        pub show_poc: bool,
+        pub show_value_area: bool,
+        pub show_vwap: bool,
+        pub show_range_high_low: bool,
+    }
+
+    impl Default for FixedRangeVolumeProfileConfig {
+        fn default() -> Self {
+            Self {
+                placement: SessionProfilePlacement::Left,
+                mode: SessionProfileMode::Volume,
+                value_area_percent: 70.0,
+                width_percent: 35.0,
+                row_size_ticks: 1,
+                show_poc: true,
+                show_value_area: true,
+                show_vwap: true,
+                show_range_high_low: true,
+            }
+        }
+    }
+
     const fn default_true() -> bool {
         true
     }
@@ -79,6 +115,8 @@ pub mod drawing {
         pub show_labels: bool,
         #[serde(default = "default_fibonacci_levels")]
         pub fibonacci_levels: Vec<FibonacciLevel>,
+        #[serde(default)]
+        pub fixed_range_volume_profile: FixedRangeVolumeProfileConfig,
     }
 
     impl Default for DrawingStyle {
@@ -93,6 +131,7 @@ pub mod drawing {
                 text_scale: 1.0,
                 show_labels: true,
                 fibonacci_levels: default_fibonacci_levels(),
+                fixed_range_volume_profile: FixedRangeVolumeProfileConfig::default(),
             }
         }
     }
@@ -139,6 +178,10 @@ pub mod drawing {
         Text {
             anchor: DrawingAnchor,
             content: String,
+        },
+        FixedRangeVolumeProfile {
+            first: UnixMs,
+            second: UnixMs,
         },
     }
 
@@ -2055,5 +2098,21 @@ mod volume_bubble_tests {
         let json = serde_json::to_string(&configured).unwrap();
         let decoded: VolumeBubbleConfig = serde_json::from_str(&json).unwrap();
         assert!(decoded.three_dimensional);
+    }
+
+    #[test]
+    fn fixed_range_volume_profile_settings_are_backward_compatible() {
+        let mut legacy = serde_json::to_value(drawing::DrawingStyle::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fixed_range_volume_profile");
+        let decoded: drawing::DrawingStyle = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.fixed_range_volume_profile,
+            drawing::FixedRangeVolumeProfileConfig::default()
+        );
+        assert_eq!(decoded.fixed_range_volume_profile.width_percent, 35.0);
+        assert!(decoded.fixed_range_volume_profile.show_poc);
     }
 }
