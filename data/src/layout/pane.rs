@@ -59,6 +59,8 @@ pub enum Pane {
     KlineChart {
         layout: ViewConfig,
         kind: KlineChartKind,
+        #[serde(default)]
+        drawings: Vec<crate::chart::kline::drawing::Drawing>,
         #[serde(deserialize_with = "ok_or_default", default)]
         stream_type: Vec<PersistStreamKind>,
         #[serde(deserialize_with = "ok_or_default")]

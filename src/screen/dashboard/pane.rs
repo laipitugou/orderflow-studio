@@ -728,6 +728,7 @@ impl State {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
                     let visual_config = chart.visual_config();
+                    let drawings = chart.drawings();
 
                     *chart = KlineChart::new(
                         layout,
@@ -740,6 +741,7 @@ impl State {
                         chart.kind(),
                         Some(visual_config),
                     );
+                    chart.set_drawings(drawings);
                 }
             }
             Content::Comparison(chart) => {
@@ -1639,7 +1641,16 @@ impl State {
                     super::chart::update(c, &msg);
                 }
                 Content::Kline { chart: Some(c), .. } => {
-                    super::chart::update(c, &msg);
+                    if let super::chart::Message::Drawing(drawing) = &msg {
+                        c.handle_drawing(drawing);
+                        if matches!(drawing, super::chart::DrawingMessage::PointerPressed(_, _))
+                            && let Some(id) = c.drawing_text_input_id()
+                        {
+                            return Some(Effect::FocusWidget(id));
+                        }
+                    } else {
+                        super::chart::update(c, &msg);
+                    }
                 }
                 _ => {}
             },
@@ -2047,6 +2058,17 @@ impl State {
             }
         }
         None
+    }
+
+    pub fn dismiss_drawing_interaction(&mut self) -> bool {
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+            && matches!(chart.kind(), data::chart::KlineChartKind::Candles)
+        {
+            return chart.handle_drawing(&super::chart::DrawingMessage::CancelOrCommit);
+        }
+        false
     }
 
     fn view_controls(
@@ -2516,6 +2538,7 @@ pub enum Content {
         indicators: Vec<KlineIndicator>,
         layout: data::chart::ViewConfig,
         kind: data::chart::KlineChartKind,
+        drawings: Vec<data::chart::kline::drawing::Drawing>,
     },
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
@@ -2594,20 +2617,22 @@ impl Content {
         settings: &Settings,
         step: exchange::unit::PriceStep,
     ) -> Self {
-        let (prev_indis, prev_layout, prev_kind_opt) = if let Content::Kline {
+        let (prev_indis, prev_layout, prev_kind_opt, prev_drawings) = if let Content::Kline {
             chart,
             indicators,
             kind,
             layout,
+            drawings,
         } = current_content
         {
             (
                 Some(indicators.clone()),
                 Some(chart.as_ref().map_or(layout.clone(), |c| c.chart_layout())),
                 Some(chart.as_ref().map_or(kind.clone(), |c| c.kind().clone())),
+                chart.as_ref().map_or(drawings.clone(), |c| c.drawings()),
             )
         } else {
-            (None, None, None)
+            (None, None, None, vec![])
         };
 
         let (default_tf, determined_chart_kind) = match content_kind {
@@ -2672,7 +2697,7 @@ impl Content {
             });
         let visual_config = settings.visual_config.as_ref().and_then(|cfg| cfg.kline());
 
-        let chart = KlineChart::new(
+        let mut chart = KlineChart::new(
             layout.clone(),
             basis,
             step,
@@ -2683,12 +2708,16 @@ impl Content {
             &determined_chart_kind,
             visual_config,
         );
+        if matches!(determined_chart_kind, data::chart::KlineChartKind::Candles) {
+            chart.set_drawings(prev_drawings.clone());
+        }
 
         Content::Kline {
             chart: Some(chart),
             indicators: enabled_indicators,
             layout,
             kind: determined_chart_kind,
+            drawings: prev_drawings,
         }
     }
 
@@ -2703,6 +2732,7 @@ impl Content {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
+                drawings: vec![],
             },
             ContentKind::FootprintChart => Content::Kline {
                 chart: None,
@@ -2716,6 +2746,7 @@ impl Content {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
+                drawings: vec![],
             },
             ContentKind::ShaderHeatmap => Content::ShaderHeatmap {
                 chart: None,

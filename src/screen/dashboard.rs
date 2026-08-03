@@ -1166,7 +1166,7 @@ impl Dashboard {
             state.modal = None;
             return true;
         }
-        false
+        state.dismiss_drawing_interaction()
     }
 
     fn handle_error(

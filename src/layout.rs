@@ -310,10 +310,12 @@ impl From<&pane::State> for data::Pane {
                 indicators,
                 kind,
                 layout,
+                drawings,
                 ..
             } => data::Pane::KlineChart {
                 layout: chart.as_ref().map_or(layout.clone(), |c| c.chart_layout()),
                 kind: kind.clone(),
+                drawings: chart.as_ref().map_or(drawings.clone(), |c| c.drawings()),
                 stream_type: streams,
                 settings: pane.settings.clone(),
                 indicators: indicators.clone(),
@@ -431,6 +433,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
         data::Pane::KlineChart {
             layout,
             kind,
+            drawings,
             stream_type,
             settings,
             indicators,
@@ -441,6 +444,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 indicators: indicators.clone(),
                 layout,
                 kind,
+                drawings,
             };
 
             Configuration::Pane(pane::State::from_config(

@@ -8,6 +8,149 @@ use exchange::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+pub mod drawing {
+    use exchange::{UnixMs, unit::Price};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct DrawingColor {
+        pub r: f32,
+        pub g: f32,
+        pub b: f32,
+        pub a: f32,
+    }
+
+    impl DrawingColor {
+        pub const BLUE: Self = Self::rgb(0.23, 0.57, 0.96);
+        pub const ORANGE: Self = Self::rgb(0.95, 0.55, 0.18);
+        pub const GREEN: Self = Self::rgb(0.20, 0.72, 0.45);
+        pub const RED: Self = Self::rgb(0.90, 0.30, 0.30);
+
+        pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
+            Self { r, g, b, a: 1.0 }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DrawingTool {
+        Select,
+        Pen,
+        HorizontalLine,
+        VerticalLine,
+        Rectangle,
+        Fibonacci,
+        TrendLine,
+        Text,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DrawingX {
+        Time(UnixMs),
+        Tick(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DrawingAnchor {
+        pub x: DrawingX,
+        pub price: Price,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct FibonacciLevel {
+        pub value: f32,
+        #[serde(default = "default_true")]
+        pub visible: bool,
+    }
+
+    const fn default_true() -> bool {
+        true
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DrawingStyle {
+        pub color: DrawingColor,
+        pub stroke_width: f32,
+        pub opacity: f32,
+        pub fill_color: DrawingColor,
+        pub fill_opacity: f32,
+        pub text_size: f32,
+        #[serde(default = "default_text_scale")]
+        pub text_scale: f32,
+        pub show_labels: bool,
+        #[serde(default = "default_fibonacci_levels")]
+        pub fibonacci_levels: Vec<FibonacciLevel>,
+    }
+
+    impl Default for DrawingStyle {
+        fn default() -> Self {
+            Self {
+                color: DrawingColor::BLUE,
+                stroke_width: 2.0,
+                opacity: 1.0,
+                fill_color: DrawingColor::BLUE,
+                fill_opacity: 0.12,
+                text_size: 14.0,
+                text_scale: 1.0,
+                show_labels: true,
+                fibonacci_levels: default_fibonacci_levels(),
+            }
+        }
+    }
+
+    const fn default_text_scale() -> f32 {
+        1.0
+    }
+
+    fn default_fibonacci_levels() -> Vec<FibonacciLevel> {
+        [
+            0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.0, 2.618,
+        ]
+        .into_iter()
+        .map(|value| FibonacciLevel {
+            value,
+            visible: value <= 1.0,
+        })
+        .collect()
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub enum DrawingGeometry {
+        Freehand {
+            points: Vec<DrawingAnchor>,
+        },
+        HorizontalLine {
+            price: Price,
+        },
+        VerticalLine {
+            x: DrawingX,
+        },
+        Rectangle {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        Fibonacci {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        TrendLine {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        Text {
+            anchor: DrawingAnchor,
+            content: String,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Drawing {
+        pub id: u64,
+        pub geometry: DrawingGeometry,
+        #[serde(default)]
+        pub style: DrawingStyle,
+    }
+}
+
 #[derive(Clone)]
 pub struct KlineDataPoint {
     pub kline: Kline,

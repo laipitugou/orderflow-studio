@@ -35,6 +35,8 @@ use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
 
+mod drawing;
+
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned by exchange timestamp when this cap is exceeded.
 /// 50k trades ≈ 1.5-3 MB depending on Trade size.
@@ -237,6 +239,21 @@ impl Chart for KlineChart {
             PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.is_empty(),
         }
     }
+
+    fn plot_overlay(&'_ self) -> Option<Element<'_, Message>> {
+        matches!(self.kind, KlineChartKind::Candles).then(|| self.drawing_overlay())
+    }
+
+    fn drawing_axis_labels(
+        &self,
+    ) -> (
+        Vec<crate::chart::scale::AxisOverlayLabel>,
+        Vec<crate::chart::scale::AxisOverlayLabel>,
+    ) {
+        matches!(self.kind, KlineChartKind::Candles)
+            .then(|| self.axis_drawing_labels())
+            .unwrap_or_default()
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -300,6 +317,7 @@ pub struct KlineChart {
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
+    drawings: drawing::DrawingState,
 }
 
 #[derive(Debug, Default)]
@@ -435,6 +453,7 @@ impl KlineChart {
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
+                    drawings: drawing::DrawingState::default(),
                 }
             }
             Basis::Tick(interval) => {
@@ -512,6 +531,7 @@ impl KlineChart {
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
+                    drawings: drawing::DrawingState::default(),
                 }
             }
         }
@@ -2450,21 +2470,21 @@ fn select_trade_fetch_gap(
 }
 
 impl canvas::Program<Message> for KlineChart {
-    type State = Interaction;
+    type State = drawing::CanvasState;
 
     fn update(
         &self,
-        interaction: &mut Interaction,
+        interaction: &mut drawing::CanvasState,
         event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        super::canvas_interaction(self, interaction, event, bounds, cursor)
+        self.drawing_canvas_update(interaction, event, bounds, cursor)
     }
 
     fn draw(
         &self,
-        interaction: &Interaction,
+        interaction: &drawing::CanvasState,
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
@@ -2745,8 +2765,13 @@ impl canvas::Program<Message> for KlineChart {
             let visible_range = chart.interval_range(&visible_region);
 
             if let Some(cursor_position) = cursor.position_in(bounds) {
-                let (_, rounded_aggregation) =
-                    chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
+                let (_, rounded_aggregation) = chart.draw_crosshair(
+                    frame,
+                    theme,
+                    bounds_size,
+                    cursor_position,
+                    &interaction.navigation,
+                );
                 let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
                 let bubbles = self.rendered_volume_bubbles.borrow();
                 if let Some(bubble) = hit_test_volume_bubbles(
@@ -2811,16 +2836,17 @@ impl canvas::Program<Message> for KlineChart {
             }
         });
 
-        vec![klines, crosshair]
+        let drawings = self.draw_drawings(renderer, theme, bounds);
+        vec![klines, crosshair, drawings]
     }
 
     fn mouse_interaction(
         &self,
-        interaction: &Interaction,
+        interaction: &drawing::CanvasState,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        match interaction {
+        match &interaction.navigation {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
             Interaction::None | Interaction::Ruler { .. } => {
