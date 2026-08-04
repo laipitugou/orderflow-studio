@@ -3243,6 +3243,7 @@ struct GexProxyZoneRun {
     start: UnixMs,
     end: UnixMs,
     center_price: f64,
+    last_price: f64,
     lower_price: f64,
     upper_price: f64,
     strength: f32,
@@ -3307,82 +3308,84 @@ fn cached_gex_proxy_zone_frames(
     cache.proxy_zone_frames.clone()
 }
 
-fn proxy_zones_nearly_equal(a: &GexProxyZoneRun, b: &data::chart::gex::GexProxyZone) -> bool {
-    let half_width_a = (a.upper_price - a.lower_price) * 0.5;
-    let half_width_b = (b.upper_price - b.lower_price) * 0.5;
-    let tolerance = half_width_a.max(half_width_b) * 0.05;
-    (a.center_price - b.center_price).abs() <= tolerance
-        && (half_width_a - half_width_b).abs() <= tolerance
+fn proxy_role_is_positive(role: data::chart::gex::GexProxyZoneRole) -> bool {
+    matches!(
+        role,
+        data::chart::gex::GexProxyZoneRole::PositivePrimary
+            | data::chart::gex::GexProxyZoneRole::PositiveSecondary
+    )
+}
+
+fn proxy_prices_match(a: f64, b: f64, tolerance_percent: f32) -> bool {
+    if !a.is_finite() || !b.is_finite() || a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    let tolerance = a.abs().max(b.abs()) * f64::from(tolerance_percent.clamp(0.0, 1.0)) / 100.0;
+    (a - b).abs() <= tolerance
 }
 
 fn build_gex_proxy_zone_runs(
     frames: &[data::chart::gex::GexProxyZoneFrame],
+    tolerance_percent: f32,
 ) -> Vec<GexProxyZoneRun> {
+    const MAX_GAP_MS: u64 = 7 * 60 * 1_000 + 30 * 1_000;
     let mut runs: Vec<GexProxyZoneRun> = Vec::new();
-    for role in data::chart::gex::GexProxyZoneRole::ALL {
-        for frame in frames {
-            let Some(zone) = frame.zones.iter().find(|zone| zone.role == role) else {
-                continue;
-            };
-            if let Some(last) = runs.last_mut()
-                && last.role == role
-                && last.end == frame.bucket_start
-                && frame.observed_at.saturating_diff(last.observed_at)
-                    <= 7 * 60 * 1_000 + 30 * 1_000
-                && proxy_zones_nearly_equal(last, zone)
-            {
-                last.end = frame.bucket_end;
-                last.strength = last.strength.max(zone.strength);
-                last.observed_at = frame.observed_at;
+    let mut active: Vec<usize> = Vec::new();
+    for frame in frames {
+        active.retain(|&index| {
+            runs[index].end == frame.bucket_start
+                && frame.observed_at.saturating_diff(runs[index].observed_at) <= MAX_GAP_MS
+        });
+
+        let mut candidates = Vec::new();
+        for &run_index in &active {
+            let run = &runs[run_index];
+            for (zone_index, zone) in frame.zones.iter().enumerate() {
+                if proxy_role_is_positive(run.role) == proxy_role_is_positive(zone.role)
+                    && proxy_prices_match(run.last_price, zone.center_price, tolerance_percent)
+                {
+                    candidates.push((
+                        (run.last_price - zone.center_price).abs(),
+                        run_index,
+                        zone_index,
+                    ));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut used_runs = std::collections::HashSet::new();
+        let mut used_zones = std::collections::HashSet::new();
+        for (_, run_index, zone_index) in candidates {
+            if used_runs.insert(run_index) && used_zones.insert(zone_index) {
+                let run = &mut runs[run_index];
+                let zone = &frame.zones[zone_index];
+                run.end = frame.bucket_end;
+                run.last_price = zone.center_price;
+                run.strength = run.strength.max(zone.strength);
+                run.observed_at = frame.observed_at;
+            }
+        }
+        active.retain(|index| used_runs.contains(index));
+        for (zone_index, zone) in frame.zones.iter().enumerate() {
+            if used_zones.contains(&zone_index) {
                 continue;
             }
+            let run_index = runs.len();
             runs.push(GexProxyZoneRun {
-                role,
+                role: zone.role,
                 start: frame.bucket_start,
                 end: frame.bucket_end,
                 center_price: zone.center_price,
+                last_price: zone.center_price,
                 lower_price: zone.lower_price,
                 upper_price: zone.upper_price,
                 strength: zone.strength,
                 observed_at: frame.observed_at,
             });
+            active.push(run_index);
         }
     }
     runs
-}
-
-fn gex_proxy_zone_transitions(
-    frames: &[data::chart::gex::GexProxyZoneFrame],
-) -> Vec<(
-    UnixMs,
-    data::chart::gex::GexProxyZoneRole,
-    data::chart::gex::GexProxyZone,
-    data::chart::gex::GexProxyZone,
-)> {
-    const MAX_GAP_MS: u64 = 7 * 60 * 1_000 + 30 * 1_000;
-    let mut transitions = Vec::new();
-    for role in data::chart::gex::GexProxyZoneRole::ALL {
-        let mut previous: Option<(
-            &data::chart::gex::GexProxyZoneFrame,
-            &data::chart::gex::GexProxyZone,
-        )> = None;
-        for frame in frames {
-            let Some(zone) = frame.zones.iter().find(|zone| zone.role == role) else {
-                previous = None;
-                continue;
-            };
-            if let Some((old_frame, old_zone)) = previous
-                && old_frame.bucket_end == frame.bucket_start
-                && frame.observed_at.saturating_diff(old_frame.observed_at) <= MAX_GAP_MS
-                && (old_zone.lower_price != zone.lower_price
-                    || old_zone.upper_price != zone.upper_price)
-            {
-                transitions.push((frame.bucket_start, role, old_zone.clone(), zone.clone()));
-            }
-            previous = Some((frame, zone));
-        }
-    }
-    transitions
 }
 
 fn proxy_zone_hit_test(
@@ -3428,7 +3431,7 @@ fn draw_gex_proxy_zone_background(
         render_cache,
     );
     let border_width = gex_screen_width_to_world(0.75, scaling);
-    for run in build_gex_proxy_zone_runs(&frames) {
+    for run in build_gex_proxy_zone_runs(&frames, config.level_match_tolerance_percent) {
         let x0 = time_to_x(run.start.as_u64()).max(region.x);
         let x1 = time_to_x(run.end.as_u64()).min(region.x + region.width);
         let top = price_to_y(Price::from_f64(run.upper_price));
@@ -3456,32 +3459,6 @@ fn draw_gex_proxy_zone_background(
                 .with_color(border)
                 .with_width(border_width),
         );
-    }
-    for (at, role, old, new) in gex_proxy_zone_transitions(&frames) {
-        let x = time_to_x(at.as_u64());
-        if x < region.x || x > region.x + region.width {
-            continue;
-        }
-        let color = proxy_zone_color(role).scale_alpha(0.12 + 0.18 * new.strength);
-        for (from, to) in [
-            (old.upper_price, new.upper_price),
-            (old.lower_price, new.lower_price),
-        ] {
-            let y0 = price_to_y(Price::from_f64(from));
-            let y1 = price_to_y(Price::from_f64(to));
-            if (y0 < region.y && y1 < region.y)
-                || (y0 > region.y + region.height && y1 > region.y + region.height)
-            {
-                continue;
-            }
-            frame.stroke(
-                &Path::line(
-                    Point::new(x, y0.clamp(region.y, region.y + region.height)),
-                    Point::new(x, y1.clamp(region.y, region.y + region.height)),
-                ),
-                Stroke::default().with_color(color).with_width(border_width),
-            );
-        }
     }
 }
 
@@ -3511,7 +3488,7 @@ fn draw_gex_proxy_zone_cores(
         asset,
         render_cache,
     );
-    for run in build_gex_proxy_zone_runs(&frames) {
+    for run in build_gex_proxy_zone_runs(&frames, config.level_match_tolerance_percent) {
         let x0 = time_to_x(run.start.as_u64()).max(region.x);
         let x1 = time_to_x(run.end.as_u64()).min(region.x + region.width);
         let y = price_to_y(Price::from_f64(run.center_price));
@@ -3538,13 +3515,10 @@ fn draw_gex_proxy_flip(
     region: Rectangle,
     scaling: f32,
 ) {
-    const MAX_GAP_MS: u64 = 7 * 60 * 1_000 + 30 * 1_000;
     let color = Color::from_rgb8(0xb7, 0xbf, 0xcc).scale_alpha(0.22);
     let width = gex_screen_width_to_world(1.0, scaling);
-    let mut previous: Option<&data::chart::gex::GexProxyZoneFrame> = None;
     for zone_frame in frames {
         let Some(level) = zone_frame.flip_level else {
-            previous = None;
             continue;
         };
         let x0 = time_to_x(zone_frame.bucket_start.as_u64()).max(region.x);
@@ -3556,28 +3530,6 @@ fn draw_gex_proxy_flip(
                 Stroke::default().with_color(color).with_width(width),
             );
         }
-        if let Some(old) = previous
-            && old.bucket_end == zone_frame.bucket_start
-            && zone_frame.observed_at.saturating_diff(old.observed_at) <= MAX_GAP_MS
-            && let Some(old_level) = old.flip_level
-            && old_level != level
-        {
-            let x = time_to_x(zone_frame.bucket_start.as_u64());
-            let old_y = price_to_y(Price::from_f64(old_level));
-            if x >= region.x
-                && x <= region.x + region.width
-                && (gex_level_is_visible(old_y, region) || gex_level_is_visible(y, region))
-            {
-                frame.stroke(
-                    &Path::line(
-                        Point::new(x, old_y.clamp(region.y, region.y + region.height)),
-                        Point::new(x, y.clamp(region.y, region.y + region.height)),
-                    ),
-                    Stroke::default().with_color(color).with_width(width),
-                );
-            }
-        }
-        previous = Some(zone_frame);
     }
 }
 
@@ -7342,26 +7294,54 @@ mod tests {
     }
 
     #[test]
-    fn proxy_transitions_stop_at_gaps_and_never_connect_roles() {
+    fn proxy_runs_stop_at_gaps_and_unmatched_prices() {
         let points = vec![
             proxy_test_point_with_levels(0, Some(105.0), None, Some(95.0), None, None),
             proxy_test_point_with_levels(8 * 60_000, Some(106.0), None, Some(94.0), None, None),
         ];
         let frames = proxy_frames(&points, &[], 60_000, 15 * 60_000);
-        assert!(gex_proxy_zone_transitions(&frames).is_empty());
+        let runs = build_gex_proxy_zone_runs(&frames, 0.10);
+        assert_eq!(runs.len(), 4);
 
         let consecutive = vec![
             proxy_test_point_with_levels(0, Some(105.0), None, Some(95.0), None, None),
             proxy_test_point_with_levels(5 * 60_000, Some(106.0), None, Some(94.0), None, None),
         ];
-        let transitions =
-            gex_proxy_zone_transitions(&proxy_frames(&consecutive, &[], 5 * 60_000, 10 * 60_000));
-        assert_eq!(transitions.len(), 2);
-        assert!(
-            transitions
-                .iter()
-                .all(|(_, role, old, new)| { old.role == *role && new.role == *role })
+        let runs = build_gex_proxy_zone_runs(
+            &proxy_frames(&consecutive, &[], 5 * 60_000, 10 * 60_000),
+            0.10,
         );
+        assert_eq!(runs.len(), 4);
+    }
+
+    #[test]
+    fn proxy_runs_match_prices_instead_of_primary_secondary_order() {
+        let points = vec![
+            proxy_test_point_with_levels(0, Some(105.0), Some(110.0), None, None, None),
+            proxy_test_point_with_levels(5 * 60_000, Some(110.0), Some(105.0), None, None, None),
+        ];
+        let frames = proxy_frames(&points, &[], 5 * 60_000, 10 * 60_000);
+        let runs = build_gex_proxy_zone_runs(&frames, 0.0);
+
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter()
+                .all(|run| run.start == UnixMs::new(0) && run.end == UnixMs::new(10 * 60_000))
+        );
+    }
+
+    #[test]
+    fn proxy_run_tolerance_compares_consecutive_snapshot_prices() {
+        let points = vec![
+            proxy_test_point_with_levels(0, Some(100.0), None, None, None, None),
+            proxy_test_point_with_levels(5 * 60_000, Some(100.09), None, None, None, None),
+            proxy_test_point_with_levels(10 * 60_000, Some(100.18), None, None, None, None),
+        ];
+        let frames = proxy_frames(&points, &[], 5 * 60_000, 15 * 60_000);
+        let runs = build_gex_proxy_zone_runs(&frames, 0.10);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].end, UnixMs::new(15 * 60_000));
     }
 
     #[test]
@@ -7397,7 +7377,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(p1.len(), 10);
         assert!(p1.windows(2).all(|pair| pair[0].1 == pair[1].0));
-        let runs = build_gex_proxy_zone_runs(&frames);
+        let runs = build_gex_proxy_zone_runs(&frames, 0.10);
         let p1_run = runs
             .iter()
             .find(|run| run.role == data::chart::gex::GexProxyZoneRole::PositivePrimary)

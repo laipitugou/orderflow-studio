@@ -176,6 +176,8 @@ pub struct GexLevelsConfig {
     pub positive_color: GexLevelColor,
     pub negative_color: GexLevelColor,
     pub minimum_zone_strength: f32,
+    /// Maximum relative price distance used only when rendering consecutive levels.
+    pub level_match_tolerance_percent: f32,
     pub max_positive_zones: u8,
     pub max_negative_zones: u8,
     pub history_minutes: u16,
@@ -201,6 +203,7 @@ impl Default for GexLevelsConfig {
             positive_color: GexLevelColor::Cyan,
             negative_color: GexLevelColor::Magenta,
             minimum_zone_strength: 0.12,
+            level_match_tolerance_percent: 0.10,
             max_positive_zones: 6,
             max_negative_zones: 6,
             history_minutes: 1440,
@@ -224,6 +227,7 @@ impl GexLevelsConfig {
             self.history_minutes = 1440;
         }
         self.minimum_zone_strength = self.minimum_zone_strength.clamp(0.01, 1.0);
+        self.level_match_tolerance_percent = self.level_match_tolerance_percent.clamp(0.0, 1.0);
         self.max_positive_zones = self.max_positive_zones.clamp(1, 6);
         self.max_negative_zones = self.max_negative_zones.clamp(1, 6);
         self.fade_buckets = self.fade_buckets.clamp(1, 3);

@@ -842,6 +842,19 @@ pub fn view_kline<'a>(
             |value| format!("{value:.2}"),
             Some(0.01),
         );
+        let level_match_tolerance = labeled_slider(
+            "Level match tolerance",
+            0.0..=1.0,
+            levels.level_match_tolerance_percent,
+            move |level_match_tolerance_percent| {
+                update(GexLevelsConfig {
+                    level_match_tolerance_percent,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.2}%"),
+            Some(0.01),
+        );
         let max_positive = labeled_slider(
             "Maximum positive zones",
             1.0..=6.0,
@@ -919,6 +932,7 @@ pub fn view_kline<'a>(
             row![text("Positive"), positive_color].spacing(8),
             row![text("Negative"), negative_color].spacing(8),
             minimum_strength,
+            level_match_tolerance,
             max_positive,
             max_negative,
             persistence,
