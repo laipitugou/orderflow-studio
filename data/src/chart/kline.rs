@@ -8,6 +8,194 @@ use exchange::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+pub mod drawing {
+    use super::{SessionProfileMode, SessionProfilePlacement};
+    use exchange::{UnixMs, unit::Price};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct DrawingColor {
+        pub r: f32,
+        pub g: f32,
+        pub b: f32,
+        pub a: f32,
+    }
+
+    impl DrawingColor {
+        pub const BLUE: Self = Self::rgb(0.23, 0.57, 0.96);
+        pub const ORANGE: Self = Self::rgb(0.95, 0.55, 0.18);
+        pub const GREEN: Self = Self::rgb(0.20, 0.72, 0.45);
+        pub const RED: Self = Self::rgb(0.90, 0.30, 0.30);
+
+        pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
+            Self { r, g, b, a: 1.0 }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DrawingTool {
+        Select,
+        Pen,
+        HorizontalLine,
+        VerticalLine,
+        Rectangle,
+        Fibonacci,
+        TrendLine,
+        Text,
+        FixedRangeVolumeProfile,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DrawingX {
+        Time(UnixMs),
+        Tick(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DrawingAnchor {
+        pub x: DrawingX,
+        pub price: Price,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct FibonacciLevel {
+        pub value: f32,
+        #[serde(default = "default_true")]
+        pub visible: bool,
+    }
+
+    /// Settings owned by one fixed-range volume-profile drawing.
+    ///
+    /// They intentionally mirror the visual options of the session volume
+    /// profile without sharing that indicator's state or its time interval.
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct FixedRangeVolumeProfileConfig {
+        pub placement: SessionProfilePlacement,
+        pub mode: SessionProfileMode,
+        pub value_area_percent: f32,
+        pub width_percent: f32,
+        pub row_size_ticks: u16,
+        pub show_poc: bool,
+        pub show_value_area: bool,
+        pub show_vwap: bool,
+        pub show_range_high_low: bool,
+    }
+
+    impl Default for FixedRangeVolumeProfileConfig {
+        fn default() -> Self {
+            Self {
+                placement: SessionProfilePlacement::Left,
+                mode: SessionProfileMode::Volume,
+                value_area_percent: 70.0,
+                width_percent: 35.0,
+                row_size_ticks: 1,
+                show_poc: true,
+                show_value_area: true,
+                show_vwap: true,
+                show_range_high_low: true,
+            }
+        }
+    }
+
+    const fn default_true() -> bool {
+        true
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DrawingStyle {
+        pub color: DrawingColor,
+        pub stroke_width: f32,
+        pub opacity: f32,
+        pub fill_color: DrawingColor,
+        pub fill_opacity: f32,
+        pub text_size: f32,
+        #[serde(default = "default_text_scale")]
+        pub text_scale: f32,
+        pub show_labels: bool,
+        #[serde(default = "default_fibonacci_levels")]
+        pub fibonacci_levels: Vec<FibonacciLevel>,
+        #[serde(default)]
+        pub fixed_range_volume_profile: FixedRangeVolumeProfileConfig,
+    }
+
+    impl Default for DrawingStyle {
+        fn default() -> Self {
+            Self {
+                color: DrawingColor::BLUE,
+                stroke_width: 2.0,
+                opacity: 1.0,
+                fill_color: DrawingColor::BLUE,
+                fill_opacity: 0.12,
+                text_size: 14.0,
+                text_scale: 1.0,
+                show_labels: true,
+                fibonacci_levels: default_fibonacci_levels(),
+                fixed_range_volume_profile: FixedRangeVolumeProfileConfig::default(),
+            }
+        }
+    }
+
+    const fn default_text_scale() -> f32 {
+        1.0
+    }
+
+    fn default_fibonacci_levels() -> Vec<FibonacciLevel> {
+        [
+            0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.0, 2.618,
+        ]
+        .into_iter()
+        .map(|value| FibonacciLevel {
+            value,
+            visible: value <= 1.0,
+        })
+        .collect()
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub enum DrawingGeometry {
+        Freehand {
+            points: Vec<DrawingAnchor>,
+        },
+        HorizontalLine {
+            price: Price,
+        },
+        VerticalLine {
+            x: DrawingX,
+        },
+        Rectangle {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        Fibonacci {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        TrendLine {
+            first: DrawingAnchor,
+            second: DrawingAnchor,
+        },
+        Text {
+            anchor: DrawingAnchor,
+            content: String,
+        },
+        FixedRangeVolumeProfile {
+            first: UnixMs,
+            second: UnixMs,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Drawing {
+        pub id: u64,
+        pub geometry: DrawingGeometry,
+        #[serde(default)]
+        pub style: DrawingStyle,
+        #[serde(default = "default_true")]
+        pub visible: bool,
+    }
+}
+
 #[derive(Clone)]
 pub struct KlineDataPoint {
     pub kline: Kline,
@@ -1912,5 +2100,21 @@ mod volume_bubble_tests {
         let json = serde_json::to_string(&configured).unwrap();
         let decoded: VolumeBubbleConfig = serde_json::from_str(&json).unwrap();
         assert!(decoded.three_dimensional);
+    }
+
+    #[test]
+    fn fixed_range_volume_profile_settings_are_backward_compatible() {
+        let mut legacy = serde_json::to_value(drawing::DrawingStyle::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fixed_range_volume_profile");
+        let decoded: drawing::DrawingStyle = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.fixed_range_volume_profile,
+            drawing::FixedRangeVolumeProfileConfig::default()
+        );
+        assert_eq!(decoded.fixed_range_volume_profile.width_percent, 35.0);
+        assert!(decoded.fixed_range_volume_profile.show_poc);
     }
 }

@@ -57,6 +57,15 @@ pub struct LabelContent {
     pub text_size: f32,
 }
 
+/// A label supplied by a chart overlay and rendered in the real chart scale.
+#[derive(Debug, Clone)]
+pub struct AxisOverlayLabel {
+    /// Position in the plot coordinate system, matching the associated axis.
+    pub position: f32,
+    pub content: String,
+    pub color: Color,
+}
+
 #[derive(Debug, Clone)]
 pub enum AxisLabel {
     X {
@@ -235,6 +244,7 @@ pub struct AxisLabelsX<'a> {
     pub chart_bounds: Rectangle,
     pub interval_keys: Option<Vec<u64>>,
     pub autoscaling: Option<Autoscale>,
+    pub overlay_labels: Vec<AxisOverlayLabel>,
 }
 
 impl AxisLabelsX<'_> {
@@ -534,6 +544,24 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                 labels.push(label);
             }
 
+            for overlay in &self.overlay_labels {
+                let width = overlay.content.len() as f32 * (TEXT_SIZE / 1.3);
+                labels.push(AxisLabel::X {
+                    bounds: Rectangle {
+                        x: overlay.position - width / 2.0,
+                        y: 4.0,
+                        width,
+                        height: bounds.height - 8.0,
+                    },
+                    label: LabelContent {
+                        content: overlay.content.clone(),
+                        background_color: None,
+                        text_color: overlay.color,
+                        text_size: TEXT_SIZE,
+                    },
+                });
+            }
+
             AxisLabel::filter_and_draw(&labels, frame);
         });
 
@@ -569,6 +597,7 @@ pub struct AxisLabelsY<'a> {
     pub cell_height: f32,
     pub basis: Basis,
     pub chart_bounds: Rectangle,
+    pub overlay_labels: Vec<AxisOverlayLabel>,
 }
 
 impl AxisLabelsY<'_> {
@@ -780,6 +809,19 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
                 all_labels.push(AxisLabel::Y {
                     bounds: calc_label_rect(y_position, 1, text_size, bounds),
                     value_label: label,
+                    timer_label: None,
+                });
+            }
+
+            for overlay in &self.overlay_labels {
+                all_labels.push(AxisLabel::Y {
+                    bounds: calc_label_rect(overlay.position, 1, text_size, bounds),
+                    value_label: LabelContent {
+                        content: overlay.content.clone(),
+                        background_color: None,
+                        text_color: overlay.color,
+                        text_size,
+                    },
                     timer_label: None,
                 });
             }

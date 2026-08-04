@@ -10,6 +10,7 @@ use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
+use data::chart::kline::drawing::FixedRangeVolumeProfileConfig;
 use data::chart::kline::{
     BubbleColorMode, BubbleLabelMode, BubblePriceResponse, BubbleVolumeSummary, ClusterKind,
     ClusterScaling, Config, FootprintStudy, FootprintSummary, KlineDataPoint, KlineTrades, NPoc,
@@ -34,6 +35,8 @@ use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
+
+mod drawing;
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned by exchange timestamp when this cap is exceeded.
@@ -237,6 +240,21 @@ impl Chart for KlineChart {
             PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.is_empty(),
         }
     }
+
+    fn plot_overlay(&'_ self) -> Option<Element<'_, Message>> {
+        matches!(self.kind, KlineChartKind::Candles).then(|| self.drawing_overlay())
+    }
+
+    fn drawing_axis_labels(
+        &self,
+    ) -> (
+        Vec<crate::chart::scale::AxisOverlayLabel>,
+        Vec<crate::chart::scale::AxisOverlayLabel>,
+    ) {
+        matches!(self.kind, KlineChartKind::Candles)
+            .then(|| self.axis_drawing_labels())
+            .unwrap_or_default()
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -300,6 +318,7 @@ pub struct KlineChart {
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
+    drawings: drawing::DrawingState,
 }
 
 #[derive(Debug, Default)]
@@ -331,6 +350,11 @@ impl KlineChart {
     ) -> Self {
         let mut visual_config = visual_config.unwrap_or_default();
         visual_config.migrate_legacy_indicator_configs();
+        // The selected indicator list is the canonical enabled state. Keep the
+        // legacy config flag aligned so a freshly-created chart starts bubble
+        // rendering and historical loading immediately, without a restart.
+        visual_config.volume_bubbles.enabled =
+            enabled_indicators.contains(&KlineIndicator::VolumeBubbles);
         let kind = kind.clone();
         let raw_trades =
             deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
@@ -435,6 +459,7 @@ impl KlineChart {
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
+                    drawings: drawing::DrawingState::default(),
                 }
             }
             Basis::Tick(interval) => {
@@ -512,6 +537,7 @@ impl KlineChart {
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
+                    drawings: drawing::DrawingState::default(),
                 }
             }
         }
@@ -673,6 +699,39 @@ impl KlineChart {
                     );
                 }
 
+                // Restored fixed-range VP drawings may refer to candles that
+                // are no longer in the currently loaded viewport. Backfill
+                // those candle buckets before requesting their raw trades.
+                if matches!(self.kind, KlineChartKind::Candles) {
+                    let mut profile_ranges = self.fixed_volume_profiles();
+                    profile_ranges.sort_by_key(|(from, _, _)| *from);
+                    for (from, to, _) in profile_ranges {
+                        if from < kline_earliest {
+                            let range = FetchRange::Kline(from, kline_earliest);
+                            if let Some(action) = request_fetch(
+                                &mut self.request_handler,
+                                range,
+                                Some(&self.chart.ticker_info),
+                            ) {
+                                return Some(action);
+                            }
+                            break;
+                        }
+                        let capped_to = to.min(UnixMs::now());
+                        if capped_to > kline_latest.saturating_add(timeframe_ms) {
+                            let range = FetchRange::Kline(kline_latest, capped_to);
+                            if let Some(action) = request_fetch(
+                                &mut self.request_handler,
+                                range,
+                                Some(&self.chart.ticker_info),
+                            ) {
+                                return Some(action);
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 let now = UnixMs::now();
                 let target_to = kline_latest.saturating_add(timeframe_ms).min(now);
                 let historical_trade_to =
@@ -832,6 +891,53 @@ impl KlineChart {
                             self.fetching_trades = (true, None);
                             return Some(action);
                         }
+                    }
+                }
+
+                // Fixed-range volume-profile drawings use the same candle
+                // footprint data as SVP, but each drawing requests only its
+                // own selected range. Never merge disjoint ranges: that would
+                // download unrelated historical trade data between drawings.
+                if matches!(self.kind, KlineChartKind::Candles)
+                    && self.has_fixed_volume_profiles()
+                    && !self.fetching_trades.0
+                    && is_trade_fetch_enabled()
+                {
+                    let historical_to = historical_trade_target_to(kline_latest, timeframe_ms, now);
+                    let mut ranges = self
+                        .fixed_volume_profiles()
+                        .into_iter()
+                        .filter_map(|(from, to, _)| {
+                            let from = from.max(kline_earliest);
+                            let to = to.min(historical_to);
+                            (to > from).then_some((from, to))
+                        })
+                        .collect::<Vec<_>>();
+                    ranges.sort_by_key(|(_, to)| std::cmp::Reverse(*to));
+                    for (from, to) in ranges {
+                        let Some((gap_from, gap_to)) = self.latest_uncovered_trade_range(from, to)
+                        else {
+                            continue;
+                        };
+                        let chunk_from = UnixMs::new(
+                            gap_from
+                                .as_u64()
+                                .max(gap_to.as_u64().saturating_sub(60 * 60_000)),
+                        );
+                        let range = FetchRange::Trades(chunk_from, gap_to);
+                        log::info!(
+                            "FIXED VP Fetch | range={}",
+                            fetcher::format_fetch_range(&range)
+                        );
+                        if let Some(action) = request_fetch(
+                            &mut self.request_handler,
+                            range,
+                            Some(&self.chart.ticker_info),
+                        ) {
+                            self.fetching_trades = (true, None);
+                            return Some(action);
+                        }
+                        break;
                     }
                 }
 
@@ -2267,13 +2373,18 @@ impl KlineChart {
             .filter(|indicator| !indicator.is_overlay() && self.indicators[**indicator].is_some())
             .count();
 
-        if self.indicators[indicator].is_some() {
+        let enabling = self.indicators[indicator].is_none();
+        if !enabling {
             self.indicators[indicator] = None;
         } else {
             let mut box_indi = indicator::kline::make_empty(indicator);
             box_indi.on_config_changed(&self.visual_config);
             box_indi.rebuild_from_source(&self.data_source);
             self.indicators[indicator] = Some(box_indi);
+        }
+
+        if indicator == KlineIndicator::VolumeBubbles {
+            self.visual_config.volume_bubbles.enabled = enabling;
         }
 
         if let Some(main_split) = self.chart.layout.splits.first() {
@@ -2450,21 +2561,21 @@ fn select_trade_fetch_gap(
 }
 
 impl canvas::Program<Message> for KlineChart {
-    type State = Interaction;
+    type State = drawing::CanvasState;
 
     fn update(
         &self,
-        interaction: &mut Interaction,
+        interaction: &mut drawing::CanvasState,
         event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        super::canvas_interaction(self, interaction, event, bounds, cursor)
+        self.drawing_canvas_update(interaction, event, bounds, cursor)
     }
 
     fn draw(
         &self,
-        interaction: &Interaction,
+        interaction: &drawing::CanvasState,
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
@@ -2625,6 +2736,22 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
+                    for (from, to, config) in self.fixed_volume_profiles() {
+                        if self.fixed_volume_profile_ready(from, to) {
+                            draw_fixed_range_volume_profile(
+                                &self.data_source,
+                                frame,
+                                from,
+                                to,
+                                interval_to_x,
+                                price_to_y,
+                                chart.cell_height,
+                                chart.tick_size,
+                                &config,
+                                palette,
+                            );
+                        }
+                    }
                     if self.indicator_enabled(KlineIndicator::Vwap) {
                         draw_vwap_overlay(
                             &self.data_source,
@@ -2745,8 +2872,13 @@ impl canvas::Program<Message> for KlineChart {
             let visible_range = chart.interval_range(&visible_region);
 
             if let Some(cursor_position) = cursor.position_in(bounds) {
-                let (_, rounded_aggregation) =
-                    chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
+                let (_, rounded_aggregation) = chart.draw_crosshair(
+                    frame,
+                    theme,
+                    bounds_size,
+                    cursor_position,
+                    &interaction.navigation,
+                );
                 let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
                 let bubbles = self.rendered_volume_bubbles.borrow();
                 if let Some(bubble) = hit_test_volume_bubbles(
@@ -2811,16 +2943,17 @@ impl canvas::Program<Message> for KlineChart {
             }
         });
 
-        vec![klines, crosshair]
+        let drawings = self.draw_drawings(renderer, theme, bounds);
+        vec![klines, crosshair, drawings]
     }
 
     fn mouse_interaction(
         &self,
-        interaction: &Interaction,
+        interaction: &drawing::CanvasState,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        match interaction {
+        match &interaction.navigation {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
             Interaction::None | Interaction::Ruler { .. } => {
@@ -4283,6 +4416,141 @@ fn build_session_profiles(
     result
 }
 
+#[derive(Clone, Copy)]
+struct VolumeProfileVisualSettings {
+    placement: SessionProfilePlacement,
+    mode: SessionProfileMode,
+    value_area_percent: f32,
+    width_percent: f32,
+    row_size_ticks: u16,
+    show_poc: bool,
+    show_value_area: bool,
+    show_vwap: bool,
+    show_high_low: bool,
+}
+
+impl From<&SessionVolumeProfileConfig> for VolumeProfileVisualSettings {
+    fn from(config: &SessionVolumeProfileConfig) -> Self {
+        Self {
+            placement: config.placement,
+            mode: config.mode,
+            value_area_percent: config.value_area_percent,
+            width_percent: config.width_percent,
+            row_size_ticks: config.row_size_ticks,
+            show_poc: config.show_poc,
+            show_value_area: config.show_value_area,
+            show_vwap: config.show_vwap,
+            show_high_low: config.show_session_high_low,
+        }
+    }
+}
+
+impl From<&FixedRangeVolumeProfileConfig> for VolumeProfileVisualSettings {
+    fn from(config: &FixedRangeVolumeProfileConfig) -> Self {
+        Self {
+            placement: config.placement,
+            mode: config.mode,
+            value_area_percent: config.value_area_percent,
+            width_percent: config.width_percent,
+            row_size_ticks: config.row_size_ticks,
+            show_poc: config.show_poc,
+            show_value_area: config.show_value_area,
+            show_vwap: config.show_vwap,
+            show_high_low: config.show_range_high_low,
+        }
+    }
+}
+
+fn build_fixed_range_volume_profile(
+    data_source: &PlotData<KlineDataPoint>,
+    from: UnixMs,
+    to: UnixMs,
+    tick_size: PriceStep,
+    config: &FixedRangeVolumeProfileConfig,
+) -> Option<SessionProfile> {
+    let PlotData::TimeBased(timeseries) = data_source else {
+        return None;
+    };
+    if to <= from {
+        return None;
+    }
+    let style = VolumeProfileVisualSettings::from(config);
+    let row_units = tick_size
+        .units
+        .saturating_mul(i64::from(style.row_size_ticks.clamp(1, 50)))
+        .max(1);
+    let mut bins: FxHashMap<i64, ProfileBin> = FxHashMap::default();
+    let mut high: Option<Price> = None;
+    let mut low: Option<Price> = None;
+
+    for (_, dp) in timeseries.datapoints.range(from..to) {
+        high = Some(high.map_or(dp.kline.high, |value| value.max(dp.kline.high)));
+        low = Some(low.map_or(dp.kline.low, |value| value.min(dp.kline.low)));
+        for (price, trades) in &dp.footprint.trades {
+            let bin_units = price.units.div_euclid(row_units).saturating_mul(row_units);
+            let bin = bins.entry(bin_units).or_default();
+            bin.buy += trades.buy_qty.to_f64();
+            bin.sell += trades.sell_qty.to_f64();
+        }
+    }
+
+    let high = high?;
+    let low = low?;
+    let mut rows: Vec<_> = bins
+        .into_iter()
+        .map(|(units, bin)| (Price::from_units(units.saturating_add(row_units / 2)), bin))
+        .filter(|(_, bin)| bin.volume() > 0.0)
+        .collect();
+    rows.sort_by_key(|(price, _)| *price);
+    if rows.is_empty() {
+        return None;
+    }
+    let poc_index = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.1.volume().total_cmp(&b.1.volume()))
+        .map(|(index, _)| index)?;
+    let total: f64 = rows.iter().map(|(_, bin)| bin.volume()).sum();
+    let target = total * (f64::from(style.value_area_percent.clamp(50.0, 95.0)) / 100.0);
+    let mut included = rows[poc_index].1.volume();
+    let mut low_index = poc_index;
+    let mut high_index = poc_index;
+    while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
+        let below = if low_index > 0 {
+            rows[low_index - 1].1.volume()
+        } else {
+            -1.0
+        };
+        let above = if high_index + 1 < rows.len() {
+            rows[high_index + 1].1.volume()
+        } else {
+            -1.0
+        };
+        if above >= below {
+            high_index += 1;
+            included += rows[high_index].1.volume();
+        } else {
+            low_index -= 1;
+            included += rows[low_index].1.volume();
+        }
+    }
+    let weighted: f64 = rows
+        .iter()
+        .map(|(price, bin)| price.to_f64() * bin.volume())
+        .sum();
+    Some(SessionProfile {
+        start: from.as_u64(),
+        end: to.as_u64(),
+        poc: rows[poc_index].0,
+        vah: rows[high_index].0,
+        val: rows[low_index].0,
+        vwap: Price::from_f64(weighted / total.max(f64::EPSILON)),
+        high,
+        low,
+        rows,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_session_volume_profiles(
     data_source: &PlotData<KlineDataPoint>,
@@ -4297,93 +4565,140 @@ fn draw_session_volume_profiles(
     palette: &Extended,
 ) {
     let profiles = build_session_profiles(data_source, earliest, latest, tick_size, config);
-    let row_height = cell_height * f32::from(config.row_size_ticks.max(1)) * 0.86;
+    let style = VolumeProfileVisualSettings::from(config);
     for profile in profiles {
-        let session_left = interval_to_x(profile.start);
-        let session_right = interval_to_x(profile.end);
-        let full_width = (session_right - session_left).abs();
-        let max_width = full_width * (config.width_percent.clamp(1.0, 100.0) / 100.0);
-        let max_value = profile
-            .rows
-            .iter()
-            .map(|(_, bin)| match config.mode {
-                SessionProfileMode::Volume => bin.volume(),
-                SessionProfileMode::Delta => bin.delta().abs(),
-            })
-            .fold(0.0f64, f64::max);
-        if max_value <= 0.0 {
-            continue;
-        }
+        draw_volume_profile(
+            frame,
+            profile,
+            &interval_to_x,
+            &price_to_y,
+            cell_height,
+            style,
+            palette,
+        );
+    }
+}
 
-        for (price, bin) in &profile.rows {
-            let value = match config.mode {
-                SessionProfileMode::Volume => bin.volume(),
-                SessionProfileMode::Delta => bin.delta().abs(),
-            };
-            let width = max_width * (value / max_value) as f32;
-            let x = match config.placement {
-                SessionProfilePlacement::Left => session_left,
-                SessionProfilePlacement::Right => session_right - width,
-            };
-            let in_value_area = *price >= profile.val && *price <= profile.vah;
-            let base = match config.mode {
-                SessionProfileMode::Volume => palette.primary.strong.color,
-                SessionProfileMode::Delta if bin.delta() >= 0.0 => palette.success.strong.color,
-                SessionProfileMode::Delta => palette.danger.strong.color,
-            };
-            frame.fill_rectangle(
-                Point::new(x, price_to_y(*price) - row_height / 2.0),
-                Size::new(width.max(0.1), row_height.max(0.1)),
-                base.scale_alpha(if in_value_area { 0.38 } else { 0.18 }),
-            );
-        }
+#[allow(clippy::too_many_arguments)]
+fn draw_fixed_range_volume_profile(
+    data_source: &PlotData<KlineDataPoint>,
+    frame: &mut canvas::Frame,
+    from: UnixMs,
+    to: UnixMs,
+    interval_to_x: impl Fn(u64) -> f32,
+    price_to_y: impl Fn(Price) -> f32,
+    cell_height: f32,
+    tick_size: PriceStep,
+    config: &FixedRangeVolumeProfileConfig,
+    palette: &Extended,
+) {
+    if let Some(profile) =
+        build_fixed_range_volume_profile(data_source, from, to, tick_size, config)
+    {
+        draw_volume_profile(
+            frame,
+            profile,
+            &interval_to_x,
+            &price_to_y,
+            cell_height,
+            config.into(),
+            palette,
+        );
+    }
+}
 
-        let draw_level = |frame: &mut canvas::Frame, price: Price, color: Color, width: f32| {
-            frame.stroke(
-                &Path::line(
-                    Point::new(session_left, price_to_y(price)),
-                    Point::new(session_right, price_to_y(price)),
-                ),
-                Stroke::default().with_color(color).with_width(width),
-            );
+fn draw_volume_profile(
+    frame: &mut canvas::Frame,
+    profile: SessionProfile,
+    interval_to_x: &impl Fn(u64) -> f32,
+    price_to_y: &impl Fn(Price) -> f32,
+    cell_height: f32,
+    style: VolumeProfileVisualSettings,
+    palette: &Extended,
+) {
+    let row_height = cell_height * f32::from(style.row_size_ticks.max(1)) * 0.86;
+    let session_left = interval_to_x(profile.start);
+    let session_right = interval_to_x(profile.end);
+    let full_width = (session_right - session_left).abs();
+    let max_width = full_width * (style.width_percent.clamp(1.0, 100.0) / 100.0);
+    let max_value = profile
+        .rows
+        .iter()
+        .map(|(_, bin)| match style.mode {
+            SessionProfileMode::Volume => bin.volume(),
+            SessionProfileMode::Delta => bin.delta().abs(),
+        })
+        .fold(0.0f64, f64::max);
+    if max_value <= 0.0 {
+        return;
+    }
+    for (price, bin) in &profile.rows {
+        let value = match style.mode {
+            SessionProfileMode::Volume => bin.volume(),
+            SessionProfileMode::Delta => bin.delta().abs(),
         };
-        let draw_label = |frame: &mut canvas::Frame, text: &str, price: Price, color: Color| {
-            let (x, alignment) = match config.placement {
-                SessionProfilePlacement::Left => (session_left + 2.0, Alignment::Start),
-                SessionProfilePlacement::Right => (session_right - 2.0, Alignment::End),
-            };
-            draw_cluster_text(
-                frame,
-                text,
-                Point::new(x, price_to_y(price) - 1.0),
-                7.0,
-                color,
-                alignment,
-                Alignment::End,
-            );
+        let width = max_width * (value / max_value) as f32;
+        let x = match style.placement {
+            SessionProfilePlacement::Left => session_left,
+            SessionProfilePlacement::Right => session_right - width,
         };
-        if config.show_poc {
-            let color = palette.warning.strong.color.scale_alpha(0.95);
-            draw_level(frame, profile.poc, color, 1.6);
-            draw_label(frame, "POC", profile.poc, color);
-        }
-        if config.show_value_area {
-            let color = palette.primary.strong.color.scale_alpha(0.82);
-            draw_level(frame, profile.vah, color, 1.0);
-            draw_level(frame, profile.val, color, 1.0);
-            draw_label(frame, "VAH", profile.vah, color);
-            draw_label(frame, "VAL", profile.val, color);
-        }
-        if config.show_vwap {
-            let color = palette.success.base.color.scale_alpha(0.85);
-            draw_level(frame, profile.vwap, color, 1.0);
-            draw_label(frame, "VWAP", profile.vwap, color);
-        }
-        if config.show_session_high_low {
-            let color = palette.background.strong.text.scale_alpha(0.42);
-            draw_level(frame, profile.high, color, 0.7);
-            draw_level(frame, profile.low, color, 0.7);
-        }
+        let in_value_area = *price >= profile.val && *price <= profile.vah;
+        let base = match style.mode {
+            SessionProfileMode::Volume => palette.primary.strong.color,
+            SessionProfileMode::Delta if bin.delta() >= 0.0 => palette.success.strong.color,
+            SessionProfileMode::Delta => palette.danger.strong.color,
+        };
+        frame.fill_rectangle(
+            Point::new(x, price_to_y(*price) - row_height / 2.0),
+            Size::new(width.max(0.1), row_height.max(0.1)),
+            base.scale_alpha(if in_value_area { 0.38 } else { 0.18 }),
+        );
+    }
+    let draw_level = |frame: &mut canvas::Frame, price: Price, color: Color, width: f32| {
+        frame.stroke(
+            &Path::line(
+                Point::new(session_left, price_to_y(price)),
+                Point::new(session_right, price_to_y(price)),
+            ),
+            Stroke::default().with_color(color).with_width(width),
+        );
+    };
+    let draw_label = |frame: &mut canvas::Frame, text: &str, price: Price, color: Color| {
+        let (x, alignment) = match style.placement {
+            SessionProfilePlacement::Left => (session_left + 2.0, Alignment::Start),
+            SessionProfilePlacement::Right => (session_right - 2.0, Alignment::End),
+        };
+        draw_cluster_text(
+            frame,
+            text,
+            Point::new(x, price_to_y(price) - 1.0),
+            7.0,
+            color,
+            alignment,
+            Alignment::End,
+        );
+    };
+    if style.show_poc {
+        let color = palette.warning.strong.color.scale_alpha(0.95);
+        draw_level(frame, profile.poc, color, 1.6);
+        draw_label(frame, "POC", profile.poc, color);
+    }
+    if style.show_value_area {
+        let color = palette.primary.strong.color.scale_alpha(0.82);
+        draw_level(frame, profile.vah, color, 1.0);
+        draw_level(frame, profile.val, color, 1.0);
+        draw_label(frame, "VAH", profile.vah, color);
+        draw_label(frame, "VAL", profile.val, color);
+    }
+    if style.show_vwap {
+        let color = palette.success.base.color.scale_alpha(0.85);
+        draw_level(frame, profile.vwap, color, 1.0);
+        draw_label(frame, "VWAP", profile.vwap, color);
+    }
+    if style.show_high_low {
+        let color = palette.background.strong.text.scale_alpha(0.42);
+        draw_level(frame, profile.high, color, 0.7);
+        draw_level(frame, profile.low, color, 0.7);
     }
 }
 
@@ -6510,6 +6825,49 @@ mod tests {
             price: Price::from_f64(100.0),
             qty: Qty::from_f64(qty),
         }
+    }
+
+    fn empty_candlestick_chart(
+        enabled_indicators: &[KlineIndicator],
+        visual_config: Option<Config>,
+    ) -> KlineChart {
+        let ticker_info = TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", exchange::adapter::Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(exchange::Timeframe::M5),
+            PriceStep::from(ticker_info.min_ticksize),
+            &[],
+            vec![],
+            enabled_indicators,
+            ticker_info,
+            &KlineChartKind::Candles,
+            visual_config,
+        )
+    }
+
+    #[test]
+    fn volume_bubble_selection_controls_runtime_enabled_state() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        assert!(!chart.visual_config.volume_bubbles.enabled);
+
+        chart.toggle_indicator(KlineIndicator::VolumeBubbles);
+        assert!(chart.indicator_enabled(KlineIndicator::VolumeBubbles));
+        assert!(chart.visual_config.volume_bubbles.enabled);
+
+        chart.toggle_indicator(KlineIndicator::VolumeBubbles);
+        assert!(!chart.indicator_enabled(KlineIndicator::VolumeBubbles));
+        assert!(!chart.visual_config.volume_bubbles.enabled);
+    }
+
+    #[test]
+    fn volume_bubble_selection_is_aligned_when_chart_is_created() {
+        let chart = empty_candlestick_chart(&[KlineIndicator::VolumeBubbles], None);
+        assert!(chart.visual_config.volume_bubbles.enabled);
     }
 
     #[test]

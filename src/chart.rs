@@ -13,7 +13,7 @@ use data::chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator};
 use exchange::TickerInfo;
 use exchange::unit::{Price, PriceStep};
 use scale::linear::PriceInfoLabel;
-use scale::{AxisLabelsX, AxisLabelsY};
+use scale::{AxisLabelsX, AxisLabelsY, AxisOverlayLabel};
 
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, LineDash, Path, Stroke};
@@ -47,7 +47,7 @@ pub enum AxisScaleClicked {
     Y,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Message {
     Translated(Vector),
     Scaled(f32, Vector),
@@ -58,6 +58,50 @@ pub enum Message {
     BoundsChanged(Rectangle),
     SplitDragged(usize, f32),
     DoubleClick(AxisScaleClicked),
+    Drawing(DrawingMessage),
+}
+
+#[derive(Debug, Clone)]
+pub enum DrawingMessage {
+    ToolSelected(data::chart::kline::drawing::DrawingTool),
+    PointerPressed(data::chart::kline::drawing::DrawingAnchor, Point),
+    PointerMoved(data::chart::kline::drawing::DrawingAnchor, Point),
+    PointerReleased(data::chart::kline::drawing::DrawingAnchor),
+    DoubleClicked(u64),
+    MoveStarted(data::chart::kline::drawing::DrawingAnchor),
+    ResizeStarted(data::chart::kline::drawing::DrawingAnchor, Point, u8),
+    MoveFinished,
+    CancelOrCommit,
+    TextChanged(String),
+    TextCommitted,
+    HorizontalLinePriceChanged(String),
+    CommitHorizontalLinePrice,
+    CloseSettings,
+    SetColor(data::chart::kline::drawing::DrawingColor),
+    SetStrokeWidth(f32),
+    SetOpacity(f32),
+    SetFillOpacity(f32),
+    SetTextSize(f32),
+    ToggleLabels(bool),
+    ToggleFibonacciLevel(usize),
+    SetFixedRangeVolumeProfile(data::chart::kline::drawing::FixedRangeVolumeProfileConfig),
+    ToggleDrawingVisibility(u64),
+    FocusDrawing(u64),
+    OpenDrawingSettings(u64),
+    DeleteDrawing(u64),
+    ToggleDrawingList,
+    ToolbarDragStarted(Point),
+    ToolbarDragged(Point),
+    ToolbarDragEnded,
+    FloatingPanelDragged(Point),
+    FloatingPanelDragEnded,
+    DrawingListDragStarted(Point),
+    DrawingListDragged(Point),
+    DrawingListDragEnded,
+    DeleteSelected,
+    ToggleDrawingsVisibility,
+    ClearAllDrawings,
+    ToggleToolbar,
 }
 
 pub trait Chart: PlotConstants + canvas::Program<Message> {
@@ -82,6 +126,14 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     fn supports_fit_autoscaling(&self) -> bool;
 
     fn is_empty(&self) -> bool;
+
+    fn plot_overlay(&'_ self) -> Option<Element<'_, Message>> {
+        None
+    }
+
+    fn drawing_axis_labels(&self) -> (Vec<AxisOverlayLabel>, Vec<AxisOverlayLabel>) {
+        (Vec::new(), Vec::new())
+    }
 }
 
 fn canvas_interaction<T: Chart>(
@@ -282,6 +334,7 @@ pub enum Action {
 
 pub fn update<T: Chart>(chart: &mut T, message: &Message) {
     match message {
+        Message::Drawing(_) => return,
         Message::DoubleClick(scale) => {
             let default_chart_width = T::default_cell_width(chart);
             let supports_fit_autoscaling = chart.supports_fit_autoscaling();
@@ -504,6 +557,7 @@ pub fn view<'a, T: Chart>(
     }
 
     let state = chart.state();
+    let (drawing_x_labels, drawing_y_labels) = chart.drawing_axis_labels();
 
     let axis_labels_x = Canvas::new(AxisLabelsX {
         labels_cache: &state.cache.x_labels,
@@ -516,6 +570,7 @@ pub fn view<'a, T: Chart>(
         chart_bounds: state.bounds,
         interval_keys: chart.interval_keys(),
         autoscaling: state.layout.autoscale,
+        overlay_labels: drawing_x_labels,
     })
     .width(Length::Fill)
     .height(Length::Fill);
@@ -563,12 +618,19 @@ pub fn view<'a, T: Chart>(
             cell_height: state.cell_height,
             basis: state.basis,
             chart_bounds: state.bounds,
+            overlay_labels: drawing_y_labels,
         })
         .width(Length::Fill)
         .height(Length::Fill);
 
+        let canvas = Canvas::new(chart).width(Length::Fill).height(Length::Fill);
+        let plot: Element<_> = if let Some(overlay) = chart.plot_overlay() {
+            iced::widget::stack![canvas, overlay].into()
+        } else {
+            canvas.into()
+        };
         let main_chart: Element<_> = row![
-            container(Canvas::new(chart).width(Length::Fill).height(Length::Fill))
+            container(plot)
                 .width(Length::FillPortion(10))
                 .height(Length::FillPortion(120)),
             rule::vertical(1).style(style::split_ruler),
