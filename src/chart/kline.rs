@@ -350,6 +350,11 @@ impl KlineChart {
     ) -> Self {
         let mut visual_config = visual_config.unwrap_or_default();
         visual_config.migrate_legacy_indicator_configs();
+        // The selected indicator list is the canonical enabled state. Keep the
+        // legacy config flag aligned so a freshly-created chart starts bubble
+        // rendering and historical loading immediately, without a restart.
+        visual_config.volume_bubbles.enabled =
+            enabled_indicators.contains(&KlineIndicator::VolumeBubbles);
         let kind = kind.clone();
         let raw_trades =
             deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
@@ -2368,13 +2373,18 @@ impl KlineChart {
             .filter(|indicator| !indicator.is_overlay() && self.indicators[**indicator].is_some())
             .count();
 
-        if self.indicators[indicator].is_some() {
+        let enabling = self.indicators[indicator].is_none();
+        if !enabling {
             self.indicators[indicator] = None;
         } else {
             let mut box_indi = indicator::kline::make_empty(indicator);
             box_indi.on_config_changed(&self.visual_config);
             box_indi.rebuild_from_source(&self.data_source);
             self.indicators[indicator] = Some(box_indi);
+        }
+
+        if indicator == KlineIndicator::VolumeBubbles {
+            self.visual_config.volume_bubbles.enabled = enabling;
         }
 
         if let Some(main_split) = self.chart.layout.splits.first() {
@@ -4506,12 +4516,16 @@ fn build_fixed_range_volume_profile(
     let mut low_index = poc_index;
     let mut high_index = poc_index;
     while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
-        let below = (low_index > 0)
-            .then(|| rows[low_index - 1].1.volume())
-            .unwrap_or(-1.0);
-        let above = (high_index + 1 < rows.len())
-            .then(|| rows[high_index + 1].1.volume())
-            .unwrap_or(-1.0);
+        let below = if low_index > 0 {
+            rows[low_index - 1].1.volume()
+        } else {
+            -1.0
+        };
+        let above = if high_index + 1 < rows.len() {
+            rows[high_index + 1].1.volume()
+        } else {
+            -1.0
+        };
         if above >= below {
             high_index += 1;
             included += rows[high_index].1.volume();
@@ -6811,6 +6825,49 @@ mod tests {
             price: Price::from_f64(100.0),
             qty: Qty::from_f64(qty),
         }
+    }
+
+    fn empty_candlestick_chart(
+        enabled_indicators: &[KlineIndicator],
+        visual_config: Option<Config>,
+    ) -> KlineChart {
+        let ticker_info = TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", exchange::adapter::Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(exchange::Timeframe::M5),
+            PriceStep::from(ticker_info.min_ticksize),
+            &[],
+            vec![],
+            enabled_indicators,
+            ticker_info,
+            &KlineChartKind::Candles,
+            visual_config,
+        )
+    }
+
+    #[test]
+    fn volume_bubble_selection_controls_runtime_enabled_state() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        assert!(!chart.visual_config.volume_bubbles.enabled);
+
+        chart.toggle_indicator(KlineIndicator::VolumeBubbles);
+        assert!(chart.indicator_enabled(KlineIndicator::VolumeBubbles));
+        assert!(chart.visual_config.volume_bubbles.enabled);
+
+        chart.toggle_indicator(KlineIndicator::VolumeBubbles);
+        assert!(!chart.indicator_enabled(KlineIndicator::VolumeBubbles));
+        assert!(!chart.visual_config.volume_bubbles.enabled);
+    }
+
+    #[test]
+    fn volume_bubble_selection_is_aligned_when_chart_is_created() {
+        let chart = empty_candlestick_chart(&[KlineIndicator::VolumeBubbles], None);
+        assert!(chart.visual_config.volume_bubbles.enabled);
     }
 
     #[test]

@@ -2,16 +2,18 @@ use super::KlineChart;
 use crate::chart::scale::AxisOverlayLabel;
 use crate::chart::{Chart, DrawingMessage, Interaction, Message};
 use crate::widget::color_picker::color_picker;
+use crate::widget::drag_handle;
 use data::chart::{
     Basis,
     kline::{SessionProfileMode, SessionProfilePlacement, drawing::*},
 };
 use exchange::{UnixMs, unit::Price};
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::canvas::{self, Frame, Geometry, LineDash, Path, Stroke};
 use iced::{
     Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, Vector, mouse,
     widget::{
-        button, checkbox, column, container, opaque, pick_list, row, slider, svg, text, text_input,
+        button, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
+        slider, space, svg, text, text_input,
     },
 };
 use iced_core::mouse::{Click, click};
@@ -44,6 +46,12 @@ pub(super) enum Draft {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatingPanel {
+    Toolbar,
+    DrawingList,
+}
+
 pub(super) struct DrawingState {
     pub active_tool: DrawingTool,
     pub drawings: Vec<Drawing>,
@@ -52,7 +60,13 @@ pub(super) struct DrawingState {
     pub settings_open: bool,
     pub visible: bool,
     pub text_editor_position: Option<Point>,
+    pub horizontal_line_price_input: Option<String>,
     pub toolbar_open: bool,
+    pub toolbar_position: Point,
+    pub drawing_list_open: bool,
+    pub drawing_list_position: Point,
+    dragging_panel: Option<FloatingPanel>,
+    drag_grab_offset: Option<Point>,
     tool_styles: Vec<(DrawingTool, DrawingStyle)>,
     next_id: u64,
     pub text_input_id: iced::widget::Id,
@@ -68,7 +82,13 @@ impl Default for DrawingState {
             settings_open: false,
             visible: true,
             text_editor_position: None,
+            horizontal_line_price_input: None,
             toolbar_open: true,
+            toolbar_position: Point::new(8.0, 8.0),
+            drawing_list_open: false,
+            drawing_list_position: Point::new(48.0, 48.0),
+            dragging_panel: None,
+            drag_grab_offset: None,
             tool_styles: [
                 DrawingTool::Pen,
                 DrawingTool::HorizontalLine,
@@ -95,6 +115,14 @@ pub struct CanvasState {
     pub previous_hit: Option<u64>,
 }
 
+/// Drawing coordinates are local to the canvas frame. `Rectangle::center` also
+/// includes the widget's position in its parent, so using it here makes a
+/// timestamp depend on where the chart is laid out and causes it to drift when
+/// the scale changes.
+fn drawing_canvas_center(bounds: Rectangle) -> Point {
+    Point::new(bounds.width / 2.0, bounds.height / 2.0)
+}
+
 impl KlineChart {
     const MAX_FIXED_VOLUME_PROFILES: usize = 16;
     const MAX_FIXED_VOLUME_PROFILE_RANGE_MS: u64 = 7 * 24 * 60 * 60_000;
@@ -102,7 +130,7 @@ impl KlineChart {
 
     pub(super) fn drawing_anchor(&self, point: Point, bounds: Rectangle) -> DrawingAnchor {
         let chart = self.state();
-        let center = bounds.center();
+        let center = drawing_canvas_center(bounds);
         let world = (point - center) * (1.0 / chart.scaling) - chart.translation;
         let x = match chart.basis {
             Basis::Time(_) => DrawingX::Time(UnixMs::new(chart.x_to_interval(world.x))),
@@ -120,13 +148,13 @@ impl KlineChart {
             DrawingX::Time(value) => chart.interval_to_x(value.as_u64()),
             DrawingX::Tick(value) => chart.interval_to_x(value),
         };
-        bounds.center()
+        drawing_canvas_center(bounds)
             + (Vector::new(x, chart.price_to_y(anchor.price)) + chart.translation) * chart.scaling
     }
 
     fn volume_profile_screen_x(&self, time: UnixMs, bounds: Rectangle) -> f32 {
         let chart = self.state();
-        bounds.center().x
+        drawing_canvas_center(bounds).x
             + (chart.interval_to_x(time.as_u64()) + chart.translation.x) * chart.scaling
     }
 
@@ -172,34 +200,32 @@ impl KlineChart {
         let Basis::Time(timeframe) = self.chart.basis else {
             return Vec::new();
         };
-        self.drawings
-            .visible
-            .then(|| {
-                self.drawings
-                    .drawings
-                    .iter()
-                    .filter_map(|drawing| {
-                        let DrawingGeometry::FixedRangeVolumeProfile { first, second } =
-                            drawing.geometry
-                        else {
-                            return None;
-                        };
-                        let (from, last) = if first <= second {
-                            (first, second)
-                        } else {
-                            (second, first)
-                        };
-                        Some((
-                            from,
-                            last.saturating_add(timeframe.to_milliseconds()),
-                            sanitize_volume_profile_config(
-                                drawing.style.fixed_range_volume_profile,
-                            ),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        if self.drawings.visible {
+            self.drawings
+                .drawings
+                .iter()
+                .filter(|drawing| drawing.visible)
+                .filter_map(|drawing| {
+                    let DrawingGeometry::FixedRangeVolumeProfile { first, second } =
+                        drawing.geometry
+                    else {
+                        return None;
+                    };
+                    let (from, last) = if first <= second {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    };
+                    Some((
+                        from,
+                        last.saturating_add(timeframe.to_milliseconds()),
+                        sanitize_volume_profile_config(drawing.style.fixed_range_volume_profile),
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn has_fixed_volume_profiles(&self) -> bool {
@@ -269,6 +295,7 @@ impl KlineChart {
             id,
             geometry,
             style: self.style_for_tool(tool),
+            visible: true,
         });
         self.drawings.selected = Some(id);
         self.drawings.active_tool = DrawingTool::Select;
@@ -285,6 +312,7 @@ impl KlineChart {
                 self.drawings.draft = None;
                 self.drawings.selected = None;
                 self.drawings.settings_open = false;
+                self.drawings.horizontal_line_price_input = None;
             }
             DrawingMessage::PointerPressed(anchor, editor_position) => match self
                 .drawings
@@ -373,10 +401,10 @@ impl KlineChart {
                             preview.x = DrawingX::Time(time);
                         }
                     }
-                    Some(Draft::Freehand { points }) => {
-                        if points.last().is_none_or(|last| last != anchor) {
-                            points.push(*anchor);
-                        }
+                    Some(Draft::Freehand { points })
+                        if points.last().is_none_or(|last| last != anchor) =>
+                    {
+                        points.push(*anchor);
                     }
                     Some(Draft::Moving {
                         original,
@@ -421,10 +449,21 @@ impl KlineChart {
                     }
                 }
             }
-            DrawingMessage::DoubleClicked(id) => {
+            DrawingMessage::DoubleClicked(id) | DrawingMessage::OpenDrawingSettings(id) => {
                 self.drawings.selected = Some(*id);
                 self.drawings.settings_open = true;
                 self.drawings.active_tool = DrawingTool::Select;
+                self.drawings.horizontal_line_price_input = self
+                    .drawings
+                    .drawings
+                    .iter()
+                    .find(|drawing| drawing.id == *id)
+                    .and_then(|drawing| match drawing.geometry {
+                        DrawingGeometry::HorizontalLine { price } => {
+                            Some(price_label(price, self.tick_size().decimal_places()))
+                        }
+                        _ => None,
+                    });
             }
             DrawingMessage::MoveStarted(anchor) => {
                 if let Some(id) = self.drawings.selected
@@ -493,23 +532,57 @@ impl KlineChart {
                 }
             }
             DrawingMessage::TextCommitted => {
-                if let Some(Draft::Text { anchor, value }) = self.drawings.draft.take() {
-                    if !value.trim().is_empty() {
-                        self.commit(DrawingGeometry::Text {
-                            anchor,
-                            content: value,
-                        });
-                    }
+                if let Some(Draft::Text { anchor, value }) = self.drawings.draft.take()
+                    && !value.trim().is_empty()
+                {
+                    self.commit(DrawingGeometry::Text {
+                        anchor,
+                        content: value,
+                    });
                 }
                 self.drawings.text_editor_position = None;
             }
-            DrawingMessage::CloseSettings => self.drawings.settings_open = false,
+            DrawingMessage::HorizontalLinePriceChanged(value) => {
+                self.drawings.horizontal_line_price_input = Some(value.clone());
+            }
+            DrawingMessage::CommitHorizontalLinePrice => {
+                let Some(input) = self.drawings.horizontal_line_price_input.as_deref() else {
+                    return true;
+                };
+                let Some(value) = parse_horizontal_line_price(input) else {
+                    return true;
+                };
+                let price = Price::from_f64(value).round_to_step(self.tick_size());
+                let decimals = self.tick_size().decimal_places();
+                if let Some(drawing) = self.drawings.drawings.iter_mut().find(|drawing| {
+                    Some(drawing.id) == self.drawings.selected
+                        && matches!(drawing.geometry, DrawingGeometry::HorizontalLine { .. })
+                }) {
+                    drawing.geometry = DrawingGeometry::HorizontalLine { price };
+                    self.drawings.horizontal_line_price_input = Some(price_label(price, decimals));
+                }
+            }
+            DrawingMessage::CloseSettings => {
+                self.drawings.settings_open = false;
+                self.drawings.horizontal_line_price_input = None;
+            }
             DrawingMessage::DeleteSelected => {
                 if let Some(id) = self.drawings.selected {
                     self.drawings.drawings.retain(|drawing| drawing.id != id);
                 }
                 self.drawings.selected = None;
                 self.drawings.settings_open = false;
+                self.drawings.horizontal_line_price_input = None;
+            }
+            DrawingMessage::DeleteDrawing(id) => {
+                self.drawings.drawings.retain(|drawing| drawing.id != *id);
+                if self.drawings.selected == Some(*id) {
+                    self.drawings.selected = None;
+                    self.drawings.settings_open = false;
+                }
+                if self.drawings.drawings.is_empty() {
+                    self.drawings.drawing_list_open = false;
+                }
             }
             DrawingMessage::ToggleDrawingsVisibility => {
                 self.drawings.visible = !self.drawings.visible;
@@ -520,6 +593,7 @@ impl KlineChart {
             }
             DrawingMessage::ClearAllDrawings => {
                 self.drawings.drawings.clear();
+                self.drawings.drawing_list_open = false;
                 self.drawings.selected = None;
                 self.drawings.settings_open = false;
                 self.drawings.draft = None;
@@ -558,12 +632,148 @@ impl KlineChart {
             DrawingMessage::ToggleToolbar => {
                 self.drawings.toolbar_open = !self.drawings.toolbar_open
             }
+            DrawingMessage::ToggleDrawingVisibility(id) => {
+                if let Some(drawing) = self
+                    .drawings
+                    .drawings
+                    .iter_mut()
+                    .find(|drawing| drawing.id == *id)
+                {
+                    drawing.visible = !drawing.visible;
+                }
+            }
+            DrawingMessage::FocusDrawing(id) => self.focus_drawing(*id),
+            DrawingMessage::ToggleDrawingList => {
+                self.drawings.drawing_list_open =
+                    !self.drawings.drawings.is_empty() && !self.drawings.drawing_list_open;
+            }
+            DrawingMessage::ToolbarDragStarted(_) => {
+                self.drawings.dragging_panel = Some(FloatingPanel::Toolbar);
+                self.drawings.drag_grab_offset = None;
+            }
+            DrawingMessage::ToolbarDragged(_) => {}
+            DrawingMessage::ToolbarDragEnded => self.stop_dragging_floating_panel(),
+            DrawingMessage::DrawingListDragStarted(_) => {
+                self.drawings.dragging_panel = Some(FloatingPanel::DrawingList);
+                self.drawings.drag_grab_offset = None;
+            }
+            DrawingMessage::DrawingListDragged(_) => {}
+            DrawingMessage::DrawingListDragEnded => self.stop_dragging_floating_panel(),
+            DrawingMessage::FloatingPanelDragged(position) => {
+                if let Some(panel) = self.drawings.dragging_panel {
+                    self.drag_floating_panel(panel, *position);
+                }
+            }
+            DrawingMessage::FloatingPanelDragEnded => self.stop_dragging_floating_panel(),
         }
         self.chart.cache.clear_all();
         if self.has_fixed_volume_profiles() {
             self.last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
         }
         true
+    }
+
+    fn drag_floating_panel(&mut self, panel: FloatingPanel, pointer: Point) {
+        if self.drawings.dragging_panel != Some(panel) {
+            return;
+        }
+        let Some(last_pointer) = self.drawings.drag_grab_offset else {
+            self.drawings.drag_grab_offset = Some(pointer);
+            return;
+        };
+        let delta = pointer - last_pointer;
+        self.drawings.drag_grab_offset = Some(pointer);
+        let (width, height) = self.floating_panel_size(panel);
+        let max_x = (self.chart.bounds.width - width).max(0.0);
+        let max_y = (self.chart.bounds.height - height).max(0.0);
+        let position = match panel {
+            FloatingPanel::Toolbar => &mut self.drawings.toolbar_position,
+            FloatingPanel::DrawingList => &mut self.drawings.drawing_list_position,
+        };
+        position.x = (position.x + delta.x).clamp(0.0, max_x);
+        position.y = (position.y + delta.y).clamp(0.0, max_y);
+    }
+
+    fn floating_panel_position(&self, panel: FloatingPanel) -> Point {
+        let position = match panel {
+            FloatingPanel::Toolbar => self.drawings.toolbar_position,
+            FloatingPanel::DrawingList => self.drawings.drawing_list_position,
+        };
+        let (width, height) = self.floating_panel_size(panel);
+        Point::new(
+            position
+                .x
+                .clamp(0.0, (self.chart.bounds.width - width).max(0.0)),
+            position
+                .y
+                .clamp(0.0, (self.chart.bounds.height - height).max(0.0)),
+        )
+    }
+
+    fn floating_panel_size(&self, panel: FloatingPanel) -> (f32, f32) {
+        match panel {
+            FloatingPanel::Toolbar => (
+                44.0,
+                toolbar_panel_height(
+                    self.drawings.toolbar_open,
+                    !self.drawings.drawings.is_empty(),
+                )
+                .min(self.chart.bounds.height),
+            ),
+            FloatingPanel::DrawingList => (
+                288.0,
+                36.0 + (self.drawings.drawings.len() as f32 * 30.0).clamp(30.0, 240.0),
+            ),
+        }
+    }
+
+    fn stop_dragging_floating_panel(&mut self) {
+        self.drawings.dragging_panel = None;
+        self.drawings.drag_grab_offset = None;
+    }
+
+    fn focus_drawing(&mut self, id: u64) {
+        let Some(drawing) = self
+            .drawings
+            .drawings
+            .iter()
+            .find(|drawing| drawing.id == id)
+        else {
+            return;
+        };
+        if let DrawingGeometry::HorizontalLine { price } = drawing.geometry {
+            self.chart.translation.y = -self.chart.price_to_y(price);
+            self.drawings.selected = Some(id);
+            self.drawings.active_tool = DrawingTool::Select;
+            return;
+        }
+        if let DrawingGeometry::VerticalLine { x } = drawing.geometry {
+            let x = match x {
+                DrawingX::Time(value) => self.chart.interval_to_x(value.as_u64()),
+                DrawingX::Tick(value) => self.chart.interval_to_x(value),
+            };
+            self.chart.translation.x = -x;
+            self.drawings.selected = Some(id);
+            self.drawings.active_tool = DrawingTool::Select;
+            return;
+        }
+        if let DrawingGeometry::FixedRangeVolumeProfile { first, second } = drawing.geometry {
+            let midpoint = UnixMs::new((first.as_u64() + second.as_u64()) / 2);
+            self.chart.translation.x = -self.chart.interval_to_x(midpoint.as_u64());
+            self.drawings.selected = Some(id);
+            self.drawings.active_tool = DrawingTool::Select;
+            return;
+        }
+        let Some(anchor) = drawing_focus_anchor(&drawing.geometry) else {
+            return;
+        };
+        let x = match anchor.x {
+            DrawingX::Time(value) => self.chart.interval_to_x(value.as_u64()),
+            DrawingX::Tick(value) => self.chart.interval_to_x(value),
+        };
+        self.chart.translation = Vector::new(-x, -self.chart.price_to_y(anchor.price));
+        self.drawings.selected = Some(id);
+        self.drawings.active_tool = DrawingTool::Select;
     }
 
     fn modify_selected_style(&mut self, apply: impl FnOnce(&mut DrawingStyle)) {
@@ -594,6 +804,7 @@ impl KlineChart {
             .drawings
             .iter()
             .rev()
+            .filter(|drawing| drawing.visible)
             .find(|drawing| hit_test(self, drawing, point, bounds))
             .map(|drawing| drawing.id)
     }
@@ -604,6 +815,16 @@ impl KlineChart {
             .drawings
             .iter()
             .find(|drawing| drawing.id == id)?;
+        if let DrawingGeometry::FixedRangeVolumeProfile { first, second } = drawing.geometry {
+            let first_x = self.volume_profile_screen_x(first, bounds);
+            let second_x = self.volume_profile_screen_x(second, bounds);
+            if (point.x - first_x).abs() <= 8.0 && point.y >= 0.0 && point.y <= bounds.height {
+                return Some(0);
+            }
+            if (point.x - second_x).abs() <= 8.0 && point.y >= 0.0 && point.y <= bounds.height {
+                return Some(1);
+            }
+        }
         drawing_handles(self, drawing, bounds)
             .iter()
             .enumerate()
@@ -762,6 +983,9 @@ impl KlineChart {
             return frame.into_geometry();
         }
         for drawing in &self.drawings.drawings {
+            if !drawing.visible {
+                continue;
+            }
             draw_one(
                 self,
                 &mut frame,
@@ -781,16 +1005,55 @@ impl KlineChart {
             self.drawings.active_tool,
             self.drawings.visible,
             self.drawings.toolbar_open,
+            self.drawings.drawing_list_open,
+            !self.drawings.drawings.is_empty(),
+            self.chart.bounds.height,
         );
         let mut layers: Vec<Element<'_, Message>> = vec![
             container(toolbar)
-                .padding(8)
+                .padding(
+                    iced::padding::top(self.floating_panel_position(FloatingPanel::Toolbar).y)
+                        .left(self.floating_panel_position(FloatingPanel::Toolbar).x),
+                )
                 .align_x(Alignment::Start)
                 .align_y(Alignment::Start)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
         ];
+        if self.drawings.visible
+            && self.drawings.drawing_list_open
+            && !self.drawings.drawings.is_empty()
+        {
+            layers.push(
+                container(drawing_list(self))
+                    .padding(
+                        iced::padding::top(
+                            self.floating_panel_position(FloatingPanel::DrawingList).y,
+                        )
+                        .left(self.floating_panel_position(FloatingPanel::DrawingList).x),
+                    )
+                    .align_x(Alignment::Start)
+                    .align_y(Alignment::Start)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            );
+        }
+        if self.drawings.dragging_panel.is_some() {
+            layers.push(
+                mouse_area(
+                    container(space::horizontal())
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .on_move(|position| {
+                    Message::Drawing(DrawingMessage::FloatingPanelDragged(position))
+                })
+                .on_release(Message::Drawing(DrawingMessage::FloatingPanelDragEnded))
+                .into(),
+            );
+        }
         if self.drawings.visible && self.drawings.settings_open && self.drawings.selected.is_some()
         {
             layers.push(
@@ -841,6 +1104,9 @@ impl KlineChart {
         let mut x_labels = Vec::new();
         let mut y_labels = Vec::new();
         for drawing in &self.drawings.drawings {
+            if !drawing.visible {
+                continue;
+            }
             match &drawing.geometry {
                 DrawingGeometry::HorizontalLine { price } => {
                     let y = self
@@ -992,6 +1258,42 @@ fn geometry_tool(geometry: &DrawingGeometry) -> DrawingTool {
         DrawingGeometry::FixedRangeVolumeProfile { .. } => DrawingTool::FixedRangeVolumeProfile,
     }
 }
+
+fn drawing_focus_anchor(geometry: &DrawingGeometry) -> Option<DrawingAnchor> {
+    match geometry {
+        DrawingGeometry::HorizontalLine { price } => Some(DrawingAnchor {
+            x: DrawingX::Tick(0),
+            price: *price,
+        }),
+        DrawingGeometry::VerticalLine { x } => Some(DrawingAnchor {
+            x: *x,
+            price: Price::from_units(0),
+        }),
+        DrawingGeometry::TrendLine { first, second }
+        | DrawingGeometry::Rectangle { first, second }
+        | DrawingGeometry::Fibonacci { first, second } => Some(DrawingAnchor {
+            x: midpoint_x(first.x, second.x),
+            price: Price::from_units((first.price.units + second.price.units) / 2),
+        }),
+        DrawingGeometry::Freehand { points } => points.first().copied(),
+        DrawingGeometry::Text { anchor, .. } => Some(*anchor),
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => Some(DrawingAnchor {
+            x: DrawingX::Time(UnixMs::new((first.as_u64() + second.as_u64()) / 2)),
+            price: Price::from_units(0),
+        }),
+    }
+}
+
+fn midpoint_x(first: DrawingX, second: DrawingX) -> DrawingX {
+    match (first, second) {
+        (DrawingX::Time(first), DrawingX::Time(second)) => {
+            DrawingX::Time(UnixMs::new((first.as_u64() + second.as_u64()) / 2))
+        }
+        (DrawingX::Tick(first), DrawingX::Tick(second)) => DrawingX::Tick((first + second) / 2),
+        (first, _) => first,
+    }
+}
+
 fn line(style: &DrawingStyle) -> Stroke<'static> {
     Stroke::with_color(
         Stroke::default().with_width(style.stroke_width),
@@ -1016,6 +1318,77 @@ fn price_label(price: Price, decimals: usize) -> String {
     )
 }
 
+/// Parses prices pasted from common market formats. A single separator followed
+/// by three digits is treated as a thousands separator, so both `63,000` and
+/// `63.000` mean 63000. The final separator is otherwise the decimal mark.
+fn parse_horizontal_line_price(input: &str) -> Option<f64> {
+    let compact = input
+        .trim()
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '\u{a0}' | '_' | '\''))
+        .collect::<String>();
+    let (negative, body) = if let Some(value) = compact.strip_prefix('-') {
+        (true, value)
+    } else if let Some(value) = compact.strip_prefix('+') {
+        (false, value)
+    } else {
+        (false, compact.as_str())
+    };
+    if body.is_empty()
+        || body
+            .chars()
+            .any(|character| !character.is_ascii_digit() && character != '.' && character != ',')
+    {
+        return None;
+    }
+
+    let separators = body
+        .char_indices()
+        .filter(|(_, character)| matches!(character, '.' | ','))
+        .collect::<Vec<_>>();
+    let decimal_position = separators.last().and_then(|(position, _)| {
+        let decimals = body[position + 1..]
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        if decimals == 0 {
+            return None;
+        }
+        let has_both_separator_kinds = separators.iter().any(|(_, character)| *character == '.')
+            && separators.iter().any(|(_, character)| *character == ',');
+        if has_both_separator_kinds || decimals != 3 {
+            Some(*position)
+        } else {
+            None
+        }
+    });
+
+    if !separators.is_empty() && decimal_position.is_none() {
+        let groups = body.split(['.', ',']).collect::<Vec<_>>();
+        if groups.iter().any(|group| group.is_empty())
+            || groups.iter().skip(1).any(|group| group.len() != 3)
+        {
+            return None;
+        }
+    }
+
+    let mut normalized = String::with_capacity(body.len() + usize::from(negative));
+    if negative {
+        normalized.push('-');
+    }
+    for (position, character) in body.char_indices() {
+        if character.is_ascii_digit() {
+            normalized.push(character);
+        } else if Some(position) == decimal_position {
+            normalized.push('.');
+        }
+    }
+    normalized
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 fn x_label(x: DrawingX) -> String {
     match x {
         DrawingX::Time(value) => value
@@ -1023,6 +1396,42 @@ fn x_label(x: DrawingX) -> String {
             .unwrap_or_else(|| value.as_u64().to_string()),
         DrawingX::Tick(value) => value.to_string(),
     }
+}
+
+fn fixed_range_guide_stroke() -> Stroke<'static> {
+    Stroke {
+        line_dash: LineDash {
+            segments: &[6.0, 4.0],
+            offset: 0,
+        },
+        ..Stroke::default()
+            .with_width(1.0)
+            .with_color(Color::from_rgb(0.55, 0.57, 0.60))
+    }
+}
+
+fn draw_fixed_range_volume_profile_guides(
+    frame: &mut Frame,
+    first_x: f32,
+    second_x: f32,
+    bounds: Rectangle,
+    stroke: Stroke<'_>,
+) {
+    frame.stroke(
+        &Path::line(Point::new(first_x, 0.0), Point::new(first_x, bounds.height)),
+        stroke,
+    );
+    frame.stroke(
+        &Path::line(
+            Point::new(second_x, 0.0),
+            Point::new(second_x, bounds.height),
+        ),
+        stroke,
+    );
+    frame.stroke(
+        &Path::line(Point::new(first_x, 8.0), Point::new(second_x, 8.0)),
+        stroke,
+    );
 }
 
 fn draw_one(
@@ -1114,29 +1523,20 @@ fn draw_one(
         DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
             let first_x = chart.volume_profile_screen_x(*first, bounds);
             let second_x = chart.volume_profile_screen_x(*second, bounds);
-            let stroke = Stroke::default()
-                .with_width(1.0)
-                .with_color(color(style.color, style.opacity * 0.55));
-            frame.stroke(
-                &Path::line(Point::new(first_x, 0.0), Point::new(first_x, bounds.height)),
-                stroke.clone(),
-            );
-            frame.stroke(
-                &Path::line(
-                    Point::new(second_x, 0.0),
-                    Point::new(second_x, bounds.height),
-                ),
-                stroke.clone(),
-            );
-            frame.stroke(
-                &Path::line(Point::new(first_x, 8.0), Point::new(second_x, 8.0)),
-                stroke,
-            );
-            if chart.fixed_volume_profile_loading(*first, *second) {
+            if selected {
+                draw_fixed_range_volume_profile_guides(
+                    frame,
+                    first_x,
+                    second_x,
+                    bounds,
+                    fixed_range_guide_stroke(),
+                );
+            }
+            if selected && chart.fixed_volume_profile_loading(*first, *second) {
                 frame.fill_text(canvas::Text {
                     content: "Loading VP…".to_string(),
                     position: Point::new(first_x.min(second_x) + 3.0, 20.0),
-                    color: color(style.color, style.opacity),
+                    color: Color::from_rgb(0.66, 0.68, 0.71),
                     size: iced::Pixels(10.0),
                     ..Default::default()
                 });
@@ -1169,6 +1569,19 @@ fn draw_draft(
             first,
             preview,
         } => {
+            if *tool == DrawingTool::FixedRangeVolumeProfile {
+                let (DrawingX::Time(first), DrawingX::Time(second)) = (first.x, preview.x) else {
+                    return;
+                };
+                draw_fixed_range_volume_profile_guides(
+                    frame,
+                    chart.volume_profile_screen_x(first, bounds),
+                    chart.volume_profile_screen_x(second, bounds),
+                    bounds,
+                    fixed_range_guide_stroke(),
+                );
+                return;
+            }
             let geometry = match tool {
                 DrawingTool::Rectangle => DrawingGeometry::Rectangle {
                     first: *first,
@@ -1178,13 +1591,6 @@ fn draw_draft(
                     first: *first,
                     second: *preview,
                 },
-                DrawingTool::FixedRangeVolumeProfile => {
-                    let (DrawingX::Time(first), DrawingX::Time(second)) = (first.x, preview.x)
-                    else {
-                        return;
-                    };
-                    DrawingGeometry::FixedRangeVolumeProfile { first, second }
-                }
                 _ => DrawingGeometry::TrendLine {
                     first: *first,
                     second: *preview,
@@ -1197,6 +1603,7 @@ fn draw_draft(
                     id: 0,
                     geometry,
                     style,
+                    visible: true,
                 },
                 bounds,
                 false,
@@ -1211,6 +1618,7 @@ fn draw_draft(
                     points: points.clone(),
                 },
                 style,
+                visible: true,
             },
             bounds,
             false,
@@ -1225,6 +1633,7 @@ fn draw_draft(
                     content: value.clone(),
                 },
                 style,
+                visible: true,
             },
             bounds,
             false,
@@ -1401,13 +1810,15 @@ fn hit_test(chart: &KlineChart, drawing: &Drawing, point: Point, bounds: Rectang
             ) <= T
         }),
         DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
-            let left = chart
-                .volume_profile_screen_x(*first, bounds)
-                .min(chart.volume_profile_screen_x(*second, bounds));
-            let right = chart
-                .volume_profile_screen_x(*first, bounds)
-                .max(chart.volume_profile_screen_x(*second, bounds));
-            point.x >= left - T && point.x <= right + T && point.y <= 24.0
+            let first_x = chart.volume_profile_screen_x(*first, bounds);
+            let second_x = chart.volume_profile_screen_x(*second, bounds);
+            // The dashed range boundaries are the handles. They must be
+            // interactive for their full height, not just at the top bar.
+            (point.x - first_x).abs() <= T
+                || (point.x - second_x).abs() <= T
+                || (point.y <= 24.0
+                    && point.x >= first_x.min(second_x) - T
+                    && point.x <= first_x.max(second_x) + T)
         }
     }
 }
@@ -1560,7 +1971,14 @@ fn resize_geometry(
     }
 }
 
-fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, Message> {
+fn toolbar(
+    active: DrawingTool,
+    visible: bool,
+    open: bool,
+    drawing_list_open: bool,
+    has_drawings: bool,
+    max_height: f32,
+) -> Element<'static, Message> {
     let tools = [
         (DrawingTool::Select, "drawing-select.svg", "Select"),
         (DrawingTool::Pen, "drawing-pen.svg", "Pen"),
@@ -1594,6 +2012,46 @@ fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, M
     } else {
         include_bytes!("../../../assets/ui/drawing-toolbar-expand.svg") as &'static [u8]
     };
+    items = items.push(drag_handle::drag_handle(
+        container(
+            svg(svg::Handle::from_memory(include_bytes!(
+                "../../../assets/ui/drawing-drag-handle.svg"
+            )))
+            .width(16)
+            .height(16)
+            .style(|theme: &Theme, _| svg::Style {
+                color: Some(theme.palette().text),
+            }),
+        )
+        .width(28)
+        .height(20)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center),
+        |position| Message::Drawing(DrawingMessage::ToolbarDragStarted(position)),
+        |position| Message::Drawing(DrawingMessage::ToolbarDragged(position)),
+        Message::Drawing(DrawingMessage::ToolbarDragEnded),
+    ));
+    if has_drawings {
+        items = items.push(
+            button(
+                svg(svg::Handle::from_memory(include_bytes!(
+                    "../../../assets/ui/drawing-list.svg"
+                )))
+                .width(16)
+                .height(16)
+                .style(|theme: &Theme, _| svg::Style {
+                    color: Some(theme.palette().text),
+                }),
+            )
+            .width(28)
+            .height(28)
+            .padding(5)
+            .on_press(Message::Drawing(DrawingMessage::ToggleDrawingList))
+            .style(move |theme, status| {
+                crate::style::button::transparent(theme, status, drawing_list_open)
+            }),
+        );
+    }
     items = items.push(
         button(
             svg(svg::Handle::from_memory(arrow))
@@ -1610,10 +2068,14 @@ fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, M
         .style(|theme, status| crate::style::button::transparent(theme, status, false)),
     );
     if !open {
-        return container(items)
-            .padding(3)
-            .style(crate::style::chart_modal)
-            .into();
+        return container(
+            scrollable(container(items).padding(iced::padding::right(10))).height(Length::Fixed(
+                toolbar_panel_height(false, has_drawings).min(max_height),
+            )),
+        )
+        .padding(3)
+        .style(crate::style::chart_modal)
+        .into();
     }
     for (tool, asset, _label) in tools {
         let bytes: &'static [u8] = match asset {
@@ -1687,10 +2149,180 @@ fn toolbar(active: DrawingTool, visible: bool, open: bool) -> Element<'static, M
         .on_press(Message::Drawing(DrawingMessage::ClearAllDrawings))
         .style(|theme, status| crate::style::button::transparent(theme, status, false)),
     );
-    container(items)
-        .padding(3)
-        .style(crate::style::chart_modal)
-        .into()
+    container(
+        scrollable(container(items).padding(iced::padding::right(10))).height(Length::Fixed(
+            toolbar_panel_height(true, has_drawings).min(max_height),
+        )),
+    )
+    .padding(3)
+    .style(crate::style::chart_modal)
+    .into()
+}
+
+fn toolbar_panel_height(open: bool, has_drawings: bool) -> f32 {
+    let buttons = if open { 12 } else { 1 } + usize::from(has_drawings);
+    let items = buttons + 1; // drag handle
+    20.0 + buttons as f32 * 28.0 + (items.saturating_sub(1) as f32) * 2.0 + 6.0
+}
+
+fn drawing_list(chart: &KlineChart) -> Element<'_, Message> {
+    let header = drag_handle::drag_handle(
+        container(
+            row![
+                svg(svg::Handle::from_memory(include_bytes!(
+                    "../../../assets/ui/drawing-drag-handle.svg"
+                )))
+                .width(14)
+                .height(14),
+                text("Drawings list")
+                    .size(13)
+                    .color(Color::from_rgb(0.68, 0.70, 0.73)),
+            ]
+            .spacing(5),
+        )
+        .width(Length::Fill)
+        .padding(5),
+        |position| Message::Drawing(DrawingMessage::DrawingListDragStarted(position)),
+        |position| Message::Drawing(DrawingMessage::DrawingListDragged(position)),
+        Message::Drawing(DrawingMessage::DrawingListDragEnded),
+    );
+
+    let mut items = column![].spacing(3);
+    for drawing in &chart.drawings.drawings {
+        let title = drawing_name(&drawing.geometry);
+        let position = drawing_position(drawing, chart.tick_size().decimal_places());
+        let focus = button(
+            text(ellipsize(&format!("{title} - {position}"), 24))
+                .size(11)
+                .color(Color::from_rgb(0.62, 0.64, 0.67)),
+        )
+        .padding(4)
+        .width(Length::Fill)
+        .on_press(Message::Drawing(DrawingMessage::FocusDrawing(drawing.id)))
+        .style(|theme, status| crate::style::button::transparent(theme, status, false));
+        let action_icon = |bytes: &'static [u8], message| {
+            button(
+                svg(svg::Handle::from_memory(bytes))
+                    .width(14)
+                    .height(14)
+                    .style(|_: &Theme, _| svg::Style {
+                        color: Some(Color::from_rgb(0.58, 0.60, 0.63)),
+                    }),
+            )
+            .width(24)
+            .height(24)
+            .padding(4)
+            .on_press(Message::Drawing(message))
+            .style(|theme, status| crate::style::button::transparent(theme, status, false))
+        };
+        items = items.push(
+            container(
+                row![
+                    focus,
+                    action_icon(
+                        include_bytes!("../../../assets/ui/drawing-settings.svg"),
+                        DrawingMessage::OpenDrawingSettings(drawing.id),
+                    ),
+                    action_icon(
+                        if drawing.visible {
+                            include_bytes!("../../../assets/ui/drawing-eye.svg")
+                        } else {
+                            include_bytes!("../../../assets/ui/drawing-eye-off.svg")
+                        },
+                        DrawingMessage::ToggleDrawingVisibility(drawing.id),
+                    ),
+                    container(action_icon(
+                        include_bytes!("../../../assets/ui/drawing-trash.svg"),
+                        DrawingMessage::DeleteDrawing(drawing.id),
+                    ))
+                    .padding(iced::padding::right(10)),
+                ]
+                .spacing(2),
+            )
+            .padding(2)
+            .style(crate::style::chart_modal),
+        );
+    }
+    container(
+        column![
+            header,
+            scrollable(items).height(Length::Fixed(
+                (chart.drawings.drawings.len() as f32 * 30.0).clamp(30.0, 240.0),
+            )),
+        ]
+        .spacing(3),
+    )
+    .padding(4)
+    .width(280)
+    .style(crate::style::chart_modal)
+    .into()
+}
+
+fn drawing_name(geometry: &DrawingGeometry) -> &'static str {
+    match geometry {
+        DrawingGeometry::Freehand { .. } => "Pen",
+        DrawingGeometry::HorizontalLine { .. } => "Horizontal line",
+        DrawingGeometry::VerticalLine { .. } => "Vertical line",
+        DrawingGeometry::Rectangle { .. } => "Rectangle",
+        DrawingGeometry::Fibonacci { .. } => "Fibonacci",
+        DrawingGeometry::TrendLine { .. } => "Trend line",
+        DrawingGeometry::Text { .. } => "Text",
+        DrawingGeometry::FixedRangeVolumeProfile { .. } => "Fixed Range VP",
+    }
+}
+
+fn drawing_position(drawing: &Drawing, decimals: usize) -> String {
+    match &drawing.geometry {
+        DrawingGeometry::HorizontalLine { price } => price_label(*price, decimals),
+        DrawingGeometry::VerticalLine { x } => x_label(*x),
+        DrawingGeometry::Rectangle { first, second }
+        | DrawingGeometry::Fibonacci { first, second }
+        | DrawingGeometry::TrendLine { first, second } => format!(
+            "{} @ {} → {} @ {}",
+            x_label(first.x),
+            price_label(first.price, decimals),
+            x_label(second.x),
+            price_label(second.price, decimals),
+        ),
+        DrawingGeometry::Freehand { points } => points
+            .first()
+            .map(|point| {
+                format!(
+                    "{} @ {}",
+                    x_label(point.x),
+                    price_label(point.price, decimals)
+                )
+            })
+            .unwrap_or_else(|| "Empty".to_string()),
+        DrawingGeometry::Text { anchor, .. } => {
+            format!(
+                "{} @ {}",
+                x_label(anchor.x),
+                price_label(anchor.price, decimals)
+            )
+        }
+        DrawingGeometry::FixedRangeVolumeProfile { first, second } => {
+            format!(
+                "{} → {}",
+                x_label(DrawingX::Time(*first)),
+                x_label(DrawingX::Time(*second))
+            )
+        }
+    }
+}
+
+fn ellipsize(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        format!(
+            "{}...",
+            value
+                .chars()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
 }
 
 fn settings(chart: &KlineChart) -> Element<'_, Message> {
@@ -1743,6 +2375,24 @@ fn settings(chart: &KlineChart) -> Element<'_, Message> {
     .spacing(6);
 
     match &drawing.geometry {
+        DrawingGeometry::HorizontalLine { .. } => {
+            let input = chart
+                .drawings
+                .horizontal_line_price_input
+                .as_deref()
+                .unwrap_or_default();
+            controls = controls.push(text("Price")).push(
+                text_input("e.g. 63,000", input)
+                    .on_input(|value| {
+                        Message::Drawing(DrawingMessage::HorizontalLinePriceChanged(value))
+                    })
+                    .on_submit(Message::Drawing(DrawingMessage::CommitHorizontalLinePrice)),
+            );
+            controls = controls.push(
+                button(text("Apply price"))
+                    .on_press(Message::Drawing(DrawingMessage::CommitHorizontalLinePrice)),
+            );
+        }
         DrawingGeometry::Rectangle { .. } => {
             controls = controls
                 .push(text(format!(
@@ -1899,4 +2549,27 @@ fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message
     .max_width(240)
     .style(crate::style::chart_modal)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drawing_canvas_center, parse_horizontal_line_price};
+    use iced::{Point, Rectangle, Size};
+
+    #[test]
+    fn drawing_center_uses_canvas_local_coordinates() {
+        let bounds = Rectangle::new(Point::new(240.0, 90.0), Size::new(800.0, 500.0));
+
+        assert_eq!(drawing_canvas_center(bounds), Point::new(400.0, 250.0));
+    }
+
+    #[test]
+    fn horizontal_line_price_parser_accepts_grouped_separators() {
+        for input in ["63,000", "63.000"] {
+            assert_eq!(parse_horizontal_line_price(input), Some(63_000.0));
+        }
+        for input in ["63,000.5", "63.000,5"] {
+            assert_eq!(parse_horizontal_line_price(input), Some(63_000.5));
+        }
+    }
 }

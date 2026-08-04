@@ -191,6 +191,8 @@ pub mod drawing {
         pub geometry: DrawingGeometry,
         #[serde(default)]
         pub style: DrawingStyle,
+        #[serde(default = "default_true")]
+        pub visible: bool,
     }
 }
 
