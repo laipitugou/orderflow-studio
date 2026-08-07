@@ -7,6 +7,7 @@ use iced::{
 fn label(kind: ContentKind) -> &'static str {
     match kind {
         ContentKind::CandlestickChart => "Candlestick",
+        ContentKind::OrderflowComparison => "OI + Dual CVD",
         ContentKind::FootprintChart => "Footprint",
         ContentKind::ShaderHeatmap => "Heatmap",
         ContentKind::Ladder => "DOM / Ladder",
@@ -20,6 +21,7 @@ fn label(kind: ContentKind) -> &'static str {
 fn description(kind: ContentKind) -> &'static str {
     match kind {
         ContentKind::CandlestickChart => "Price candles over time",
+        ContentKind::OrderflowComparison => "OI, perpetual CVD, spot CVD",
         ContentKind::FootprintChart => "Order flow per candle",
         ContentKind::ShaderHeatmap => "Order book liquidity",
         ContentKind::Ladder => "Live depth ladder",

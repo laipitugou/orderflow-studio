@@ -221,6 +221,7 @@ pub enum ContentKind {
     ShaderHeatmap,
     FootprintChart,
     CandlestickChart,
+    OrderflowComparison,
     ComparisonChart,
     GexChart,
     TimeAndSales,
@@ -228,19 +229,21 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 9] = [
+    pub const ALL: [ContentKind; 10] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
         ContentKind::CandlestickChart,
+        ContentKind::OrderflowComparison,
         ContentKind::ComparisonChart,
         ContentKind::GexChart,
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
     ];
 
-    pub const ADDABLE: [ContentKind; 7] = [
+    pub const ADDABLE: [ContentKind; 8] = [
+        ContentKind::OrderflowComparison,
         ContentKind::CandlestickChart,
         ContentKind::FootprintChart,
         ContentKind::ShaderHeatmap,
@@ -259,6 +262,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::ShaderHeatmap => "Heatmap Chart",
             ContentKind::FootprintChart => "Footprint Chart",
             ContentKind::CandlestickChart => "Candlestick Chart",
+            ContentKind::OrderflowComparison => "OI + Dual CVD",
             ContentKind::ComparisonChart => "Comparison Chart",
             ContentKind::GexChart => "GEX Options Chart",
             ContentKind::TimeAndSales => "Time&Sales",
@@ -317,7 +321,9 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M5)
                     }))
                 }
-                ContentKind::CandlestickChart | ContentKind::ComparisonChart => {
+                ContentKind::CandlestickChart
+                | ContentKind::OrderflowComparison
+                | ContentKind::ComparisonChart => {
                     let current = current_basis.and_then(|b| match b {
                         Basis::Time(tf) if exchange.supports_kline_timeframe(tf) => Some(b),
                         _ => None,
@@ -347,6 +353,7 @@ impl PaneSetup {
                 Some(current_tick_multiplier.unwrap_or(TickMultiplier(50)))
             }
             ContentKind::CandlestickChart
+            | ContentKind::OrderflowComparison
             | ContentKind::ComparisonChart
             | ContentKind::GexChart
             | ContentKind::TimeAndSales

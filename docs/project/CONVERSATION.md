@@ -18,6 +18,11 @@ absorption clusters as the first anomaly features to implement. The agreed
 noise controls are adaptive percentiles, minimum quote notional, proximity to
 the market, persistence for additions, and time-separated absorption retests.
 
+The user explicitly rejected treating indicators inside a normal price chart as
+the requested standalone comparison window. The dedicated view must omit the
+price canvas, stack OI candles, perpetual composite CVD, and spot composite CVD,
+and be able to open and persist as its own native Windows tool window.
+
 ## 2026-08-06 — Initial request
 
 The user trades cryptocurrency and uses FlowSurface order-flow data. They asked

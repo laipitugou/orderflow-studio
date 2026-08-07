@@ -479,7 +479,7 @@ impl State {
 
                     (content, streams)
                 }
-                ContentKind::CandlestickChart => {
+                ContentKind::CandlestickChart | ContentKind::OrderflowComparison => {
                     let content = {
                         let base_ticker = tickers[0];
                         Content::new_kline(
@@ -877,6 +877,11 @@ impl State {
         tickers_table: &'a TickersTable,
         allow_native_popout: bool,
     ) -> pane_grid::Content<'a, Message, Theme, Renderer> {
+        // The dedicated comparison workspace is intentionally allowed to open
+        // as a native Windows tool window. It contains no GPU heatmap and avoids
+        // the multi-window redraw path that required the general restriction.
+        let allow_native_popout =
+            allow_native_popout || self.content.kind() == ContentKind::OrderflowComparison;
         let mut top_left_buttons = if Content::Starter == self.content {
             row![]
         } else {
@@ -2156,7 +2161,9 @@ impl State {
                 tooltip_pos,
                 control_btn_style(is_popout),
             ));
-        } else if total_panes > 1 && allow_native_popout {
+        } else if (total_panes > 1 || self.content.kind() == ContentKind::OrderflowComparison)
+            && allow_native_popout
+        {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Popout, 12),
                 Message::Popout,
@@ -2695,13 +2702,20 @@ impl Content {
                         studies: vec![],
                     }),
             ),
-            ContentKind::CandlestickChart => (Timeframe::M15, data::chart::KlineChartKind::Candles),
+            ContentKind::CandlestickChart | ContentKind::OrderflowComparison => {
+                (Timeframe::M15, data::chart::KlineChartKind::Candles)
+            }
             _ => unreachable!("invalid content kind for kline chart"),
         };
 
         let basis = settings.selected_basis.unwrap_or(Basis::Time(default_tf));
 
-        let enabled_indicators = {
+        let enabled_indicators = if content_kind == ContentKind::OrderflowComparison {
+            vec![
+                KlineIndicator::OpenInterest,
+                KlineIndicator::CumulativeDelta,
+            ]
+        } else {
             let available = KlineIndicator::for_market(ticker_info.market_type());
             prev_indis.map_or_else(
                 || vec![KlineIndicator::Volume],
@@ -2716,7 +2730,9 @@ impl Content {
             )
         };
 
-        let splits = {
+        let splits = if content_kind == ContentKind::OrderflowComparison {
+            vec![1.0 / 3.0]
+        } else {
             let main_chart_split: f32 = 0.8;
             let mut splits_vec = vec![main_chart_split];
 
@@ -2744,7 +2760,14 @@ impl Content {
                 splits,
                 autoscale: Some(data::chart::Autoscale::FitToVisible),
             });
-        let visual_config = settings.visual_config.as_ref().and_then(|cfg| cfg.kline());
+        let mut visual_config = settings.visual_config.as_ref().and_then(|cfg| cfg.kline());
+        if content_kind == ContentKind::OrderflowComparison {
+            let mut config = visual_config.unwrap_or_default();
+            config.comparison_workspace = true;
+            config.cvd.source_mode =
+                data::orderflow::cvd_aggregation::CvdSourceMode::CompositeSpotAndPerpetual;
+            visual_config = Some(config);
+        }
 
         let mut chart = KlineChart::new(
             layout.clone(),
@@ -2779,6 +2802,19 @@ impl Content {
                 kind: data::chart::KlineChartKind::Candles,
                 layout: ViewConfig {
                     splits: vec![],
+                    autoscale: Some(data::chart::Autoscale::FitToVisible),
+                },
+                drawings: vec![],
+            },
+            ContentKind::OrderflowComparison => Content::Kline {
+                chart: None,
+                indicators: vec![
+                    KlineIndicator::OpenInterest,
+                    KlineIndicator::CumulativeDelta,
+                ],
+                kind: data::chart::KlineChartKind::Candles,
+                layout: ViewConfig {
+                    splits: vec![1.0 / 3.0],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
                 drawings: vec![],
@@ -3043,9 +3079,18 @@ impl Content {
     pub fn kind(&self) -> ContentKind {
         match self {
             Content::Heatmap { .. } => ContentKind::HeatmapChart,
-            Content::Kline { kind, .. } => match kind {
+            Content::Kline { chart, kind, .. } => match kind {
                 data::chart::KlineChartKind::Footprint { .. } => ContentKind::FootprintChart,
-                data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                data::chart::KlineChartKind::Candles => {
+                    if chart
+                        .as_ref()
+                        .is_some_and(|chart| chart.visual_config().comparison_workspace)
+                    {
+                        ContentKind::OrderflowComparison
+                    } else {
+                        ContentKind::CandlestickChart
+                    }
+                }
             },
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,

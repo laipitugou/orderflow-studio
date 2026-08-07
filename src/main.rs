@@ -2324,6 +2324,18 @@ impl Flowsurface {
         if self.debug_terminal_window == Some(_window) {
             return "Orderflow Studio Debug Terminal".to_string();
         }
+        if self
+            .active_dashboard()
+            .popout
+            .get(&_window)
+            .is_some_and(|(panes, _)| {
+                panes.iter().any(|(_, state)| {
+                    state.content.kind() == data::layout::pane::ContentKind::OrderflowComparison
+                })
+            })
+        {
+            return "Orderflow Studio — OI + Dual CVD".to_string();
+        }
 
         if let Some(id) = self.layout_manager.active_layout_id() {
             format!("Orderflow Studio [{}]", id.name)
@@ -2696,9 +2708,6 @@ impl Flowsurface {
     }
 
     fn open_startup_popouts(&mut self) -> Task<Message> {
-        if !self.windowing_mode.allows_native_popout() {
-            return Task::none();
-        }
         let Some(layout_id) = self.layout_manager.active_layout_id().map(|id| id.unique) else {
             return Task::none();
         };

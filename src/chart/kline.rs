@@ -143,6 +143,10 @@ impl Chart for KlineChart {
         &self.chart
     }
 
+    fn show_main_chart(&self) -> bool {
+        !self.visual_config.comparison_workspace
+    }
+
     fn mut_state(&mut self) -> &mut ViewState {
         &mut self.chart
     }

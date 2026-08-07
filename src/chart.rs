@@ -117,6 +117,10 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
 
     fn view_indicators(&'_ self, enabled: &[Self::IndicatorKind]) -> Vec<Element<'_, Message>>;
 
+    fn show_main_chart(&self) -> bool {
+        true
+    }
+
     fn visible_timerange(&self) -> Option<(u64, u64)>;
 
     fn interval_keys(&self) -> Option<Vec<u64>>;
@@ -647,6 +651,11 @@ pub fn view<'a, T: Chart>(
 
         if indicators.is_empty() {
             main_chart
+        } else if !chart.show_main_chart() {
+            MultiSplit::new(indicators, &state.layout.splits, |index, position| {
+                Message::SplitDragged(index, position)
+            })
+            .into()
         } else {
             let panels = std::iter::once(main_chart)
                 .chain(indicators)

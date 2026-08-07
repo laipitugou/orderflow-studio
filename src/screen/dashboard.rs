@@ -654,14 +654,28 @@ impl Dashboard {
                 Task::none()
             }
         } else {
-            // In embedded mode, merge popout panes back into the main pane grid
+            // In embedded mode, keep the lightweight order-flow comparison
+            // workspace native; merge GPU/general panes that are subject to the
+            // Windows redraw workaround.
             log::info!(
                 "WINDOW NativePopoutBlocked | pane=load_layout reason={reason}",
                 reason = windowing_mode.reason()
             );
-            for (_, (pane_state, _)) in keys_to_remove
+            let merge_ids = keys_to_remove
                 .iter()
-                .filter_map(|(id, _)| self.popout.remove(id).map(|ps| (*id, ps)))
+                .filter(|(id, _)| {
+                    self.popout.get(id).is_some_and(|(panes, _)| {
+                        !panes.iter().all(|(_, state)| {
+                            state.content.kind()
+                                == data::layout::pane::ContentKind::OrderflowComparison
+                        })
+                    })
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for (_, (pane_state, _)) in merge_ids
+                .into_iter()
+                .filter_map(|id| self.popout.remove(&id).map(|ps| (id, ps)))
             {
                 // Merge each popout pane into the main grid
                 for (_, state) in pane_state.panes {
@@ -672,7 +686,11 @@ impl Dashboard {
                     );
                 }
             }
-            Task::none()
+            if open_native_popouts {
+                self.open_popout_windows()
+            } else {
+                Task::none()
+            }
         };
 
         self.reconcile_gex_liquidity_references(main_window);
@@ -1164,7 +1182,13 @@ impl Dashboard {
         main_window: &Window,
         windowing_mode: WindowingMode,
     ) -> Task<Message> {
-        if !windowing_mode.allows_native_popout() {
+        let focused_is_orderflow_comparison = self.focus.is_some_and(|(window, pane)| {
+            self.get_pane(main_window.id, window, pane)
+                .is_some_and(|state| {
+                    state.content.kind() == data::layout::pane::ContentKind::OrderflowComparison
+                })
+        });
+        if !windowing_mode.allows_native_popout() && !focused_is_orderflow_comparison {
             log::info!(
                 "WINDOW NativePopoutBlocked | reason={reason}",
                 reason = windowing_mode.reason()

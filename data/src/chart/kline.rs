@@ -796,6 +796,8 @@ impl std::fmt::Display for ClusterKind {
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Hide the price canvas and dedicate the pane to OI + dual composite CVD.
+    pub comparison_workspace: bool,
     // Whether to show last value labels on top right/left when not hovering
     // e.g. OHLC/bar change values for the main chart, or last value of an indicator series
     pub data_labels_always_visible: bool,
@@ -821,6 +823,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            comparison_workspace: false,
             data_labels_always_visible: false,
             show_footprint_summary: false,
             show_footprint_table_candle: true,

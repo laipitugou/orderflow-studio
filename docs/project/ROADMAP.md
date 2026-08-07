@@ -19,7 +19,8 @@
 - [x] Implement a pure event-time Time-at-Price accumulator with disconnect caps.
 - [ ] Render dwell heatmap/profile and visit statistics.
 - [ ] Implement developing, composite, time, delta, naked, and confluence POCs.
-- [ ] Add OI delta and synchronized spot/perpetual/OI context panels.
+- [x] Add a detachable OI-candle, perpetual-CVD, spot-CVD comparison workspace.
+- [ ] Add OI delta and divergence annotations to the synchronized context panels.
 
 ## Phase 3 — Explainable event framework
 
