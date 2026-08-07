@@ -25,16 +25,19 @@ pub enum CvdSourceMode {
     CompositeSpot,
     /// Combine enabled perpetual venues for the matching base asset.
     CompositePerpetual,
+    /// Show perpetual and spot composites simultaneously as two aligned panels.
+    CompositeSpotAndPerpetual,
     /// Use a separately persisted list of source instruments.
     Custom,
 }
 
 impl CvdSourceMode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Chart,
         Self::MatchingSpot,
         Self::CompositeSpot,
         Self::CompositePerpetual,
+        Self::CompositeSpotAndPerpetual,
         Self::Custom,
     ];
 }
@@ -46,6 +49,7 @@ impl std::fmt::Display for CvdSourceMode {
             Self::MatchingSpot => "Matching spot",
             Self::CompositeSpot => "Composite spot",
             Self::CompositePerpetual => "Composite perpetual",
+            Self::CompositeSpotAndPerpetual => "Perpetual + spot composites",
             Self::Custom => "Custom sources",
         })
     }

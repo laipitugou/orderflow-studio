@@ -4,6 +4,15 @@ This file preserves the product context needed to continue the project from a
 different Codex client. It is a faithful structured record rather than an
 export of hidden system/tool messages.
 
+## 2026-08-07 — Comparison workspace and resilient offline behavior
+
+The user clarified that spot and perpetual composite CVD must be visible at the
+same time, aligned like CoinAnk for divergence analysis. A detachable order-flow
+workspace should stack OI candles, perpetual CVD, and spot CVD. The user also
+requested that exchange disconnects preserve access to cached charts instead of
+blocking the application, plus large resting-order/add/cancel alerts, repeated
+absorption annotations, and POC-rejection markers on the bubble/heatmap view.
+
 ## 2026-08-06 — Initial request
 
 The user trades cryptocurrency and uses FlowSurface order-flow data. They asked
@@ -82,4 +91,3 @@ source tree under GPL-3.0-or-later, with Flowdepth retained as the `upstream` Gi
 remote. The first implementation slice is the normalized multi-source CVD core,
 followed by source selection, streaming integration, chart presentation, and
 coverage diagnostics.
-

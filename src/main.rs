@@ -35,7 +35,7 @@ use widget::{
 };
 
 use iced::{
-    Alignment, Element, Length, Subscription, Task, Theme, keyboard, padding,
+    Alignment, Element, Length, Subscription, Task, keyboard, padding,
     widget::{
         button, column, container, pick_list, progress_bar, row, scrollable, text, text_input,
         tooltip::Position as TooltipPosition,
@@ -324,7 +324,6 @@ enum Message {
     StartupContinueWithDefault,
     StartupExitWithoutOverwrite,
     StartupWarningNoop,
-    ConnectionOverlayNoop,
     ToggleDialogModal(Option<screen::ConfirmDialog<Message>>),
     ThemeEditor(modal::theme_editor::Message),
     NetworkEditor(modal::network_editor::Message),
@@ -1500,7 +1499,6 @@ impl Flowsurface {
                 return iced::exit();
             }
             Message::StartupWarningNoop => {}
-            Message::ConnectionOverlayNoop => {}
             Message::SetTimezone(tz) => {
                 self.timezone = tz;
             }
@@ -2264,58 +2262,10 @@ impl Flowsurface {
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        if self.market_connectivity.overlay_visible() {
-            main_dialog_modal(
-                content,
-                self.connection_lost_modal(),
-                Message::ConnectionOverlayNoop,
-            )
-        } else {
-            content
-        }
-    }
-
-    fn connection_lost_modal(&self) -> Element<'_, Message> {
-        let connected = self.market_connectivity.connected_count();
-        let expected = self.market_connectivity.expected_count();
-
-        let status_icon = container(text("!").size(36))
-            .width(Length::Fixed(64.0))
-            .height(Length::Fixed(64.0))
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .style(|theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    text_color: Some(palette.danger.base.color),
-                    background: Some(palette.danger.weak.color.into()),
-                    ..container::Style::default()
-                }
-            });
-
-        container(
-            column![
-                status_icon,
-                text("No connection").size(crate::style::text_size::TITLE),
-                text("Market data is temporarily unavailable. Charts are paused to prevent incomplete or misleading updates.")
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill),
-                text(format!(
-                    "Reconnecting automatically… ({connected}/{expected} streams restored)"
-                ))
-                .size(crate::style::text_size::BODY),
-                text("As soon as the connection is restored, missing trades and candles will be fetched and the charts will resume.")
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill),
-            ]
-            .spacing(14)
-            .align_x(Alignment::Center)
-            .width(Length::Fill),
-        )
-        .width(Length::Fixed(480.0))
-        .padding(28)
-        .style(style::dashboard_modal)
-        .into()
+        // Keep cached charts and all local interactions usable while exchange
+        // streams reconnect. The sidebar continues to show Offline/Partial
+        // state and the reconnect/backfill machinery remains active.
+        content
     }
 
     fn startup_warning_modal(&self) -> Element<'_, Message> {

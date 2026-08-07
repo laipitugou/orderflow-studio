@@ -91,6 +91,7 @@ impl<V, T> LinePlot<V, T> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn interpolation(mut self, interpolation: LineInterpolation) -> Self {
         self.interpolation = interpolation;
         self

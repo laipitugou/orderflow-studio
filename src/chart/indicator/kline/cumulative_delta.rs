@@ -22,7 +22,7 @@ use data::orderflow::cvd_aggregation::{CvdAggregationUnit, CvdSourceMode, normal
 use data::util::format_with_commas;
 use exchange::{Kline, TickerInfo, Trade, Volume, unit::Qty};
 
-use iced::widget::{center, text};
+use iced::widget::{center, column, text};
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -179,6 +179,7 @@ fn cumulative_point(open: Qty, volume: DirectionalVolume) -> CumulativeDeltaPoin
 
 pub struct CumulativeDeltaIndicator {
     cache: Caches,
+    spot_cache: Caches,
     /// Per-bucket delta. Stored separately so inserting/replacing older klines can
     /// rebuild the cumulative line without needing the full chart source.
     delta: BasisSeries<DirectionalVolume>,
@@ -187,17 +188,22 @@ pub struct CumulativeDeltaIndicator {
     config: CvdConfig,
     /// Directional volume received from indicator-only multi-venue streams.
     composite_delta: BTreeMap<exchange::UnixMs, DirectionalVolume>,
+    composite_spot_delta: BTreeMap<exchange::UnixMs, DirectionalVolume>,
+    spot_data: BasisSeries<CumulativeDeltaPoint>,
 }
 
 impl CumulativeDeltaIndicator {
     pub fn new() -> Self {
         Self {
             cache: Caches::default(),
+            spot_cache: Caches::default(),
             delta: BasisSeries::default(),
             data: BasisSeries::default(),
             availability: IndicatorAvailability::Unknown,
             config: CvdConfig::default(),
             composite_delta: BTreeMap::new(),
+            composite_spot_delta: BTreeMap::new(),
+            spot_data: BasisSeries::default(),
         }
     }
 
@@ -211,6 +217,46 @@ impl CumulativeDeltaIndicator {
             return center(text(message)).into();
         }
 
+        if self.config.source_mode == CvdSourceMode::CompositeSpotAndPerpetual {
+            return column![
+                text("Perpetual composite CVD").size(crate::style::text_size::TINY),
+                self.plot_elem(
+                    main_chart,
+                    &self.cache,
+                    &self.data,
+                    data_labels_always_visible,
+                    visible_range.clone(),
+                ),
+                text("Spot composite CVD").size(crate::style::text_size::TINY),
+                self.plot_elem(
+                    main_chart,
+                    &self.spot_cache,
+                    &self.spot_data,
+                    data_labels_always_visible,
+                    visible_range,
+                ),
+            ]
+            .spacing(4)
+            .into();
+        }
+
+        self.plot_elem(
+            main_chart,
+            &self.cache,
+            &self.data,
+            data_labels_always_visible,
+            visible_range,
+        )
+    }
+
+    fn plot_elem<'a>(
+        &'a self,
+        main_chart: &'a ViewState,
+        cache: &'a Caches,
+        data: &'a BasisSeries<CumulativeDeltaPoint>,
+        data_labels_always_visible: bool,
+        visible_range: RangeInclusive<u64>,
+    ) -> iced::Element<'a, Message> {
         let invalid_message = "CVD directional trade history is incomplete";
 
         match self.config.render_style {
@@ -226,10 +272,10 @@ impl CumulativeDeltaIndicator {
                         .with_tooltip(cvd_tooltip);
                 indicator_row(
                     main_chart,
-                    &self.cache,
+                    cache,
                     data_labels_always_visible,
                     plot,
-                    self.data.as_plot_series(),
+                    data.as_plot_series(),
                     visible_range,
                 )
             }
@@ -243,10 +289,10 @@ impl CumulativeDeltaIndicator {
                     .with_tooltip(cvd_tooltip);
                 indicator_row(
                     main_chart,
-                    &self.cache,
+                    cache,
                     data_labels_always_visible,
                     plot,
-                    self.data.as_plot_series(),
+                    data.as_plot_series(),
                     visible_range,
                 )
             }
@@ -304,6 +350,18 @@ impl CumulativeDeltaIndicator {
         self.clear_all_caches();
     }
 
+    fn rebuild_spot_cumulative(&mut self) {
+        let previous_delta = std::mem::replace(
+            &mut self.delta,
+            BasisSeries::Time(self.composite_spot_delta.clone()),
+        );
+        let previous_data = std::mem::take(&mut self.data);
+        self.rebuild_cumulative();
+        self.spot_data = std::mem::replace(&mut self.data, previous_data);
+        self.delta = previous_delta;
+        self.spot_cache.clear_all();
+    }
+
     fn rebuild_from_deltas(&mut self, deltas: BasisSeries<DirectionalVolume>) {
         self.delta = deltas;
         self.rebuild_cumulative();
@@ -313,10 +371,12 @@ impl CumulativeDeltaIndicator {
 impl KlineIndicatorImpl for CumulativeDeltaIndicator {
     fn clear_all_caches(&mut self) {
         self.cache.clear_all();
+        self.spot_cache.clear_all();
     }
 
     fn clear_crosshair_caches(&mut self) {
         self.cache.clear_crosshair();
+        self.spot_cache.clear_crosshair();
     }
 
     fn element<'a>(
@@ -334,9 +394,13 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
 
     fn rebuild_from_source(&mut self, source: &PlotData<KlineDataPoint>) {
         if self.config.source_mode != CvdSourceMode::Chart {
-            let has_points = !self.composite_delta.is_empty();
+            let has_points =
+                !self.composite_delta.is_empty() || !self.composite_spot_delta.is_empty();
             self.set_availability(has_points, has_points);
             self.rebuild_from_deltas(BasisSeries::Time(self.composite_delta.clone()));
+            if self.config.source_mode == CvdSourceMode::CompositeSpotAndPerpetual {
+                self.rebuild_spot_cumulative();
+            }
             return;
         }
         let deltas = source.map_basis_series(
@@ -435,7 +499,22 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                 continue;
             }
             let bucket = normalized.time.floor_to(timeseries.interval);
-            let volume = self.composite_delta.entry(bucket).or_default();
+            let is_spot = ticker_info.market_type() == exchange::adapter::MarketKind::Spot;
+            let accepts_market = match self.config.source_mode {
+                CvdSourceMode::MatchingSpot | CvdSourceMode::CompositeSpot => is_spot,
+                CvdSourceMode::CompositePerpetual => !is_spot,
+                CvdSourceMode::CompositeSpotAndPerpetual => true,
+                CvdSourceMode::Chart | CvdSourceMode::Custom => false,
+            };
+            if !accepts_market {
+                continue;
+            }
+            let volume =
+                if self.config.source_mode == CvdSourceMode::CompositeSpotAndPerpetual && is_spot {
+                    self.composite_spot_delta.entry(bucket).or_default()
+                } else {
+                    self.composite_delta.entry(bucket).or_default()
+                };
             let qty = Qty::from_f64(value);
             if normalized.is_sell {
                 volume.sell += qty;
@@ -446,6 +525,9 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
         }
         self.set_availability(true, true);
         self.rebuild_from_deltas(BasisSeries::Time(self.composite_delta.clone()));
+        if self.config.source_mode == CvdSourceMode::CompositeSpotAndPerpetual {
+            self.rebuild_spot_cumulative();
+        }
     }
 
     fn on_ticksize_change(&mut self, source: &PlotData<KlineDataPoint>) {
@@ -461,12 +543,17 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
             self.config = config.cvd;
             if source_changed {
                 self.composite_delta.clear();
+                self.composite_spot_delta.clear();
                 self.delta = BasisSeries::default();
                 self.data = BasisSeries::default();
+                self.spot_data = BasisSeries::default();
                 self.availability = IndicatorAvailability::Unknown;
                 self.clear_all_caches();
             } else if reset_changed {
                 self.rebuild_cumulative();
+                if self.config.source_mode == CvdSourceMode::CompositeSpotAndPerpetual {
+                    self.rebuild_spot_cumulative();
+                }
             } else {
                 self.clear_all_caches();
             }

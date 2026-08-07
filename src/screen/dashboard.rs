@@ -122,9 +122,12 @@ fn resolve_cvd_sources_task(
                     error: Some("Composite CVD: could not identify the chart base asset".into()),
                 };
             };
-            let market = match config.source_mode {
-                CvdSourceMode::MatchingSpot | CvdSourceMode::CompositeSpot => MarketKind::Spot,
-                CvdSourceMode::CompositePerpetual => MarketKind::LinearPerps,
+            let markets: &[MarketKind] = match config.source_mode {
+                CvdSourceMode::MatchingSpot | CvdSourceMode::CompositeSpot => &[MarketKind::Spot],
+                CvdSourceMode::CompositePerpetual => &[MarketKind::LinearPerps],
+                CvdSourceMode::CompositeSpotAndPerpetual => {
+                    &[MarketKind::LinearPerps, MarketKind::Spot]
+                }
                 CvdSourceMode::Chart | CvdSourceMode::Custom => {
                     return Message::CvdSourcesResolved {
                         pane_id,
@@ -149,12 +152,19 @@ fn resolve_cvd_sources_task(
             let mut sources = Vec::new();
             let mut errors = Vec::new();
             for venue in venues {
-                match handles.fetch_ticker_metadata(venue, &[market]).await {
+                match handles.fetch_ticker_metadata(venue, markets).await {
                     Ok(metadata) => {
-                        if let Some(info) = select_cvd_instrument(metadata, &base, market) {
-                            sources.push(info);
-                        } else {
-                            errors.push(format!("{venue}: no matching {base} instrument"));
+                        let metadata = metadata.into_iter().collect::<Vec<_>>();
+                        for &market in markets {
+                            if let Some(info) =
+                                select_cvd_instrument(metadata.iter().copied(), &base, market)
+                            {
+                                sources.push(info);
+                            } else {
+                                errors.push(format!(
+                                    "{venue}: no matching {base} {market} instrument"
+                                ));
+                            }
                         }
                     }
                     Err(error) => errors.push(format!("{venue}: {error}")),

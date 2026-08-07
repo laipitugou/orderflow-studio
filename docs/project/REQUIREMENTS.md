@@ -55,6 +55,21 @@
 - Aggregation and level-of-detail based on zoom.
 - Configurable disk limits and raw-L2 retention.
 
+### Order-flow comparison workspace
+
+- A dedicated, detachable workspace shares one time axis and stacks, from top
+  to bottom: open-interest candles, multi-venue perpetual CVD, and multi-venue
+  spot CVD. Spot and perpetual CVD remain visible simultaneously for divergence
+  analysis rather than being mutually exclusive.
+- OI renders as change candles. With snapshot-only sources, each candle opens at
+  the prior sample and closes at the current sample; high/low bound that change.
+- Exchange disconnections enter a non-blocking cached read-only mode. Existing
+  charts, layouts, inspection, pan, and zoom remain usable while streams retry;
+  stale/incomplete state remains visible and gaps are backfilled on reconnect.
+- Bubble/heatmap annotations include significant resting-liquidity additions and
+  cancellations, clustered repeated absorption, and POC rejection. Every marker
+  distinguishes observed facts from heuristic inference and exposes its basis.
+
 ## Deferred
 
 - TradingView-compatible drawing experience.
@@ -69,4 +84,3 @@
 - `Modelled`: estimated distribution such as prospective liquidation zones.
 
 The UI must not present inferred or modelled output as observed fact.
-

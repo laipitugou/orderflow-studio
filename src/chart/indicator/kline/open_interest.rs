@@ -5,7 +5,7 @@ use crate::chart::{
         kline::{AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl},
         plot::{
             AnySeries, PlotTooltip,
-            line::{LineInterpolation, LinePlot},
+            candlestick::{CandlestickPlot, CandlestickValue},
         },
     },
 };
@@ -22,7 +22,31 @@ use std::{collections::BTreeMap, ops::RangeInclusive};
 pub struct OpenInterestIndicator {
     cache: Caches,
     pub data: BTreeMap<UnixMs, f64>,
+    candles: BTreeMap<UnixMs, OpenInterestCandle>,
     source_timeframe: Option<Timeframe>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenInterestCandle {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+}
+
+impl CandlestickValue for OpenInterestCandle {
+    fn open(&self) -> f32 {
+        self.open as f32
+    }
+    fn high(&self) -> f32 {
+        self.high as f32
+    }
+    fn low(&self) -> f32 {
+        self.low as f32
+    }
+    fn close(&self) -> f32 {
+        self.close as f32
+    }
 }
 
 impl OpenInterestIndicator {
@@ -30,6 +54,7 @@ impl OpenInterestIndicator {
         Self {
             cache: Caches::default(),
             data: BTreeMap::new(),
+            candles: BTreeMap::new(),
             source_timeframe: None,
         }
     }
@@ -50,27 +75,25 @@ impl OpenInterestIndicator {
         }
 
         let source = self.source_timeframe;
-        let tooltip = move |value: &f64, next: Option<&f64>| {
-            let value_text = format!("Open Interest: {}", format_with_commas(*value));
-            let change_text = if let Some(next_value) = next {
-                let delta = next_value - *value;
-                let sign = if delta >= 0.0 { "+" } else { "" };
-                format!("Change: {}{}", sign, format_with_commas(delta))
-            } else {
-                "Change: N/A".to_string()
-            };
+        let tooltip = move |value: &OpenInterestCandle, _next: Option<&OpenInterestCandle>| {
+            let delta = value.close - value.open;
+            let sign = if delta >= 0.0 { "+" } else { "" };
             let source_text =
                 source.map_or(String::new(), |timeframe| format!("\nSource: {timeframe}"));
-            PlotTooltip::new(format!("{value_text}\n{change_text}{source_text}"))
+            PlotTooltip::new(format!(
+                "OI O: {}  H: {}\nOI L: {}  C: {}\nChange: {sign}{}{}",
+                format_with_commas(value.open),
+                format_with_commas(value.high),
+                format_with_commas(value.low),
+                format_with_commas(value.close),
+                format_with_commas(delta),
+                source_text,
+            ))
         };
 
-        let value_fn = |v: &f64| *v as f32;
-
-        let plot = LinePlot::new(value_fn)
-            .stroke_width(1.0)
-            .show_points(true)
-            .point_radius_factor(0.2)
-            .interpolation(LineInterpolation::StepAfter)
+        let plot = CandlestickPlot::new()
+            .body_width_factor(0.7)
+            .show_wicks(true)
             .padding(0.08)
             .with_tooltip(tooltip);
 
@@ -79,7 +102,7 @@ impl OpenInterestIndicator {
             &self.cache,
             data_labels_always_visible,
             plot,
-            AnySeries::forward_unix_ms(&self.data),
+            AnySeries::forward_unix_ms(&self.candles),
             visible_range,
         );
         let label = self.source_timeframe.map_or_else(
@@ -169,6 +192,7 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
         if self.source_timeframe != Some(source_timeframe) {
             self.source_timeframe = Some(source_timeframe);
             self.data.clear();
+            self.candles.clear();
         }
 
         let (oi_earliest, oi_latest) = self.oi_timerange(ctx.kline_latest);
@@ -213,6 +237,23 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
 
     fn on_open_interest(&mut self, data: &[exchange::OpenInterest]) {
         self.data.extend(data.iter().map(|oi| (oi.time, oi.value)));
+        self.candles = self
+            .data
+            .iter()
+            .scan(None, |previous, (&time, &close)| {
+                let open = previous.unwrap_or(close);
+                *previous = Some(close);
+                Some((
+                    time,
+                    OpenInterestCandle {
+                        open,
+                        high: open.max(close),
+                        low: open.min(close),
+                        close,
+                    },
+                ))
+            })
+            .collect();
         self.clear_all_caches();
     }
 }
