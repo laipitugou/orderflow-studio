@@ -163,6 +163,34 @@ pub fn view_kline<'a>(
                 )
             },
         );
+        let effective_venues = if cvd.venue_mask == 0 {
+            0b111
+        } else {
+            cvd.venue_mask
+        };
+        let venue_toggle = |label: &'static str, bit: u16| {
+            checkbox(effective_venues & bit != 0)
+                .label(label)
+                .on_toggle(move |_| {
+                    config_message(
+                        pane,
+                        KlineConfig {
+                            cvd: data::chart::kline::CvdConfig {
+                                venue_mask: effective_venues ^ bit,
+                                ..cvd
+                            },
+                            ..cfg
+                        },
+                    )
+                })
+        };
+        let venues = column![
+            text("Composite venues"),
+            venue_toggle("Binance", 1 << 0),
+            venue_toggle("Bybit", 1 << 1),
+            venue_toggle("OKX", 1 << 2),
+        ]
+        .spacing(4);
         let style_controls: Element<'a, Message> = match cvd.render_style {
             CvdRenderStyle::Candlesticks => column![candle_width, show_wicks].spacing(6).into(),
             CvdRenderStyle::Line => column![line_width].spacing(6).into(),
@@ -172,6 +200,7 @@ pub fn view_kline<'a>(
             column![
                 source_mode,
                 aggregation_unit,
+                venues,
                 render_style,
                 reset,
                 style_controls

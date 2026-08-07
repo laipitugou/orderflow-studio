@@ -1,10 +1,15 @@
 //! Pure, replayable multi-source CVD aggregation.
 //!
-//! Exchange adapters are responsible for producing both base quantity and quote
-//! notional. Keeping that normalization at the adapter boundary prevents this
-//! engine from adding contracts, coins, and dollars as if they were equivalent.
+//! Exchange adapters normalize contract quantities into the application's
+//! selected volume unit. This module derives a common base/quote representation
+//! before aggregation, preventing contracts, coins, and dollars from being
+//! added as if they were equivalent.
 
-use exchange::{UnixMs, adapter::Exchange};
+use exchange::{
+    TickerInfo, Trade, UnixMs,
+    adapter::Exchange,
+    unit::qty::{SizeUnit, volume_size_unit},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -114,6 +119,38 @@ pub struct NormalizedCvdTrade {
     pub is_sell: bool,
     pub base_quantity: f64,
     pub quote_notional: f64,
+}
+
+/// Convert the application's normalized trade representation into both units
+/// needed by the composite engine. Exchange adapters normalize contracts before
+/// this boundary; `volume_size_unit` tells us whether `Trade::qty` currently
+/// carries base quantity or quote notional.
+pub fn normalize_trade(ticker_info: TickerInfo, trade: Trade) -> NormalizedCvdTrade {
+    let qty = trade.qty.to_f64();
+    let price = trade.price.to_f64();
+    let qty_is_quote = volume_size_unit() == SizeUnit::Quote;
+    let market = ticker_info.market_type();
+
+    let (base_quantity, quote_notional) = if qty_is_quote {
+        let base = if price > 0.0 { qty / price } else { 0.0 };
+        (base, qty)
+    } else {
+        (
+            qty,
+            market.qty_in_quote_value(trade.qty, trade.price, false),
+        )
+    };
+
+    NormalizedCvdTrade {
+        source: CvdSourceId::new(
+            ticker_info.exchange(),
+            ticker_info.ticker.to_full_symbol_and_type().0,
+        ),
+        time: trade.time,
+        is_sell: trade.is_sell,
+        base_quantity,
+        quote_notional,
+    }
 }
 
 /// Directional totals for one time bucket.

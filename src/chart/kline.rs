@@ -1947,6 +1947,21 @@ impl KlineChart {
         }
     }
 
+    /// Route auxiliary market trades to indicators without changing the main
+    /// chart data source, raw-trade cache, footprint, or volume.
+    pub fn insert_indicator_trades(&mut self, ticker_info: TickerInfo, buffer: &[Trade]) {
+        if buffer.is_empty() {
+            return;
+        }
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indicator| {
+                indicator.on_insert_external_trades(ticker_info, buffer, &self.data_source);
+            });
+        self.invalidate(None);
+    }
+
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let received_size = raw_trades.len();
         let raw_trades = deduplicate_incoming_trades(

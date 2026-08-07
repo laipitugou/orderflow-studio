@@ -18,8 +18,9 @@ use data::chart::{
     PlotData,
     kline::{CvdConfig, CvdRenderStyle, CvdReset, KlineDataPoint, TradeCoverage},
 };
+use data::orderflow::cvd_aggregation::{CvdAggregationUnit, CvdSourceMode, normalize_trade};
 use data::util::format_with_commas;
-use exchange::{Kline, Trade, Volume, unit::Qty};
+use exchange::{Kline, TickerInfo, Trade, Volume, unit::Qty};
 
 use iced::widget::{center, text};
 
@@ -184,6 +185,8 @@ pub struct CumulativeDeltaIndicator {
     data: BasisSeries<CumulativeDeltaPoint>,
     availability: IndicatorAvailability,
     config: CvdConfig,
+    /// Directional volume received from indicator-only multi-venue streams.
+    composite_delta: BTreeMap<exchange::UnixMs, DirectionalVolume>,
 }
 
 impl CumulativeDeltaIndicator {
@@ -194,6 +197,7 @@ impl CumulativeDeltaIndicator {
             data: BasisSeries::default(),
             availability: IndicatorAvailability::Unknown,
             config: CvdConfig::default(),
+            composite_delta: BTreeMap::new(),
         }
     }
 
@@ -329,6 +333,12 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
     }
 
     fn rebuild_from_source(&mut self, source: &PlotData<KlineDataPoint>) {
+        if self.config.source_mode != CvdSourceMode::Chart {
+            let has_points = !self.composite_delta.is_empty();
+            self.set_availability(has_points, has_points);
+            self.rebuild_from_deltas(BasisSeries::Time(self.composite_delta.clone()));
+            return;
+        }
         let deltas = source.map_basis_series(
             |timeseries| {
                 let latest = timeseries
@@ -394,9 +404,48 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
         source: &PlotData<KlineDataPoint>,
     ) {
         let _ = old_dp_len;
-        if !trades.is_empty() {
+        if self.config.source_mode == CvdSourceMode::Chart && !trades.is_empty() {
             self.rebuild_from_source(source);
         }
+    }
+
+    fn on_insert_external_trades(
+        &mut self,
+        ticker_info: TickerInfo,
+        trades: &[Trade],
+        source: &PlotData<KlineDataPoint>,
+    ) {
+        if self.config.source_mode == CvdSourceMode::Chart || trades.is_empty() {
+            return;
+        }
+        let PlotData::TimeBased(timeseries) = source else {
+            self.availability = IndicatorAvailability::Unavailable(AvailabilityCause::Basis(
+                crate::chart::Basis::Tick(data::aggr::TickCount(1)),
+            ));
+            return;
+        };
+
+        for trade in trades {
+            let normalized = normalize_trade(ticker_info, *trade);
+            let value = match self.config.aggregation_unit {
+                CvdAggregationUnit::QuoteNotional => normalized.quote_notional,
+                CvdAggregationUnit::BaseQuantity => normalized.base_quantity,
+            };
+            if !value.is_finite() || value < 0.0 {
+                continue;
+            }
+            let bucket = normalized.time.floor_to(timeseries.interval);
+            let volume = self.composite_delta.entry(bucket).or_default();
+            let qty = Qty::from_f64(value);
+            if normalized.is_sell {
+                volume.sell += qty;
+            } else {
+                volume.buy += qty;
+            }
+            volume.reliable = true;
+        }
+        self.set_availability(true, true);
+        self.rebuild_from_deltas(BasisSeries::Time(self.composite_delta.clone()));
     }
 
     fn on_ticksize_change(&mut self, source: &PlotData<KlineDataPoint>) {
@@ -406,8 +455,17 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
     fn on_config_changed(&mut self, config: &data::chart::kline::Config) {
         if self.config != config.cvd {
             let reset_changed = self.config.reset != config.cvd.reset;
+            let source_changed = self.config.source_mode != config.cvd.source_mode
+                || self.config.aggregation_unit != config.cvd.aggregation_unit
+                || self.config.venue_mask != config.cvd.venue_mask;
             self.config = config.cvd;
-            if reset_changed {
+            if source_changed {
+                self.composite_delta.clear();
+                self.delta = BasisSeries::default();
+                self.data = BasisSeries::default();
+                self.availability = IndicatorAvailability::Unknown;
+                self.clear_all_caches();
+            } else if reset_changed {
                 self.rebuild_cumulative();
             } else {
                 self.clear_all_caches();

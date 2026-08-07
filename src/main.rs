@@ -1434,7 +1434,12 @@ impl Flowsurface {
                                         Task::none()
                                     } else {
                                         dashboard
-                                            .resolve_streams(main_window.id, pane_id, resolved)
+                                            .resolve_streams(
+                                                main_window.id,
+                                                pane_id,
+                                                resolved,
+                                                self.data_sources.exchange.clone(),
+                                            )
                                             .map(move |msg| Message::Dashboard {
                                                 layout_id: None,
                                                 event: msg,

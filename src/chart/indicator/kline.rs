@@ -5,7 +5,7 @@ use data::chart::indicator::KlineIndicator;
 use data::chart::kline::KlineDataPoint;
 use data::chart::{BasisSeries, PlotData};
 use exchange::adapter::Exchange;
-use exchange::{Kline, Timeframe, Trade, UnixMs};
+use exchange::{Kline, TickerInfo, Timeframe, Trade, UnixMs};
 
 use super::plot::AnySeries;
 
@@ -110,6 +110,17 @@ pub trait KlineIndicatorImpl {
         &mut self,
         _trades: &[Trade],
         _old_dp_len: usize,
+        _source: &PlotData<KlineDataPoint>,
+    ) {
+    }
+
+    /// Trades from an auxiliary instrument used only by an indicator (for
+    /// example another venue feeding composite CVD). These must never mutate
+    /// the main chart's candles or volume.
+    fn on_insert_external_trades(
+        &mut self,
+        _ticker_info: TickerInfo,
+        _trades: &[Trade],
         _source: &PlotData<KlineDataPoint>,
     ) {
     }

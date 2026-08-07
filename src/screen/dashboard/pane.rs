@@ -137,6 +137,9 @@ pub struct State {
     pub settings: Settings,
     pub notifications: Vec<Toast>,
     pub streams: ResolvedStream,
+    /// Indicator-only live streams. They are subscribed globally but kept out
+    /// of the pane's primary stream identity and never feed the main chart.
+    pub supplemental_streams: Vec<StreamKind>,
     pub status: Status,
     pub link_group: Option<LinkGroup>,
     gex_liquidity_missing_logged: bool,
@@ -2333,6 +2336,30 @@ impl State {
         self.streams.matches_stream(stream)
     }
 
+    pub fn matches_supplemental_stream(&self, stream: &StreamKind) -> bool {
+        self.supplemental_streams.contains(stream)
+    }
+
+    pub fn set_supplemental_trade_sources(&mut self, sources: Vec<TickerInfo>) {
+        self.supplemental_streams = sources
+            .into_iter()
+            .map(|ticker_info| StreamKind::Trades { ticker_info })
+            .collect();
+    }
+
+    pub fn cvd_source_request(&self) -> Option<(TickerInfo, data::chart::kline::CvdConfig)> {
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &self.content
+        else {
+            return None;
+        };
+        let config = chart.visual_config().cvd;
+        (chart.indicator_enabled(KlineIndicator::CumulativeDelta)
+            && config.source_mode != data::orderflow::cvd_aggregation::CvdSourceMode::Chart)
+            .then_some((self.stream_pair()?, config))
+    }
+
     /// Check if this pane can consume a specific type of fetched data.
     ///
     /// Live WS events (trades, depth) can be consumed by Heatmap, Ladder,
@@ -2530,6 +2557,7 @@ impl Default for State {
             content: Content::Starter,
             settings: Settings::default(),
             streams: ResolvedStream::waiting(vec![]),
+            supplemental_streams: vec![],
             notifications: vec![],
             status: Status::Ready,
             link_group: None,

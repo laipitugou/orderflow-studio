@@ -27,8 +27,8 @@ use data::{
 use exchange::{
     Kline, PushFrequency, StreamPairKind, TickerInfo, Trade, UnixMs,
     adapter::{
-        AdapterHandles, MAX_KLINE_STREAMS_PER_STREAM, MAX_TRADE_TICKERS_PER_STREAM, StreamConfig,
-        StreamKind, StreamTicksize, UniqueStreams,
+        AdapterHandles, MAX_KLINE_STREAMS_PER_STREAM, MAX_TRADE_TICKERS_PER_STREAM, MarketKind,
+        StreamConfig, StreamKind, StreamTicksize, UniqueStreams, Venue,
     },
     depth::Depth,
 };
@@ -41,6 +41,135 @@ use iced::{
     },
 };
 use std::{collections::HashMap, sync::Arc, time::Instant, vec};
+
+use data::orderflow::cvd_aggregation::CvdSourceMode;
+
+const CVD_VENUES: [(Venue, u16); 3] = [
+    (Venue::Binance, 1 << 0),
+    (Venue::Bybit, 1 << 1),
+    (Venue::Okex, 1 << 2),
+];
+
+fn normalized_base_symbol(ticker: exchange::Ticker) -> Option<String> {
+    let (display, _) = ticker.display_symbol_and_type();
+    let mut symbol = display
+        .to_ascii_uppercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    for suffix in ["SWAP", "PERPETUAL", "PERP"] {
+        if let Some(stripped) = symbol.strip_suffix(suffix) {
+            symbol = stripped.to_owned();
+            break;
+        }
+    }
+    for quote in ["USDT", "USDC", "BUSD", "FDUSD", "USD"] {
+        if let Some(base) = symbol.strip_suffix(quote)
+            && !base.is_empty()
+        {
+            return Some(base.to_owned());
+        }
+    }
+    None
+}
+
+fn quote_rank(ticker: exchange::Ticker) -> u8 {
+    let symbol = ticker
+        .display_symbol_and_type()
+        .0
+        .to_ascii_uppercase()
+        .replace(['-', '_', '/'], "");
+    if symbol.contains("USDT") {
+        0
+    } else if symbol.contains("USDC") {
+        1
+    } else if symbol.contains("USD") {
+        2
+    } else {
+        3
+    }
+}
+
+fn select_cvd_instrument(
+    metadata: impl IntoIterator<Item = (exchange::Ticker, Option<TickerInfo>)>,
+    base: &str,
+    market: MarketKind,
+) -> Option<TickerInfo> {
+    let mut matches = metadata
+        .into_iter()
+        .filter_map(|(_, info)| info)
+        .filter(|info| {
+            info.market_type() == market
+                && normalized_base_symbol(info.ticker).as_deref() == Some(base)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|info| quote_rank(info.ticker));
+    matches.into_iter().next()
+}
+
+fn resolve_cvd_sources_task(
+    handles: AdapterHandles,
+    pane_id: uuid::Uuid,
+    main_ticker: TickerInfo,
+    config: data::chart::kline::CvdConfig,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let Some(base) = normalized_base_symbol(main_ticker.ticker) else {
+                return Message::CvdSourcesResolved {
+                    pane_id,
+                    sources: vec![],
+                    error: Some("Composite CVD: could not identify the chart base asset".into()),
+                };
+            };
+            let market = match config.source_mode {
+                CvdSourceMode::MatchingSpot | CvdSourceMode::CompositeSpot => MarketKind::Spot,
+                CvdSourceMode::CompositePerpetual => MarketKind::LinearPerps,
+                CvdSourceMode::Chart | CvdSourceMode::Custom => {
+                    return Message::CvdSourcesResolved {
+                        pane_id,
+                        sources: vec![],
+                        error: (config.source_mode == CvdSourceMode::Custom)
+                            .then(|| "Custom CVD sources are not configured yet".into()),
+                    };
+                }
+            };
+            let venues = CVD_VENUES
+                .into_iter()
+                .filter(|(venue, bit)| {
+                    if config.source_mode == CvdSourceMode::MatchingSpot {
+                        *venue == main_ticker.exchange().venue()
+                    } else {
+                        config.venue_mask == 0 || config.venue_mask & bit != 0
+                    }
+                })
+                .map(|(venue, _)| venue)
+                .collect::<Vec<_>>();
+
+            let mut sources = Vec::new();
+            let mut errors = Vec::new();
+            for venue in venues {
+                match handles.fetch_ticker_metadata(venue, &[market]).await {
+                    Ok(metadata) => {
+                        if let Some(info) = select_cvd_instrument(metadata, &base, market) {
+                            sources.push(info);
+                        } else {
+                            errors.push(format!("{venue}: no matching {base} instrument"));
+                        }
+                    }
+                    Err(error) => errors.push(format!("{venue}: {error}")),
+                }
+            }
+            Message::CvdSourcesResolved {
+                pane_id,
+                sources,
+                error: (!errors.is_empty())
+                    .then(|| format!("Composite CVD source error: {}", errors.join("; "))),
+            }
+        },
+        |message| message,
+    )
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -75,6 +204,11 @@ pub enum Message {
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
     RequestPalette,
+    CvdSourcesResolved {
+        pane_id: uuid::Uuid,
+        sources: Vec<TickerInfo>,
+        error: Option<String>,
+    },
 }
 
 /// Tracks WS disconnect state for deferred backfill computation.
@@ -698,6 +832,37 @@ impl Dashboard {
                     if refresh_streams {
                         return (self.refresh_streams(main_window.id), None);
                     }
+
+                    let request = self
+                        .get_pane(main_window.id, window, pane)
+                        .and_then(|state| {
+                            state
+                                .cvd_source_request()
+                                .map(|request| (state.unique_id(), request))
+                        });
+                    if let Some((pane_id, (main_ticker, config))) = request {
+                        if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                            state.supplemental_streams.clear();
+                        }
+                        return (
+                            Task::batch([
+                                self.refresh_streams(main_window.id),
+                                resolve_cvd_sources_task(
+                                    handles.clone(),
+                                    pane_id,
+                                    main_ticker,
+                                    config,
+                                ),
+                            ]),
+                            None,
+                        );
+                    }
+                    if let Some(state) = self.get_mut_pane(main_window.id, window, pane)
+                        && !state.supplemental_streams.is_empty()
+                    {
+                        state.supplemental_streams.clear();
+                        return (self.refresh_streams(main_window.id), None);
+                    }
                 }
                 pane::Message::SwitchLinkGroup(pane, group) => {
                     if group.is_none() {
@@ -765,7 +930,12 @@ impl Dashboard {
                             return (Task::none(), None);
                         };
 
-                        let task = match effect {
+                        let cvd_request = state
+                            .cvd_source_request()
+                            .map(|request| (state.unique_id(), request));
+                        state.supplemental_streams.clear();
+
+                        let mut task = match effect {
                             pane::Effect::RefreshStreams => self.refresh_streams(main_window.id),
                             pane::Effect::RequestFetch(reqs) => {
                                 let pane_id = state.unique_id();
@@ -811,6 +981,14 @@ impl Dashboard {
                                 return (iced::widget::operation::focus(id), None);
                             }
                         };
+                        if let Some((pane_id, (main_ticker, config))) = cvd_request {
+                            task = task.chain(resolve_cvd_sources_task(
+                                handles.clone(),
+                                pane_id,
+                                main_ticker,
+                                config,
+                            ));
+                        }
                         return (task, None);
                     }
                 }
@@ -890,6 +1068,25 @@ impl Dashboard {
             }
             Message::Notification(toast) => {
                 return (Task::none(), Some(Event::Notification(toast)));
+            }
+            Message::CvdSourcesResolved {
+                pane_id,
+                sources,
+                error,
+            } => {
+                if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
+                    state.set_supplemental_trade_sources(sources.clone());
+                    if let Some(error) = error {
+                        state.status = pane::Status::Stale(error);
+                    } else if sources.is_empty() {
+                        state.status = pane::Status::Stale(
+                            "Composite CVD: no matching exchange instruments".into(),
+                        );
+                    } else {
+                        state.status = pane::Status::Ready;
+                    }
+                }
+                return (self.refresh_streams(main_window.id), None);
             }
         }
 
@@ -2247,6 +2444,17 @@ impl Dashboard {
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
+                if pane_state.matches_supplemental_stream(stream) {
+                    matched_panes += 1;
+                    if let pane::Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut pane_state.content
+                    {
+                        chart.insert_indicator_trades(stream.ticker_info(), buffer);
+                        content_updates.push("CompositeCvd");
+                        found_match = true;
+                    }
+                }
                 if pane_state.matches_stream(stream) {
                     matched_panes += 1;
                     match &mut pane_state.content {
@@ -2431,6 +2639,7 @@ impl Dashboard {
         main_window: window::Id,
         pane_id: uuid::Uuid,
         streams: Vec<StreamKind>,
+        handles: AdapterHandles,
     ) -> Task<Message> {
         log::debug!(
             "STREAM ResolveReady | pane={} streams={}",
@@ -2440,7 +2649,17 @@ impl Dashboard {
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
             state.streams = ResolvedStream::Ready(streams.clone());
         }
-        self.refresh_streams(main_window)
+        let cvd_task = self
+            .get_mut_pane_state_by_uuid(main_window, pane_id)
+            .and_then(|state| {
+                state
+                    .cvd_source_request()
+                    .map(|request| (state.unique_id(), request))
+            })
+            .map_or_else(Task::none, |(pane_id, (main_ticker, config))| {
+                resolve_cvd_sources_task(handles, pane_id, main_ticker, config)
+            });
+        Task::batch([self.refresh_streams(main_window), cvd_task])
     }
 
     pub fn block_streams(&mut self, main_window: window::Id, pane_id: uuid::Uuid, reason: String) {
@@ -2588,7 +2807,14 @@ impl Dashboard {
         let old_streams = all_unique_streams(&self.streams);
         let all_pane_streams = self
             .iter_all_panes(main_window)
-            .flat_map(|(_, _, pane_state)| pane_state.streams.ready_iter().into_iter().flatten());
+            .flat_map(|(_, _, pane_state)| {
+                pane_state
+                    .streams
+                    .ready_iter()
+                    .into_iter()
+                    .flatten()
+                    .chain(pane_state.supplemental_streams.iter())
+            });
         self.streams = UniqueStreams::from(all_pane_streams);
         let new_streams = all_unique_streams(&self.streams);
         let added = new_streams
