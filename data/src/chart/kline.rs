@@ -868,6 +868,13 @@ pub struct CvdConfig {
     pub show_wicks: bool,
     pub line_width: f32,
     pub reset: CvdReset,
+    /// Market family used by CVD independently of the main chart.
+    pub source_mode: crate::orderflow::cvd_aggregation::CvdSourceMode,
+    /// Unit all selected sources are converted to before aggregation.
+    pub aggregation_unit: crate::orderflow::cvd_aggregation::CvdAggregationUnit,
+    /// Enabled venues. Bit positions follow `exchange::adapter::Venue` mapping
+    /// owned by the source resolver; zero means use resolver defaults.
+    pub venue_mask: u16,
 }
 
 impl Default for CvdConfig {
@@ -878,6 +885,9 @@ impl Default for CvdConfig {
             show_wicks: false,
             line_width: 1.0,
             reset: CvdReset::DailyUtc,
+            source_mode: crate::orderflow::cvd_aggregation::CvdSourceMode::Chart,
+            aggregation_unit: crate::orderflow::cvd_aggregation::CvdAggregationUnit::QuoteNotional,
+            venue_mask: 0,
         }
     }
 }

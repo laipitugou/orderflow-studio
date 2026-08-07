@@ -1,0 +1,85 @@
+name: Windows Preview
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libasound2-dev
+
+      - name: Install configured Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-preview-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-preview-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+
+  windows:
+    name: Build Windows x64 portable
+    needs: quality
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install configured Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-preview-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-preview-
+
+      - name: Build portable package
+        shell: bash
+        run: bash scripts/build-windows.sh x86_64
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: orderflow-studio-windows-x64
+          path: target/release/orderflow-studio-x86_64-windows.zip
+          if-no-files-found: error
+          retention-days: 14

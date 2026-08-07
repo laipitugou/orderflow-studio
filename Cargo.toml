@@ -1,9 +1,9 @@
 [package]
-name = "flowsurface"
+name = "orderflow-studio"
 version.workspace = true
 readme = "README.md"
 license = "GPL-3.0-or-later"
-description = "A native desktop terminal for crypto order flow and options analytics"
+description = "A local-first native crypto order-flow workstation"
 categories = ["finance", "visualization", "gui"]
 edition.workspace = true
 repository.workspace = true
@@ -12,8 +12,8 @@ homepage.workspace = true
 [workspace.package]
 version = "0.8.9"
 edition = "2024"
-repository = "https://github.com/Niketion/flowdepth"
-homepage = "https://github.com/Niketion/flowdepth"
+repository = "https://github.com/laipitugou/orderflow-studio"
+homepage = "https://github.com/laipitugou/orderflow-studio"
 
 [workspace]
 members = [ "data", "exchange"]

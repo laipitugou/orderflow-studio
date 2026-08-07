@@ -9,6 +9,7 @@ use data::chart::kline::{
     VolumeBubblePreset, VolumeBubbleSession,
 };
 use data::layout::pane::VisualConfig;
+use data::orderflow::cvd_aggregation::{CvdAggregationUnit, CvdSourceMode};
 use data::util::format_with_commas;
 use iced::{
     Element, Length, padding,
@@ -133,13 +134,49 @@ pub fn view_kline<'a>(
                 },
             )
         });
+        let source_mode = pick_list(
+            CvdSourceMode::ALL,
+            Some(cvd.source_mode),
+            move |source_mode| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        cvd: data::chart::kline::CvdConfig { source_mode, ..cvd },
+                        ..cfg
+                    },
+                )
+            },
+        );
+        let aggregation_unit = pick_list(
+            CvdAggregationUnit::ALL,
+            Some(cvd.aggregation_unit),
+            move |aggregation_unit| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        cvd: data::chart::kline::CvdConfig {
+                            aggregation_unit,
+                            ..cvd
+                        },
+                        ..cfg
+                    },
+                )
+            },
+        );
         let style_controls: Element<'a, Message> = match cvd.render_style {
             CvdRenderStyle::Candlesticks => column![candle_width, show_wicks].spacing(6).into(),
             CvdRenderStyle::Line => column![line_width].spacing(6).into(),
         };
         sections = sections.push(indicator_card(
             "Cumulative Volume Delta",
-            column![render_style, reset, style_controls].spacing(6),
+            column![
+                source_mode,
+                aggregation_unit,
+                render_style,
+                reset,
+                style_controls
+            ]
+            .spacing(6),
         ));
     }
 

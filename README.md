@@ -1,3 +1,32 @@
+# Orderflow Studio
+
+Orderflow Studio is a local-first native crypto order-flow workstation focused
+on multi-venue CVD, spot/perpetual context, explainable liquidity events, durable
+tick storage, and replay.
+
+Development has started from the Flowdepth codebase. The first project milestone
+adds a normalized multi-source CVD foundation so a perpetual chart can display
+spot CVD and combine selected venues without mixing incompatible quantity units.
+See [the project brief](docs/project/PROJECT_BRIEF.md),
+[requirements](docs/project/REQUIREMENTS.md), and
+[conversation record](docs/project/CONVERSATION.md).
+
+TradingView-style drawing tools and custom indicator scripting are deferred from
+the first phase.
+
+## Windows preview
+
+Every push to `main` runs the full quality gate and produces a portable Windows
+x64 artifact in GitHub Actions. Open the latest **Windows Preview** run, choose
+**Artifacts**, and download `orderflow-studio-windows-x64`.
+
+## Upstream foundation
+
+This project is derived from Flowdepth, which is derived from Flowsurface. It is
+licensed under GPL-3.0-or-later and retains the upstream history and attribution.
+
+---
+
 # Flowdepth — crypto order flow, below the surface
 
 > Flowdepth is an open-source native desktop terminal for crypto order flow and options analytics, built in Rust as an advanced fork of Flowsurface.

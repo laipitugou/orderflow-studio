@@ -2367,13 +2367,13 @@ impl Flowsurface {
 
     fn title(&self, _window: window::Id) -> String {
         if self.debug_terminal_window == Some(_window) {
-            return "Flowsurface Debug Terminal".to_string();
+            return "Orderflow Studio Debug Terminal".to_string();
         }
 
         if let Some(id) = self.layout_manager.active_layout_id() {
-            format!("Flowsurface [{}]", id.name)
+            format!("Orderflow Studio [{}]", id.name)
         } else {
-            "Flowsurface".to_string()
+            "Orderflow Studio".to_string()
         }
     }
 
