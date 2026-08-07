@@ -27,6 +27,8 @@ use data::chart::{
     indicator::HeatmapIndicator,
 };
 use data::orderflow::iceberg::IcebergEvent;
+use data::orderflow::iceberg::IcebergSide;
+use data::orderflow::liquidity_events::{LiquidityEventDetector, LiquiditySide};
 use exchange::depth::Depth;
 use exchange::unit::{Price, PriceStep};
 use exchange::{TickerInfo, Trade, UnixMs};
@@ -108,6 +110,7 @@ pub struct HeatmapShader {
     pub studies: Vec<HeatmapStudy>,
     pub study_configurator: study::Configurator<HeatmapStudy>,
     iceberg_events: std::collections::VecDeque<IcebergEvent>,
+    liquidity_detector: LiquidityEventDetector,
 }
 
 impl HeatmapShader {
@@ -131,6 +134,7 @@ impl HeatmapShader {
             exchange::SizeUnit::Quote => 1.0,
         };
 
+        let config = config.unwrap_or_default();
         Self {
             last_tick: None,
             scene: Scene::new(),
@@ -155,10 +159,15 @@ impl HeatmapShader {
             rebuild_policy: view::RebuildPolicy::Idle,
             indicators,
             anchor: view::Anchor::default(),
-            config: config.unwrap_or_default(),
+            config,
             studies,
             study_configurator: study::Configurator::new(),
             iceberg_events: std::collections::VecDeque::new(),
+            liquidity_detector: LiquidityEventDetector::new(
+                config.liquidity_events,
+                ticker_info,
+                step,
+            ),
         }
     }
 
@@ -380,6 +389,8 @@ impl HeatmapShader {
             volume_profile_max_qty: self.instances.volume_profile_scale_max_qty,
             iceberg_events: &self.iceberg_events,
             show_icebergs: self.config.iceberg_detector.enabled,
+            liquidity_events: self.liquidity_detector.events(),
+            show_liquidity_events: self.config.liquidity_events.enabled,
             aggr_time_ms: self.depth_history.aggr_time_ms(),
             y_anchor: self.depth_grid.y_anchor_price(),
             timezone,
@@ -442,6 +453,7 @@ impl HeatmapShader {
     }
 
     pub fn insert_depth(&mut self, depth: &Depth, update_t: UnixMs) {
+        self.liquidity_detector.observe_depth(depth, update_t);
         self.mark_needs_full_upload_if_stalled();
         let prev_effective_base = self.anchor.effective_base_price(self.base_price);
 
@@ -507,7 +519,21 @@ impl HeatmapShader {
     }
 
     pub fn insert_iceberg_event(&mut self, event: IcebergEvent) {
-        if !self.config.iceberg_detector.enabled || event.ticker_info != self.ticker_info {
+        if event.ticker_info != self.ticker_info {
+            return;
+        }
+        self.liquidity_detector.observe_absorption_qty(
+            match event.side {
+                IcebergSide::PossibleBuy => LiquiditySide::Bid,
+                IcebergSide::PossibleSell => LiquiditySide::Ask,
+            },
+            event.price,
+            event.aggressive_executed_qty,
+            event.confirmed_at,
+        );
+        if !self.config.iceberg_detector.enabled {
+            self.canvas_invalidation.mark_overlay_scale_labels();
+            self.canvas_invalidation.apply(&self.canvas_caches);
             return;
         }
         if let Some(existing) = self
@@ -588,6 +614,8 @@ impl HeatmapShader {
 
         let prev = self.config;
         self.config = config;
+        self.liquidity_detector
+            .set_config(self.config.liquidity_events);
 
         let order_filter_changed =
             prev.order_size_filter.to_bits() != self.config.order_size_filter.to_bits();

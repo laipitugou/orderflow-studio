@@ -8,6 +8,7 @@ use crate::widget::chart::heatmap::view;
 
 use data::config::timezone::TimeLabelKind;
 use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
+use data::orderflow::liquidity_events::{LiquidityEvent, LiquidityEventKind, LiquiditySide};
 use data::util::abbr_large_numbers;
 use exchange::unit::Qty;
 use exchange::unit::{MinTicksize, Price, PriceStep};
@@ -162,6 +163,8 @@ pub struct OverlayCanvas<'a> {
     pub is_paused: bool,
     pub iceberg_events: &'a std::collections::VecDeque<IcebergEvent>,
     pub show_icebergs: bool,
+    pub liquidity_events: &'a std::collections::VecDeque<LiquidityEvent>,
+    pub show_liquidity_events: bool,
     pub aggr_time_ms: u64,
     pub y_anchor: Option<Price>,
     pub timezone: data::UserTimezone,
@@ -247,6 +250,63 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                         builder.line_to(Point::new(point.x + size, point.y - direction * size));
                         builder.close();
                         frame.fill(&builder.build(), color);
+                    }
+                }
+                if self.show_liquidity_events {
+                    for event in self.liquidity_events {
+                        let Some(point) = self.market_event_screen_position(
+                            event.confirmed_at,
+                            event.price,
+                            bounds,
+                        ) else {
+                            continue;
+                        };
+                        let size = 4.0 + f32::from(event.score) / 25.0;
+                        let side_color = match event.side {
+                            LiquiditySide::Bid => palette.success.strong.color,
+                            LiquiditySide::Ask => palette.danger.strong.color,
+                        };
+                        match event.kind {
+                            LiquidityEventKind::LargeAdd => {
+                                let mut builder = canvas::path::Builder::new();
+                                builder.move_to(Point::new(point.x, point.y - size));
+                                builder.line_to(Point::new(point.x + size, point.y));
+                                builder.line_to(Point::new(point.x, point.y + size));
+                                builder.line_to(Point::new(point.x - size, point.y));
+                                builder.close();
+                                frame.fill(&builder.build(), side_color);
+                            }
+                            LiquidityEventKind::LargePull => {
+                                let path = canvas::Path::new(|builder| {
+                                    builder.move_to(Point::new(point.x - size, point.y - size));
+                                    builder.line_to(Point::new(point.x + size, point.y + size));
+                                    builder.move_to(Point::new(point.x + size, point.y - size));
+                                    builder.line_to(Point::new(point.x - size, point.y + size));
+                                });
+                                frame.stroke(
+                                    &path,
+                                    canvas::Stroke::default()
+                                        .with_color(palette.warning.strong.color)
+                                        .with_width(1.5),
+                                );
+                            }
+                            LiquidityEventKind::RepeatedAbsorption => {
+                                frame.stroke(
+                                    &canvas::Path::circle(point, size),
+                                    canvas::Stroke::default()
+                                        .with_color(side_color)
+                                        .with_width(2.0),
+                                );
+                                frame.fill_text(canvas::Text {
+                                    content: format!("A×{}", event.test_count),
+                                    position: Point::new(point.x + size + 2.0, point.y),
+                                    size: iced::Pixels(crate::style::text_size::TINY),
+                                    color: side_color,
+                                    font: style::AZERET_MONO,
+                                    ..canvas::Text::default()
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -776,21 +836,30 @@ impl<'a> OverlayCanvas<'a> {
     }
 
     fn event_screen_position(&self, event: &IcebergEvent, bounds: Rectangle) -> Option<Point> {
+        self.market_event_screen_position(event.confirmed_at, event.price, bounds)
+    }
+
+    fn market_event_screen_position(
+        &self,
+        confirmed_at: exchange::UnixMs,
+        price: Price,
+        bounds: Rectangle,
+    ) -> Option<Point> {
         let base_price = self.base_price?;
         if self.aggr_time_ms == 0 {
             return None;
         }
-        let bucket = i64::try_from(event.confirmed_at.as_u64() / self.aggr_time_ms).ok()?;
+        let bucket = i64::try_from(confirmed_at.as_u64() / self.aggr_time_ms).ok()?;
         let relative_bucket = bucket.saturating_sub(self.scroll_ref_bucket);
         let world_x =
             (relative_bucket as f32 - self.scene.params.origin_x()) * self.scene.cell.width_world();
         let step_units = self.step.units.max(1);
         let steps_per_bin = self.scene.params.steps_per_y_bin().max(1);
         let relative_bin = if let Some(anchor) = self.y_anchor {
-            ((event.price.units - anchor.units).div_euclid(step_units) / steps_per_bin)
+            ((price.units - anchor.units).div_euclid(step_units) / steps_per_bin)
                 - ((base_price.units - anchor.units).div_euclid(step_units) / steps_per_bin)
         } else {
-            (event.price.units - base_price.units).div_euclid(step_units) / steps_per_bin
+            (price.units - base_price.units).div_euclid(step_units) / steps_per_bin
         };
         let world_y = -((relative_bin as f32 + 0.5) * self.scene.cell.height_world());
         Some(Point::new(

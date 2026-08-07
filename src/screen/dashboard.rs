@@ -2379,13 +2379,17 @@ impl Dashboard {
                 pane::Content::Heatmap {
                     chart: Some(chart), ..
                 } => {
-                    let config = chart.visual_config().iceberg_detector;
+                    let visual = chart.visual_config();
+                    let mut config = visual.iceberg_detector;
+                    config.enabled |= visual.liquidity_events.enabled;
                     config.enabled.then(|| (chart.detector_key(), config))
                 }
                 pane::Content::ShaderHeatmap {
                     chart: Some(chart), ..
                 } => {
-                    let config = chart.visual_config().iceberg_detector;
+                    let visual = chart.visual_config();
+                    let mut config = visual.iceberg_detector;
+                    config.enabled |= visual.liquidity_events.enabled;
                     config.enabled.then(|| {
                         (
                             crate::connector::iceberg::DetectorKey {

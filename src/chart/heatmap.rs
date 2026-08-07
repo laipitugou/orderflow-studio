@@ -12,6 +12,9 @@ use data::chart::{
     indicator::HeatmapIndicator,
 };
 use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
+use data::orderflow::liquidity_events::{
+    LiquidityEventDetector, LiquidityEventKind, LiquiditySide,
+};
 use data::util::abbr_large_numbers;
 use data::{
     aggr::time::{DataPoint, TimeSeries},
@@ -256,6 +259,7 @@ pub struct HeatmapChart {
     last_tick: Instant,
     pub studies: Vec<HeatmapStudy>,
     iceberg_events: std::collections::VecDeque<IcebergEvent>,
+    liquidity_detector: LiquidityEventDetector,
 }
 
 impl HeatmapChart {
@@ -291,17 +295,23 @@ impl HeatmapChart {
             4.0,
         );
 
+        let visual_config = config.unwrap_or_default();
         HeatmapChart {
             chart: view_state,
             indicators,
             pause_buffer: vec![],
             heatmap,
             trades: TimeSeries::<HeatmapDataPoint>::new(timeframe, step),
-            visual_config: config.unwrap_or_default(),
+            visual_config,
             study_configurator: study::Configurator::new(),
             studies,
             last_tick: Instant::now(),
             iceberg_events: std::collections::VecDeque::new(),
+            liquidity_detector: LiquidityEventDetector::new(
+                visual_config.liquidity_events,
+                ticker_info,
+                step,
+            ),
         }
     }
 
@@ -317,6 +327,7 @@ impl HeatmapChart {
     }
 
     pub fn insert_depth(&mut self, depth: &Depth, update_t: UnixMs) {
+        self.liquidity_detector.observe_depth(depth, update_t);
         let rounded_depth_update = self.round_to_basis_time(update_t);
 
         let chart = &mut self.chart;
@@ -390,9 +401,21 @@ impl HeatmapChart {
     }
 
     pub fn insert_iceberg_event(&mut self, event: IcebergEvent) {
-        if !self.visual_config.iceberg_detector.enabled
-            || event.ticker_info != self.chart.ticker_info
-        {
+        if event.ticker_info != self.chart.ticker_info {
+            return;
+        }
+        let absorption_side = match event.side {
+            IcebergSide::PossibleBuy => LiquiditySide::Bid,
+            IcebergSide::PossibleSell => LiquiditySide::Ask,
+        };
+        self.liquidity_detector.observe_absorption_qty(
+            absorption_side,
+            event.price,
+            event.aggressive_executed_qty,
+            event.confirmed_at,
+        );
+        if !self.visual_config.iceberg_detector.enabled {
+            self.invalidate(None);
             return;
         }
         if let Some(existing) = self
@@ -431,6 +454,8 @@ impl HeatmapChart {
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
+        self.liquidity_detector
+            .set_config(visual_config.liquidity_events);
         self.visual_config = visual_config;
         self.invalidate(Some(Instant::now()));
     }
@@ -876,6 +901,65 @@ impl canvas::Program<Message> for HeatmapChart {
                     }
                     builder.close();
                     frame.fill(&builder.build(), color);
+                }
+            }
+
+            if self.visual_config.liquidity_events.enabled {
+                for event in self.liquidity_detector.events().iter().filter(|event| {
+                    let time = event.confirmed_at.as_u64();
+                    time >= earliest
+                        && time <= latest
+                        && event.price >= lowest
+                        && event.price <= highest
+                }) {
+                    let x = chart.interval_to_x(event.confirmed_at.as_u64());
+                    let y = chart.price_to_y(event.price);
+                    let size = 4.0 + f32::from(event.score) / 25.0;
+                    let side_color = match event.side {
+                        LiquiditySide::Bid => palette.success.strong.color,
+                        LiquiditySide::Ask => palette.danger.strong.color,
+                    };
+                    match event.kind {
+                        LiquidityEventKind::LargeAdd => {
+                            let mut builder = canvas::path::Builder::new();
+                            builder.move_to(Point::new(x, y - size));
+                            builder.line_to(Point::new(x + size, y));
+                            builder.line_to(Point::new(x, y + size));
+                            builder.line_to(Point::new(x - size, y));
+                            builder.close();
+                            frame.fill(&builder.build(), side_color);
+                        }
+                        LiquidityEventKind::LargePull => {
+                            let path = canvas::Path::new(|builder| {
+                                builder.move_to(Point::new(x - size, y - size));
+                                builder.line_to(Point::new(x + size, y + size));
+                                builder.move_to(Point::new(x + size, y - size));
+                                builder.line_to(Point::new(x - size, y + size));
+                            });
+                            frame.stroke(
+                                &path,
+                                canvas::Stroke::default()
+                                    .with_color(palette.warning.strong.color)
+                                    .with_width(1.5),
+                            );
+                        }
+                        LiquidityEventKind::RepeatedAbsorption => {
+                            frame.stroke(
+                                &canvas::Path::circle(Point::new(x, y), size),
+                                canvas::Stroke::default()
+                                    .with_color(side_color)
+                                    .with_width(2.0),
+                            );
+                            frame.fill_text(canvas::Text {
+                                content: format!("A×{}", event.test_count),
+                                position: Point::new(x + size + 2.0, y),
+                                size: (crate::style::text_size::TINY / chart.scaling).into(),
+                                color: side_color,
+                                font: style::AZERET_MONO,
+                                ..canvas::Text::default()
+                            });
+                        }
+                    }
                 }
             }
 

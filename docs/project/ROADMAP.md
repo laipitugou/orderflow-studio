@@ -24,7 +24,9 @@
 ## Phase 3 — Explainable event framework
 
 - [ ] Generalize Flowdepth's iceberg event schema.
-- [ ] Add absorption and repeated-absorption zone clustering.
+- [x] Add adaptive large resting-liquidity add/pull detection and markers.
+- [x] Add repeated-absorption clustering from separately confirmed absorption hits.
+- [ ] Generalize absorption confirmation beyond Binance Linear replenishment evidence.
 - [ ] Add exhaustion, stacked imbalance, auction completion, trapped trader,
   divergence, sweep, and spoofing-like detectors.
 - [ ] Add score breakdown, data-quality state, confirmation, and invalidation UI.

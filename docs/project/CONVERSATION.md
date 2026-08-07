@@ -13,6 +13,11 @@ requested that exchange disconnects preserve access to cached charts instead of
 blocking the application, plus large resting-order/add/cancel alerts, repeated
 absorption annotations, and POC-rejection markers on the bubble/heatmap view.
 
+The user then selected large resting-order add/pull detection and repeated
+absorption clusters as the first anomaly features to implement. The agreed
+noise controls are adaptive percentiles, minimum quote notional, proximity to
+the market, persistence for additions, and time-separated absorption retests.
+
 ## 2026-08-06 — Initial request
 
 The user trades cryptocurrency and uses FlowSurface order-flow data. They asked

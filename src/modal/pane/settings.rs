@@ -224,6 +224,56 @@ fn iceberg_cfg_controls<'a>(cfg: heatmap::Config, pane: pane_grid::Pane) -> Elem
             );
     }
 
+    let liquidity = cfg.liquidity_events;
+    let update_liquidity = move |liquidity_events| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Heatmap(heatmap::Config {
+                liquidity_events,
+                ..cfg
+            }),
+            false,
+        )
+    };
+    controls = controls
+        .push(
+            checkbox(liquidity.enabled)
+                .label("Large add/pull and repeated absorption")
+                .on_toggle(move |enabled| {
+                    update_liquidity(
+                        data::orderflow::liquidity_events::LiquidityEventConfig {
+                            enabled,
+                            ..liquidity
+                        },
+                    )
+                }),
+        )
+        .push(
+            text("Adaptive 98th-percentile filter; adds require persistence and absorption requires separate retests.")
+                .size(crate::style::text_size::SMALL),
+        );
+    if liquidity.enabled {
+        controls = controls.push(classic_slider_row(
+            text("Minimum notional"),
+            slider(
+                10_000.0..=5_000_000.0,
+                liquidity.min_quote_notional,
+                move |min_quote_notional| {
+                    update_liquidity(data::orderflow::liquidity_events::LiquidityEventConfig {
+                        min_quote_notional,
+                        ..liquidity
+                    })
+                },
+            )
+            .step(10_000.0)
+            .into(),
+            Some(text(format!(
+                "${}",
+                format_with_commas(liquidity.min_quote_notional)
+            ))),
+        ));
+    }
+
     controls.into()
 }
 
