@@ -238,6 +238,32 @@ impl State {
         }
     }
 
+    pub fn reconcile_candlestick_liquidity_stream(&mut self) {
+        let Some(ticker_info) = self.stream_pair() else {
+            return;
+        };
+        let enabled = matches!(
+            &self.content,
+            Content::Kline { chart: Some(chart), kind: data::chart::KlineChartKind::Candles, .. }
+                if chart.visual_config().liquidity_heatmap.enabled
+                    && matches!(chart.basis(), Basis::Time(_))
+                    && !chart.visual_config().comparison_workspace
+        );
+        let ResolvedStream::Ready(streams) = &mut self.streams else {
+            return;
+        };
+        streams.retain(|stream| !matches!(stream, StreamKind::Depth { .. }));
+        if enabled {
+            streams.push(StreamKind::Depth {
+                ticker_info,
+                depth_aggr: ticker_info
+                    .exchange()
+                    .stream_ticksize(None, TickMultiplier(1)),
+                push_freq: PushFrequency::ServerDefault,
+            });
+        }
+    }
+
     pub fn reconcile_gex_liquidity_stream(&mut self) {
         let Content::Gex {
             chart,
@@ -476,7 +502,6 @@ impl State {
                         },
                         || vec![trades_stream(&derived_plan)],
                     );
-
                     (content, streams)
                 }
                 ContentKind::CandlestickChart | ContentKind::OrderflowComparison => {
@@ -510,12 +535,20 @@ impl State {
                         vec![trades_stream(&temp)]
                     };
 
-                    let streams = by_basis_default(
+                    let mut streams = by_basis_default(
                         derived_plan.basis,
                         Timeframe::M15,
                         time_basis_stream,
                         tick_basis_stream,
                     );
+
+                    if matches!(&content, Content::Kline { chart: Some(chart), .. }
+                        if chart.visual_config().liquidity_heatmap.enabled
+                            && matches!(chart.basis(), Basis::Time(_))
+                            && !chart.visual_config().comparison_workspace)
+                    {
+                        streams.push(depth_stream(&derived_plan));
+                    }
 
                     (content, streams)
                 }
@@ -2963,8 +2996,10 @@ impl Content {
     pub fn change_visual_config(&mut self, config: VisualConfig) -> bool {
         match (self, config) {
             (Content::Kline { chart: Some(c), .. }, VisualConfig::Kline(cfg)) => {
+                let refresh_streams =
+                    c.visual_config().liquidity_heatmap.enabled != cfg.liquidity_heatmap.enabled;
                 c.set_visual_config(cfg);
-                false
+                refresh_streams
             }
             (Content::Heatmap { chart: Some(c), .. }, VisualConfig::Heatmap(cfg)) => {
                 c.set_visual_config(cfg);

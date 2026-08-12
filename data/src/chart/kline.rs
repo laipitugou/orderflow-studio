@@ -798,6 +798,8 @@ impl std::fmt::Display for ClusterKind {
 pub struct Config {
     /// Hide the price canvas and dedicate the pane to OI + dual composite CVD.
     pub comparison_workspace: bool,
+    /// Resting-liquidity history rendered behind price candles.
+    pub liquidity_heatmap: KlineLiquidityHeatmapConfig,
     // Whether to show last value labels on top right/left when not hovering
     // e.g. OHLC/bar change values for the main chart, or last value of an indicator series
     pub data_labels_always_visible: bool,
@@ -824,6 +826,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             comparison_workspace: false,
+            liquidity_heatmap: KlineLiquidityHeatmapConfig::default(),
             data_labels_always_visible: false,
             show_footprint_summary: false,
             show_footprint_table_candle: true,
@@ -833,6 +836,29 @@ impl Default for Config {
             cvd: CvdConfig::default(),
             indicator_configs: IndicatorConfigs::default(),
             legacy_gex_levels: None,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KlineLiquidityHeatmapConfig {
+    pub enabled: bool,
+    /// Minimum displayed quote notional for a level to be rendered.
+    pub min_quote_notional: f32,
+    /// Overall background opacity; deliberately bounded below candle opacity.
+    pub opacity: f32,
+    /// Maximum retained live history in minutes.
+    pub history_minutes: u16,
+}
+
+impl Default for KlineLiquidityHeatmapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_quote_notional: 250_000.0,
+            opacity: 0.42,
+            history_minutes: 60,
         }
     }
 }

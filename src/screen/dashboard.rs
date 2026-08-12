@@ -843,6 +843,7 @@ impl Dashboard {
                                         refresh_streams |=
                                             state.content.change_visual_config(cfg.clone());
                                         state.reconcile_candlestick_trade_stream();
+                                        state.reconcile_candlestick_liquidity_stream();
                                         state.reconcile_gex_liquidity_stream();
 
                                         state.apply_synced_settings(&studies_cfg, &clusters_cfg);
@@ -853,6 +854,7 @@ impl Dashboard {
                         state.settings.visual_config = Some(cfg.clone());
                         refresh_streams = state.content.change_visual_config(cfg);
                         state.reconcile_candlestick_trade_stream();
+                        state.reconcile_candlestick_liquidity_stream();
                         state.reconcile_gex_liquidity_stream();
                     }
 
@@ -2364,6 +2366,11 @@ impl Dashboard {
                             chart: Some(chart), ..
                         } => {
                             chart.insert_depth(depth, update_t);
+                        }
+                        pane::Content::Kline {
+                            chart: Some(chart), ..
+                        } => {
+                            chart.insert_liquidity_depth(depth, update_t);
                         }
                         _ => {
                             log::error!("No chart found for the stream: {stream:?}");

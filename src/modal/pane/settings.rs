@@ -1085,8 +1085,88 @@ pub fn kline_cfg_view<'a>(
 
     let content = match kind {
         KlineChartKind::Candles => {
+            let liquidity = cfg.liquidity_heatmap;
+            let update_liquidity = move |liquidity_heatmap| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        liquidity_heatmap,
+                        ..cfg
+                    }),
+                    false,
+                )
+            };
+            let mut liquidity_controls = column![
+                text("Resting liquidity").size(crate::style::text_size::SECTION),
+                checkbox(liquidity.enabled)
+                    .label("Show large resting orders behind candles")
+                    .on_toggle(move |enabled| {
+                        update_liquidity(data::chart::kline::KlineLiquidityHeatmapConfig {
+                            enabled,
+                            ..liquidity
+                        })
+                    }),
+                text(
+                    "Blue = bids, purple = asks. Uses the exchange's live order-book refresh rate."
+                )
+                .size(crate::style::text_size::SMALL),
+            ]
+            .spacing(8);
+            if !matches!(basis, data::chart::Basis::Time(_)) {
+                liquidity_controls = liquidity_controls.push(
+                    text("Available on time-based candles; switch from tick aggregation to enable it.")
+                        .size(crate::style::text_size::SMALL),
+                );
+            }
+            if liquidity.enabled {
+                liquidity_controls = liquidity_controls
+                    .push(classic_slider_row(
+                        text("Minimum notional"),
+                        slider(
+                            10_000.0..=5_000_000.0,
+                            liquidity.min_quote_notional,
+                            move |min_quote_notional| {
+                                update_liquidity(data::chart::kline::KlineLiquidityHeatmapConfig {
+                                    min_quote_notional,
+                                    ..liquidity
+                                })
+                            },
+                        )
+                        .step(10_000.0)
+                        .into(),
+                        Some(text(format!(
+                            "${}",
+                            format_with_commas(f64::from(liquidity.min_quote_notional))
+                        ))),
+                    ))
+                    .push(classic_slider_row(
+                        text("Opacity"),
+                        slider(0.10..=0.70, liquidity.opacity, move |opacity| {
+                            update_liquidity(data::chart::kline::KlineLiquidityHeatmapConfig {
+                                opacity,
+                                ..liquidity
+                            })
+                        })
+                        .step(0.05)
+                        .into(),
+                        Some(text(format!("{:.0}%", liquidity.opacity * 100.0))),
+                    ))
+                    .push(classic_slider_row(
+                        text("Live history"),
+                        slider(5..=240, liquidity.history_minutes, move |history_minutes| {
+                            update_liquidity(data::chart::kline::KlineLiquidityHeatmapConfig {
+                                history_minutes,
+                                ..liquidity
+                            })
+                        })
+                        .step(5_u16)
+                        .into(),
+                        Some(text(format!("{} min", liquidity.history_minutes))),
+                    ));
+            }
             split_column![
                 display_readout_section,
+                liquidity_controls,
                 row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))

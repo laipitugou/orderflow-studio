@@ -9,6 +9,7 @@ use crate::connector::fetcher::{
 use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
+use data::chart::heatmap::{CoalesceKind, HistoricalDepth};
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::drawing::FixedRangeVolumeProfileConfig;
 use data::chart::kline::{
@@ -323,6 +324,7 @@ pub struct KlineChart {
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
     drawings: drawing::DrawingState,
+    liquidity_depth: HistoricalDepth,
 }
 
 #[derive(Debug, Default)]
@@ -362,6 +364,10 @@ impl KlineChart {
         let kind = kind.clone();
         let raw_trades =
             deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
+        let (_, depth_timeframe) = data::chart::heatmap::normalize_basis(
+            Basis::default_heatmap_time(Some(ticker_info)),
+            ticker_info,
+        );
 
         match basis {
             Basis::Time(interval) => {
@@ -464,6 +470,11 @@ impl KlineChart {
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
+                    liquidity_depth: HistoricalDepth::new(
+                        ticker_info.min_qty,
+                        step,
+                        depth_timeframe,
+                    ),
                 }
             }
             Basis::Tick(interval) => {
@@ -542,6 +553,11 @@ impl KlineChart {
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
+                    liquidity_depth: HistoricalDepth::new(
+                        ticker_info.min_qty,
+                        step,
+                        depth_timeframe,
+                    ),
                 }
             }
         }
@@ -1966,6 +1982,21 @@ impl KlineChart {
         self.invalidate(None);
     }
 
+    pub fn insert_liquidity_depth(&mut self, depth: &exchange::depth::Depth, update_t: UnixMs) {
+        if !self.visual_config.liquidity_heatmap.enabled
+            || !matches!(self.chart.basis, Basis::Time(_))
+        {
+            return;
+        }
+        let rounded = update_t.floor_to(self.liquidity_depth.aggr_time);
+        self.liquidity_depth.insert_latest_depth(depth, rounded);
+        let retention =
+            u64::from(self.visual_config.liquidity_heatmap.history_minutes.max(1)) * 60_000;
+        self.liquidity_depth
+            .cleanup_old_price_levels(rounded.saturating_sub(retention));
+        self.invalidate(None);
+    }
+
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let received_size = raw_trades.len();
         let raw_trades = deduplicate_incoming_trades(
@@ -2718,6 +2749,23 @@ impl canvas::Program<Message> for KlineChart {
                     let proxy_asset =
                         exchange::options::resolve_options_underlying(chart.ticker_info.ticker);
                     let (visible_high, visible_low) = chart.price_range(&region);
+                    if self.visual_config.liquidity_heatmap.enabled
+                        && matches!(chart.basis, Basis::Time(_))
+                    {
+                        draw_kline_liquidity_heatmap(
+                            frame,
+                            &self.liquidity_depth,
+                            earliest,
+                            latest,
+                            visible_high,
+                            visible_low,
+                            interval_to_x,
+                            price_to_y,
+                            chart.cell_height,
+                            chart.ticker_info.market_type(),
+                            &self.visual_config.liquidity_heatmap,
+                        );
+                    }
                     if self.indicator_enabled(KlineIndicator::GexLevels)
                         && (self.gex_snapshot.is_some() || !self.gex_proxy_history.is_empty())
                     {
@@ -4752,6 +4800,69 @@ fn draw_candle_dp(
         Size::new(candle_width / 4.0, (y_high - y_low).abs()),
         wick_color,
     );
+}
+
+fn draw_kline_liquidity_heatmap(
+    frame: &mut canvas::Frame,
+    depth: &HistoricalDepth,
+    earliest: u64,
+    latest: u64,
+    highest: Price,
+    lowest: Price,
+    interval_to_x: impl Fn(u64) -> f32 + Copy,
+    price_to_y: impl Fn(Price) -> f32 + Copy,
+    cell_height: f32,
+    market: exchange::adapter::MarketKind,
+    config: &data::chart::kline::KlineLiquidityHeatmapConfig,
+) {
+    let runs = depth.coalesced_runs(
+        UnixMs::new(earliest),
+        UnixMs::new(latest),
+        highest,
+        lowest,
+        market,
+        config.min_quote_notional,
+        CoalesceKind::Average(0.15),
+    );
+    if runs.is_empty() {
+        return;
+    }
+    let size_in_quote =
+        exchange::unit::qty::volume_size_unit() == exchange::unit::qty::SizeUnit::Quote;
+    let max_value = runs
+        .iter()
+        .map(|(price, run)| market.qty_in_quote_value(run.qty, *price, size_in_quote))
+        .fold(0.0_f64, f64::max)
+        .max(f64::from(config.min_quote_notional));
+    let opacity = config.opacity.clamp(0.05, 0.75);
+
+    for (price, run) in runs {
+        let start = run.start_time.as_u64().max(earliest);
+        let end = run.until_time.as_u64().min(latest);
+        if end <= start {
+            continue;
+        }
+        let value = market.qty_in_quote_value(run.qty, price, size_in_quote);
+        let strength = ((value / max_value).sqrt() as f32).clamp(0.15, 1.0);
+        // Bid/ask hues remain in the blue-purple/cyan family so they cannot be
+        // mistaken for bullish/bearish candle bodies.
+        let base = if run.is_bid {
+            Color::from_rgb(0.20, 0.48, 0.95)
+        } else {
+            Color::from_rgb(0.62, 0.30, 0.92)
+        };
+        let x0 = interval_to_x(start);
+        let x1 = interval_to_x(end);
+        let y = price_to_y(price);
+        frame.fill_rectangle(
+            Point::new(x0.min(x1), y - cell_height * 0.45),
+            Size::new((x1 - x0).abs().max(0.5), (cell_height * 0.9).max(0.5)),
+            Color {
+                a: opacity * strength,
+                ..base
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
